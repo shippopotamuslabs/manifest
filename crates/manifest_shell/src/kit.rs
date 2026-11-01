@@ -16,8 +16,8 @@ use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BORDER_DEFAULT, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, RADIUS_PILL, SPACE_M, SPACE_S,
-    SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY,
+    BORDER_DEFAULT, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_M,
+    SPACE_S, SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY,
     TEXT_TERTIARY,
 };
 
@@ -128,20 +128,6 @@ pub(crate) fn panel<'a, Message: Clone + 'a>(
         .into()
 }
 
-/// A [`panel`] that stretches to the full height of its parent column.
-/// Used for full-column panels (e.g. the session list); item panels
-/// inside scrollables must keep shrink height, so they stay on [`panel`].
-pub(crate) fn panel_fill<'a, Message: Clone + 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .padding(SPACE_M)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(panel_style)
-        .into()
-}
-
 /// Status-aware style for the single-line input.
 fn field_style(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let border_color = match status {
@@ -195,27 +181,96 @@ fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style
     }
 }
 
-/// A full-width session row: title plus a small subtitle. Selected rows
-/// sit on the muted accent wash; unselected rows are transparent until
-/// hovered.
+/// A full-width session row: title plus a small subtitle, with a faint
+/// trailing label pinned to the right edge. Selected rows sit on the
+/// muted accent wash; unselected rows are transparent until hovered.
 pub(crate) fn list_row<'a, Message: Clone + 'a>(
     title: &'a str,
     subtitle: &'a str,
+    trailing: &'a str,
     selected: bool,
     on_press: Message,
 ) -> Element<'a, Message> {
     let title_color = if selected { TEXT_HIGH } else { TEXT_PRIMARY };
-    let content = iced::widget::column![
+    let body = iced::widget::column![
         text(title).size(FONT_SIZE_BODY).color(title_color),
         text(subtitle).size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
     ]
     .spacing(SPACE_XS)
     .width(Length::Fill);
+    let content = iced::widget::row![body, text(trailing).size(FONT_SIZE_SMALL).color(TEXT_FAINT),]
+        .spacing(SPACE_S)
+        .width(Length::Fill);
     button(content)
         .width(Length::Fill)
         .padding(SPACE_S)
         .on_press(on_press)
         .style(row_style(selected))
+        .into()
+}
+
+/// Status-aware style for label rows (section headers, add-row): clear
+/// at rest, surface-1 on hover and press, with the label tone shifting
+/// from `rest` to `hot` under the pointer.
+fn label_row_style(rest: Color, hot: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme: &Theme, status: button::Status| {
+        let (background, text_color) = match status {
+            button::Status::Hovered | button::Status::Pressed => (Some(SURFACE_1), hot),
+            button::Status::Active | button::Status::Disabled => (None, rest),
+        };
+        button::Style {
+            background: background.map(Background::Color),
+            text_color,
+            border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+            ..button::Style::default()
+        }
+    }
+}
+
+/// A full-width project section header: a small label button that
+/// expands or collapses the group below it.
+pub(crate) fn section_header<'a, Message: Clone + 'a>(
+    label: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    button(text(label).size(FONT_SIZE_SMALL))
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(label_row_style(TEXT_TERTIARY, TEXT_SECONDARY))
+        .into()
+}
+
+/// A full-width add row: same shape as [`section_header`] with a body
+/// label tone, for actions like "+ New Project".
+pub(crate) fn action_row<'a, Message: Clone + 'a>(
+    label: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    button(text(label).size(FONT_SIZE_BODY))
+        .width(Length::Fill)
+        .padding([SPACE_S, SPACE_S])
+        .on_press(on_press)
+        .style(label_row_style(TEXT_SECONDARY, TEXT_PRIMARY))
+        .into()
+}
+
+/// Status-aware style for the modal dim: the scrim token, no border.
+fn scrim_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SCRIM)),
+        ..container::Style::default()
+    }
+}
+
+/// Dims the workspace and centers a popup: a full Fill by Fill
+/// container carrying the popup in the middle of both axes.
+pub(crate) fn scrim<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .center(Length::Fill)
+        .style(scrim_style)
         .into()
 }
 

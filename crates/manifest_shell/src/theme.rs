@@ -5,8 +5,8 @@
 //! `contracts/gospel/PALETTE.md`. Feature and kit code reference these
 //! tokens; no hex literal or `Color` constructor appears anywhere else.
 
-use iced::{Color, Theme};
 use iced::theme::Palette;
+use iced::{Color, Theme};
 
 // Items marked `#[allow(dead_code)]` below are D4 palette tokens with no
 // M1 consumer yet (later phases: focus rings, deeper surfaces, larger
@@ -78,6 +78,11 @@ pub const FONT_SIZE_SMALL: f32 = 12.0;
 pub const FONT_SIZE_BODY: f32 = 14.0;
 pub const FONT_SIZE_HEADING: f32 = 16.0;
 pub const FONT_SIZE_TITLE: f32 = 20.0;
+
+// Modal dim over the workspace while a popup is open.
+pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
+// Fixed width of the add-project popup.
+pub const POPUP_WIDTH: f32 = 420.0;
 
 /// Returns `base` with its alpha channel replaced.
 pub const fn with_alpha(base: Color, alpha: f32) -> Color {

@@ -8,4 +8,7 @@
 
 mod fixture;
 
-pub use fixture::{Fixture, SessionId, SessionStatus, SessionSummary, TodoItem, TranscriptItem, fixture};
+pub use fixture::{
+    Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,
+    TranscriptItem, fixture,
+};

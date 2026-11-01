@@ -26,6 +26,28 @@ pub enum SessionStatus {
     AwaitingApproval,
 }
 
+/// Opaque handle for one project.
+///
+/// Mirrors [`SessionId`]: callers compare and match by the whole handle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectId(String);
+
+impl ProjectId {
+    /// Build a project id from its stored handle.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+/// One project grouping sessions in the left panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSummary {
+    /// Opaque project handle.
+    pub id: ProjectId,
+    /// Short human name, e.g. "checkout-api".
+    pub name: String,
+}
+
 /// One row in the session list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
@@ -35,6 +57,10 @@ pub struct SessionSummary {
     pub title: String,
     /// What the session is doing now.
     pub status: SessionStatus,
+    /// Owning project, if the session belongs to one.
+    pub project: Option<ProjectId>,
+    /// Precomputed relative-time label for the row's right edge, e.g. '20h'.
+    pub relative_time: String,
 }
 
 /// One entry in a session transcript.
@@ -57,9 +83,11 @@ pub struct TodoItem {
     pub done: bool,
 }
 
-/// The whole fixture: sessions, one visible transcript, and todos.
+/// The whole fixture: projects, sessions, one visible transcript, and todos.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fixture {
+    /// Projects for the left panel, in display order.
+    pub projects: Vec<ProjectSummary>,
     /// Sessions for the left panel, in display order.
     pub sessions: Vec<SessionSummary>,
     /// Transcript of the selected session.
@@ -74,21 +102,51 @@ pub struct Fixture {
 /// the shell always start from identical state.
 pub fn fixture() -> Fixture {
     Fixture {
+        projects: vec![
+            ProjectSummary {
+                id: ProjectId::new("project-checkout-api"),
+                name: String::from("checkout-api"),
+            },
+            ProjectSummary {
+                id: ProjectId::new("project-storefront-web"),
+                name: String::from("storefront-web"),
+            },
+        ],
         sessions: vec![
             SessionSummary {
                 id: SessionId::new("session-checkout-sync"),
                 title: String::from("Fix checkout sync retries"),
                 status: SessionStatus::Running,
-            },
-            SessionSummary {
-                id: SessionId::new("session-settings-copy"),
-                title: String::from("Review new settings screen copy"),
-                status: SessionStatus::AwaitingApproval,
+                project: Some(ProjectId::new("project-checkout-api")),
+                relative_time: String::from("20h"),
             },
             SessionSummary {
                 id: SessionId::new("session-migration-cleanup"),
                 title: String::from("Clean up old migration scripts"),
                 status: SessionStatus::Idle,
+                project: Some(ProjectId::new("project-checkout-api")),
+                relative_time: String::from("1d"),
+            },
+            SessionSummary {
+                id: SessionId::new("session-settings-copy"),
+                title: String::from("Review new settings screen copy"),
+                status: SessionStatus::AwaitingApproval,
+                project: Some(ProjectId::new("project-storefront-web")),
+                relative_time: String::from("2d"),
+            },
+            SessionSummary {
+                id: SessionId::new("session-empty-cart"),
+                title: String::from("Audit empty-cart states"),
+                status: SessionStatus::Idle,
+                project: Some(ProjectId::new("project-storefront-web")),
+                relative_time: String::from("4d"),
+            },
+            SessionSummary {
+                id: SessionId::new("session-cron-scratch"),
+                title: String::from("Cron expression help"),
+                status: SessionStatus::Idle,
+                project: None,
+                relative_time: String::from("6d"),
             },
         ],
         transcript: vec![
@@ -152,11 +210,29 @@ mod tests {
     fn fixture_has_sessions_with_work_to_show() {
         let got = fixture();
         assert!(got.sessions.len() >= 3);
-        assert!(
-            got.sessions
-                .iter()
-                .any(|s| s.status != SessionStatus::Idle)
-        );
+        assert!(got.sessions.iter().any(|s| s.status != SessionStatus::Idle));
+    }
+
+    #[test]
+    fn fixture_projects_cover_sessions() {
+        let got = fixture();
+        assert!(got.projects.len() >= 2);
+        let ids: Vec<_> = got.projects.iter().map(|p| &p.id).collect();
+        for session in &got.sessions {
+            if let Some(project) = &session.project {
+                assert!(ids.contains(&project));
+            }
+        }
+        assert!(got.sessions.iter().any(|s| s.project.is_none()));
+    }
+
+    #[test]
+    fn fixture_relative_times_are_labels() {
+        let got = fixture();
+        assert!(!got.sessions.is_empty());
+        for session in &got.sessions {
+            assert!(!session.relative_time.is_empty());
+        }
     }
 
     #[test]

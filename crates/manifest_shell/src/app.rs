@@ -85,7 +85,7 @@ impl App {
             .find(|todo| !todo.done)
             .map(|todo| todo.label.clone());
         App {
-            sessions: sessions::State::from_sessions(fixture.sessions),
+            sessions: sessions::State::from_projects(fixture.projects, fixture.sessions),
             transcript: transcript::State::from_items(fixture.transcript),
             composer: composer::State::new(),
             todos: fixture.todos,
@@ -145,7 +145,7 @@ impl App {
                     .width(Length::Fill),
             )
             .into();
-        iced::widget::column![
+        let base: Element<'_, Message> = iced::widget::column![
             topbar(self),
             iced::widget::row![
                 iced::widget::container(self.sessions.view().map(Message::Sessions))
@@ -163,7 +163,11 @@ impl App {
         .padding(SPACE_M)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+        if let Some(popup) = self.sessions.add_project_view() {
+            return iced::widget::stack![base, kit::scrim(popup.map(Message::Sessions))].into();
+        }
+        base
     }
 }
 
@@ -278,7 +282,14 @@ mod tests {
     fn boot_selects_first_session_with_drawer_peeking() {
         let fixture = manifest_domain::fixture();
         let got = App::from_fixture(fixture.clone());
-        assert!(got.sessions.sessions.len() >= 3);
+        let total: usize = got
+            .sessions
+            .groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>()
+            + got.sessions.unprojected.len();
+        assert!(total >= 3);
         assert_eq!(got.todo_drawer, TodoDrawer::Peek);
         let first_id = fixture.sessions.first().map(|summary| summary.id.clone());
         assert!(first_id.is_some());
@@ -288,7 +299,7 @@ mod tests {
     #[test]
     fn selection_survives_composer_and_drawer_messages() {
         let mut got = App::boot();
-        let target = got.sessions.sessions[1].id.clone();
+        let target = got.sessions.groups[0].sessions[1].id.clone();
         let _ = got.update(Message::Sessions(sessions::Message::Select(target.clone())));
         assert_eq!(got.sessions.selected, target);
         let _ = got.update(Message::Composer(composer::Message::DraftChanged(
@@ -317,12 +328,50 @@ mod tests {
     fn drawer_state_survives_selection_and_draft_messages() {
         let mut got = App::boot();
         let _ = got.update(Message::ToggleTodoDrawer);
-        let target = got.sessions.sessions[1].id.clone();
+        let target = got.sessions.groups[0].sessions[1].id.clone();
         let _ = got.update(Message::Sessions(sessions::Message::Select(target)));
         let _ = got.update(Message::Composer(composer::Message::DraftChanged(
             String::from("hello"),
         )));
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
         assert_eq!(got.composer.draft, "hello");
+    }
+
+    #[test]
+    fn popup_name_rule_flows_through_root_update() {
+        let mut got = App::boot();
+        let _ = got.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = got.update(Message::Sessions(sessions::Message::DirectoryChanged(
+            String::from("/x/y/billing-service"),
+        )));
+        assert_eq!(
+            got.sessions.add_project,
+            sessions::AddProject::Open {
+                directory: String::from("/x/y/billing-service"),
+                name: String::from("billing-service"),
+                name_edited: false,
+            }
+        );
+        assert!(got.sessions.add_project_view().is_some());
+    }
+
+    #[test]
+    fn popup_survives_drawer_and_composer_messages() {
+        let mut got = App::boot();
+        let _ = got.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = got.update(Message::ToggleTodoDrawer);
+        let _ = got.update(Message::Composer(composer::Message::DraftChanged(
+            String::from("draft text"),
+        )));
+        assert_eq!(got.todo_drawer, TodoDrawer::Open);
+        assert_eq!(got.composer.draft, "draft text");
+        assert_eq!(
+            got.sessions.add_project,
+            sessions::AddProject::Open {
+                directory: String::new(),
+                name: String::new(),
+                name_edited: false,
+            }
+        );
     }
 }
