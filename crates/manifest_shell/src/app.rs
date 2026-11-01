@@ -142,9 +142,6 @@ pub struct App {
     /// The server config to connect with; `None` in fixture mode, where
     /// no server is ever spawned.
     pub engine_config: Option<manifest_mcp::ServerConfig>,
-    /// The latest session-load failure or diagnostic message, shown in
-    /// the side panel until a retry clears it.
-    pub engine_notice: Option<String>,
 }
 
 impl App {
@@ -178,7 +175,6 @@ impl App {
             connection_attempt: 0,
             engine: None,
             engine_config: None,
-            engine_notice: None,
         }
     }
 
@@ -270,11 +266,15 @@ impl App {
                 if attempt != self.connection_attempt || self.engine_config.is_none() {
                     return Task::none();
                 }
+                let mut appended = false;
                 match input {
                     engine::Input::Ready(handle) => {
                         self.engine = Some(handle);
                     }
                     engine::Input::Event(EngineEvent::ConnectionChanged(next)) => {
+                        if let Connection::Failed(message) = &next {
+                            appended = self.transcript.push_error(message.clone());
+                        }
                         self.connection = next;
                         if self.connection == Connection::Connected {
                             if let Some(engine) = &self.engine {
@@ -288,10 +288,10 @@ impl App {
                         self.sessions.replace(projects, sessions);
                     }
                     engine::Input::Event(EngineEvent::SessionsLoadFailed(message)) => {
-                        self.engine_notice = Some(message);
+                        appended = self.transcript.push_error(message);
                     }
                     engine::Input::Event(EngineEvent::Diagnostic(message)) => {
-                        self.engine_notice = Some(message);
+                        appended = self.transcript.push_error(message);
                     }
                     engine::Input::Event(EngineEvent::Stream(StreamEvent::Pending { .. })) => {
                         if self.connection == Connection::Connected
@@ -304,7 +304,11 @@ impl App {
                     // consumed as no-ops until M3 renders them.
                     engine::Input::Event(EngineEvent::Stream(_)) => {}
                 }
-                Task::none()
+                if appended {
+                    transcript::scroll_to_end().map(Message::Transcript)
+                } else {
+                    Task::none()
+                }
             }
             Message::Reconnect => {
                 if self.engine_config.is_some() {
@@ -312,7 +316,6 @@ impl App {
                     // subscription restarts under the new attempt.
                     self.engine = None;
                     self.connection = Connection::Connecting;
-                    self.engine_notice = None;
                     self.connection_attempt += 1;
                 }
                 Task::none()
@@ -376,20 +379,7 @@ impl App {
                     .width(Length::Fill),
             )
             .into();
-        let mut panel = iced::widget::column![];
-        if let Some(notice) = side_notice(self) {
-            panel = panel.push(
-                iced::widget::text(notice)
-                    .size(FONT_SIZE_SMALL)
-                    .color(TEXT_TERTIARY),
-            );
-        }
-        let panel: Element<'_, Message> = panel
-            .push(self.sessions.view().map(Message::Sessions))
-            .spacing(SPACE_S)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let panel: Element<'_, Message> = self.sessions.view().map(Message::Sessions);
         let base: Element<'_, Message> = iced::widget::column![
             topbar(self),
             iced::widget::row![
@@ -512,22 +502,6 @@ fn connection_label(connection: &Connection) -> &'static str {
         Connection::Connecting => "Connecting...",
         Connection::Connected => "Connected",
         Connection::Failed(_) => "Connection failed",
-    }
-}
-
-/// The side-panel notice line, if there is something true to show, in
-/// priority order: the failure message, then the latest load or
-/// diagnostic notice, then the connecting line. Borrows stored text so
-/// the view formats nothing (UI contract §2).
-fn side_notice(state: &App) -> Option<&str> {
-    if let Connection::Failed(message) = &state.connection {
-        Some(message.as_str())
-    } else if let Some(notice) = state.engine_notice.as_deref() {
-        Some(notice)
-    } else if state.engine_config.is_some() && state.connection == Connection::Connecting {
-        Some("Connecting to the MCP server...")
-    } else {
-        None
     }
 }
 
@@ -978,6 +952,10 @@ mod tests {
             manifest_domain::Connection::Failed(String::from("boom"))
         );
         assert!(app.engine.is_none());
+        assert!(app.transcript.items.iter().any(|item| matches!(
+            item,
+            manifest_domain::TranscriptItem::ErrorNote { text } if text == "boom"
+        )));
     }
 
     #[test]
@@ -999,7 +977,6 @@ mod tests {
         let _ = app.update(Message::Reconnect);
         assert_eq!(app.connection_attempt, before + 1);
         assert_eq!(app.connection, manifest_domain::Connection::Connecting);
-        assert!(app.engine_notice.is_none());
         assert!(app.engine.is_none());
     }
 
@@ -1039,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn load_failed_and_diagnostic_set_notice() {
+    fn load_failed_and_diagnostic_append_error_notes() {
         let (mut app, _) = live_app();
         deliver(
             &mut app,
@@ -1047,12 +1024,39 @@ mod tests {
                 String::from("x"),
             )),
         );
-        assert_eq!(app.engine_notice, Some(String::from("x")));
         deliver(
             &mut app,
             engine::Input::Event(manifest_domain::EngineEvent::Diagnostic(String::from("y"))),
         );
-        assert_eq!(app.engine_notice, Some(String::from("y")));
+        let tail: Vec<&str> = app
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .filter_map(|item| match item {
+                manifest_domain::TranscriptItem::ErrorNote { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Both events append; the tail holds exactly the two texts.
+        assert!(app.transcript.items.len() >= 2);
+        assert_eq!(tail, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn connected_and_connecting_append_no_error_notes() {
+        let (mut app, _) = live_app();
+        let before = app.transcript.items.len();
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Connecting,
+            )),
+        );
+        deliver_connected(&mut app);
+        assert_eq!(app.transcript.items.len(), before);
     }
 
     #[test]

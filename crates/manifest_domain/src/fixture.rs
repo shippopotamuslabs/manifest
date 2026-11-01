@@ -74,6 +74,10 @@ pub enum TranscriptItem {
     AssistantTurn { text: String },
     /// A tool result worth showing inline, e.g. a test run summary.
     ToolNote { text: String },
+    /// An error shown in the transcript like an assistant response.
+    /// The shell renders it in the danger tone so failures read as
+    /// part of the conversation, per the product's error presentation.
+    ErrorNote { text: String },
 }
 
 /// One checklist entry the agent works through.

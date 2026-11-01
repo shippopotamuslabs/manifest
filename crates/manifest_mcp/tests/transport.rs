@@ -240,8 +240,8 @@ fn malformed_line_fails_connection() {
     let seen = recv_until(&rx, "Failed", is_failed);
     let text = failed_text(&seen).expect("Failed seen above");
     assert!(
-        text.to_lowercase().contains("protocol") || text.to_lowercase().contains("malformed"),
-        "failure names the protocol breakage, saw {text:?}"
+        text.contains("couldn't understand"),
+        "failure is the friendly protocol sentence, saw {text:?}"
     );
     drop(engine);
 }
@@ -283,6 +283,10 @@ fn missing_binary_fails_naming_command() {
     );
     let seen = recv_until(&rx, "Failed", is_failed);
     let text = failed_text(&seen).expect("Failed seen above");
+    assert!(
+        text.contains("Couldn't find"),
+        "failure is the friendly missing-binary sentence, saw {text:?}"
+    );
     assert!(
         text.contains(&missing),
         "failure names the command, saw {text:?}"

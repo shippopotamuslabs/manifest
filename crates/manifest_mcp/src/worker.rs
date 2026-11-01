@@ -213,7 +213,7 @@ impl Worker {
             let text = error
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("muse_status failed");
+                .unwrap_or("Couldn't load your sessions from the Muse MCP server.");
             return self.emit(EngineEvent::SessionsLoadFailed(text.to_string()));
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
@@ -242,9 +242,7 @@ fn spawn_reader(stdout: ChildStdout, worker_tx: Sender<WorkerMsg>) {
                     }
                 }
                 Err(err) => {
-                    let _ = worker_tx.send(WorkerMsg::ReaderFailed(format!(
-                        "Could not read from the MCP server: {err}"
-                    )));
+                    let _ = worker_tx.send(WorkerMsg::ReaderFailed(err.to_string()));
                     return;
                 }
             }

@@ -54,8 +54,10 @@ pub(crate) fn map_status_rows(
     for row in rows {
         let dto: StatusDto = match serde_json::from_value(row.clone()) {
             Ok(dto) => dto,
-            Err(err) => {
-                diagnostics.push(format!("Skipped a session row from muse_status: {err}"));
+            Err(_) => {
+                diagnostics.push(String::from(
+                    "A session from the server couldn't be read and was skipped.",
+                ));
                 continue;
             }
         };
@@ -67,8 +69,7 @@ pub(crate) fn map_status_rows(
             "running" => SessionStatus::Running,
             other => {
                 diagnostics.push(format!(
-                    "Skipped session `{}` from muse_status: unknown status `{other}`",
-                    dto.session_id,
+                    "A session had an unrecognized status (`{other}`) and was skipped."
                 ));
                 continue;
             }
@@ -254,7 +255,7 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
         None => {
             return vec![EngineEvent::SessionsLoadFailed(
                 Error::Tool(String::from(
-                    "Could not parse the muse_status result: no text content item",
+                    "Couldn't load your sessions from the Muse MCP server.",
                 ))
                 .to_string(),
             )];
@@ -262,9 +263,12 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
     };
     let rows: Vec<Value> = match serde_json::from_str(&text) {
         Ok(rows) => rows,
-        Err(err) => {
+        Err(_) => {
             return vec![EngineEvent::SessionsLoadFailed(
-                Error::Tool(format!("Could not parse the muse_status result: {err}")).to_string(),
+                Error::Tool(String::from(
+                    "Couldn't load your sessions from the Muse MCP server.",
+                ))
+                .to_string(),
             )];
         }
     };
@@ -291,7 +295,8 @@ fn first_text_opt(result: &Value) -> Option<String> {
 
 /// Text of the first `type == "text"` content item, or the fallback.
 fn first_text(result: &Value) -> String {
-    first_text_opt(result).unwrap_or_else(|| String::from("muse_status failed"))
+    first_text_opt(result)
+        .unwrap_or_else(|| String::from("Couldn't load your sessions from the Muse MCP server."))
 }
 
 #[cfg(test)]
@@ -341,9 +346,12 @@ mod tests {
         let (_, sessions, diagnostics) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].contains("weird"));
-        assert!(diagnostics[0].contains("exploded"));
+        assert_eq!(
+            diagnostics,
+            vec![String::from(
+                "A session had an unrecognized status (`exploded`) and was skipped."
+            )]
+        );
     }
 
     #[test]
@@ -351,7 +359,12 @@ mod tests {
         let rows = vec![json!({"status": "running"})];
         let (_, sessions, diagnostics) = map_status_rows(&rows);
         assert!(sessions.is_empty());
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics,
+            vec![String::from(
+                "A session from the server couldn't be read and was skipped."
+            )]
+        );
     }
 
     #[test]
@@ -470,7 +483,7 @@ mod tests {
         assert_eq!(
             map_status_result(&empty),
             vec![EngineEvent::SessionsLoadFailed(String::from(
-                "muse_status failed"
+                "Couldn't load your sessions from the Muse MCP server."
             ))]
         );
     }
