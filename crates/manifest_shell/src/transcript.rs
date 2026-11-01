@@ -279,7 +279,7 @@ fn render_item<'a>(item: &'a TranscriptItem) -> Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, item_height, item_tops, wrapped_lines};
+    use super::{ESTIMATED_CHAR_WIDTH, State, item_height, item_tops, wrapped_lines};
     use crate::theme::{SPACE_M, SPACE_S};
     use manifest_domain::{TranscriptItem, fixture};
 
@@ -309,7 +309,9 @@ mod tests {
     fn overlong_word_splits_across_lines() {
         let word = "a".repeat(50);
         assert_eq!(wrapped_lines(&word, 600.0), 1);
-        assert_eq!(wrapped_lines(&word, 100.0), 4);
+        let max_chars = (100.0 / ESTIMATED_CHAR_WIDTH) as usize;
+        let expected = 50_usize.div_ceil(max_chars);
+        assert_eq!(wrapped_lines(&word, 100.0), expected);
     }
 
     #[test]

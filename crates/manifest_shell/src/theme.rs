@@ -74,20 +74,20 @@ pub const RADIUS_PANEL: f32 = 8.0;
 pub const RADIUS_PILL: f32 = 999.0;
 
 // Type sizes in logical pixels.
-pub const FONT_SIZE_SMALL: f32 = 12.0;
-pub const FONT_SIZE_BODY: f32 = 14.0;
-pub const FONT_SIZE_HEADING: f32 = 16.0;
-pub const FONT_SIZE_TITLE: f32 = 20.0;
+pub const FONT_SIZE_SMALL: f32 = 15.0;
+pub const FONT_SIZE_BODY: f32 = 18.0;
+pub const FONT_SIZE_HEADING: f32 = 20.0;
+pub const FONT_SIZE_TITLE: f32 = 25.0;
 
 // Modal dim over the workspace while a popup is open.
 pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 // Composer input geometry: visible line cap, per-line height, and the
 // fixed square of the inside-bar icon buttons.
 pub const COMPOSER_MAX_LINES: usize = 5;
-pub const COMPOSER_LINE_HEIGHT: f32 = 21.0;
-pub const ICON_BUTTON_SIZE: f32 = 30.0;
+pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
+pub const ICON_BUTTON_SIZE: f32 = 36.0;
 // Fixed width of the add-project popup.
-pub const POPUP_WIDTH: f32 = 420.0;
+pub const POPUP_WIDTH: f32 = 480.0;
 
 /// Returns `base` with its alpha channel replaced.
 pub const fn with_alpha(base: Color, alpha: f32) -> Color {
