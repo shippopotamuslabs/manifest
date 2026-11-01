@@ -349,46 +349,6 @@ pub(crate) fn scrim<'a, Message: Clone + 'a>(
         .into()
 }
 
-/// Status-aware style for a toggle chip.
-fn chip_style(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme: &Theme, status: button::Status| {
-        let (background, text_color) = if on {
-            (Some(ACCENT_MUTED_BG), TEXT_HIGH)
-        } else {
-            let background = match status {
-                button::Status::Hovered | button::Status::Pressed => Some(SURFACE_1),
-                button::Status::Active | button::Status::Disabled => None,
-            };
-            let text_color = match status {
-                button::Status::Hovered | button::Status::Pressed => TEXT_PRIMARY,
-                button::Status::Active => TEXT_SECONDARY,
-                button::Status::Disabled => TEXT_FAINT,
-            };
-            (background, text_color)
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: Border::default().width(0.0).rounded(RADIUS_PILL),
-            ..button::Style::default()
-        }
-    }
-}
-
-/// A pill toggle chip (a button, not a switch): the on state carries the
-/// muted accent wash fill and nothing else.
-pub(crate) fn toggle_chip<'a, Message: Clone + 'a>(
-    label: &'a str,
-    on: bool,
-    on_toggle: Message,
-) -> Element<'a, Message> {
-    button(text(label).size(FONT_SIZE_SMALL))
-        .padding(SPACE_S)
-        .on_press(on_toggle)
-        .style(chip_style(on))
-        .into()
-}
-
 /// Maps the drawer situation to its chevron glyph: the drawer grows
 /// upward when opened, so the collapsed peek strip shows an up chevron
 /// (expand) and the open header shows a down chevron (collapse).

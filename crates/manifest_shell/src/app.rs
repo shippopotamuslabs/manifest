@@ -332,8 +332,8 @@ impl Default for App {
 }
 
 /// Drags the window on press and toggles maximize on double click.
-/// Only non-interactive title regions opt into this; the chip and the
-/// window controls stay out so they never start a drag.
+/// Only non-interactive title regions opt into this; the window
+/// controls stay out so they never start a drag.
 fn drag_region<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     iced::widget::mouse_area(content)
         .on_press(Message::DragWindow)
@@ -386,8 +386,8 @@ fn resize_corner<'a>(
 
 /// The title bar: the app title in the fixed panel share, then the
 /// selected session title truly centered in the fill share with the
-/// Todos chip and window controls right-aligned. A plain function on
-/// the root state — no state of its own, no module.
+/// window controls right-aligned. A plain function on the root state
+/// — no state of its own, no module.
 fn topbar(state: &App) -> Element<'_, Message> {
     let selected_title: &str = state
         .sessions
@@ -396,7 +396,7 @@ fn topbar(state: &App) -> Element<'_, Message> {
         .unwrap_or("No session");
     // The two Fill regions flanking the title share the leftover
     // width equally, so the title stays centered no matter how wide
-    // the chip and window controls run.
+    // the window controls run.
     let title_row = iced::widget::row![
         drag_region(
             iced::widget::container(iced::widget::text("").size(FONT_SIZE_BODY))
@@ -409,11 +409,6 @@ fn topbar(state: &App) -> Element<'_, Message> {
         )),
         iced::widget::container(
             iced::widget::row![
-                kit::toggle_chip(
-                    "Todos",
-                    state.todo_drawer == TodoDrawer::Open,
-                    Message::ToggleTodoDrawer,
-                ),
                 kit::icon_button(
                     "−",
                     kit::IconButtonKind::Subtle,
