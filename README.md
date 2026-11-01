@@ -15,3 +15,5 @@ its governing contracts (`AGENTS.md`,
 Manifest is an independent project. It is not affiliated with or
 endorsed by Meta. Muse and Muse Code are trademarks of Meta
 Platforms, Inc.
+
+Licensed under the 0BSD license (see `LICENSE`).
