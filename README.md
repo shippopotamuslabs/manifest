@@ -16,4 +16,4 @@ Manifest is an independent project. It is not affiliated with or
 endorsed by Meta. Muse and Muse Code are trademarks of Meta
 Platforms, Inc.
 
-Licensed under the 0BSD license (see `LICENSE`).
+0BSD License. Do whatever you want with the code just don't sue me or expect it to work.
