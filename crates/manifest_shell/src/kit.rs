@@ -640,28 +640,6 @@ pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'
     .into()
 }
 
-/// Status-aware style for [`sticky_bubble`]: the same flat surface-2
-/// fill as [`prompt_bubble_style`], no border, no shadow. While the
-/// bubble is pushed (`square_top`), its real top edge sits above the
-/// window, so the top corners are square and only the bottom corners
-/// keep the panel radius; once settled the full panel radius returns.
-fn sticky_bubble_style(square_top: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_theme: &Theme| container::Style {
-        background: Some(Background::Color(SURFACE_2)),
-        border: Border::default().width(0.0).rounded(if square_top {
-            iced::border::Radius {
-                top_left: 0.0,
-                top_right: 0.0,
-                bottom_right: RADIUS_PANEL,
-                bottom_left: RADIUS_PANEL,
-            }
-        } else {
-            RADIUS_PANEL.into()
-        }),
-        ..container::Style::default()
-    }
-}
-
 /// The sticky prompt window: a container sized to exactly the visible
 /// slice of the stuck bubble, with its text slid up inside by `push`.
 ///
@@ -693,7 +671,7 @@ pub(crate) fn sticky_bubble<'a, Message: Clone + 'a>(
         left: SPACE_XL,
     })
     .clip(true)
-    .style(sticky_bubble_style(push > 0.0))
+    .style(prompt_bubble_style)
     .into()
 }
 
