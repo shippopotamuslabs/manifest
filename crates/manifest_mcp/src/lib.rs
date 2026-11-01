@@ -45,12 +45,62 @@ impl ServerConfig {
 
     /// Build a config from the environment.
     ///
-    /// The command comes from `MANIFEST_MUSE_MCP_BIN` when set, and
-    /// defaults to `muse-mcp` otherwise. Args and envs are empty.
+    /// The command resolves in this order (first hit wins):
+    ///
+    /// 1. `MANIFEST_MUSE_MCP_BIN` when set, returned verbatim even if
+    ///    the file does not exist (an explicit user choice is never
+    ///    second-guessed; the spawn error path explains a bad path).
+    /// 2. `muse-code-mcp/bin/muse-mcp` next to the running binary
+    ///    (installed sidecar layout).
+    /// 3. `../share/manifest/muse-code-mcp/bin/muse-mcp` relative to
+    ///    the running binary (prefix layout: `$PREFIX/bin/manifest`
+    ///    with the payload under `$PREFIX/share/manifest/`).
+    /// 4. `bundled/muse-code-mcp/bin/muse-mcp` in a dev checkout
+    ///    (relative to `CARGO_MANIFEST_DIR`; absent on machines
+    ///    without the checkout, so the candidate is simply skipped).
+    /// 5. `muse-mcp` resolved from `PATH`.
+    ///
+    /// Args and envs are empty.
     pub fn from_env() -> Self {
-        let command =
-            std::env::var("MANIFEST_MUSE_MCP_BIN").unwrap_or_else(|_| String::from("muse-mcp"));
-        Self::new(command)
+        Self::new(Self::resolve_command(
+            std::env::var("MANIFEST_MUSE_MCP_BIN").ok(),
+            std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(|p| p.parent()),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            std::path::Path::is_file,
+        ))
+    }
+
+    /// Resolve the server command from its candidates.
+    ///
+    /// Pure over its inputs so the resolution order is unit-testable;
+    /// [`ServerConfig::from_env`] feeds it the real values.
+    fn resolve_command(
+        env_bin: Option<String>,
+        exe_dir: Option<&std::path::Path>,
+        manifest_dir: &std::path::Path,
+        is_file: impl Fn(&std::path::Path) -> bool,
+    ) -> String {
+        if let Some(bin) = env_bin {
+            return bin;
+        }
+        if let Some(dir) = exe_dir {
+            let sidecar = dir.join("muse-code-mcp/bin/muse-mcp");
+            if is_file(&sidecar) {
+                return sidecar.to_string_lossy().into_owned();
+            }
+            let shared = dir.join("../share/manifest/muse-code-mcp/bin/muse-mcp");
+            if is_file(&shared) {
+                return shared.to_string_lossy().into_owned();
+            }
+        }
+        let dev = manifest_dir.join("../../bundled/muse-code-mcp/bin/muse-mcp");
+        if is_file(&dev) {
+            return dev.to_string_lossy().into_owned();
+        }
+        String::from("muse-mcp")
     }
 }
 
@@ -97,5 +147,117 @@ pub fn connect(config: ServerConfig, events: Sender<EngineEvent>) -> MuseEngine 
     std::thread::spawn(move || worker::run(config, events, worker_rx, worker_tx));
     MuseEngine {
         worker_tx: engine_tx,
+    }
+}
+
+#[cfg(test)]
+mod resolve_command_tests {
+    use super::ServerConfig;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    fn resolve(
+        env_bin: Option<&str>,
+        exe_dir: Option<&str>,
+        manifest_dir: &str,
+        existing: &[&str],
+    ) -> String {
+        let present: HashSet<PathBuf> = existing.iter().copied().map(PathBuf::from).collect();
+        ServerConfig::resolve_command(
+            env_bin.map(String::from),
+            exe_dir.map(Path::new),
+            Path::new(manifest_dir),
+            |p| present.contains(p),
+        )
+    }
+
+    fn exe_paths(exe_dir: &str, manifest_dir: &str) -> (String, String, String) {
+        let dir = Path::new(exe_dir);
+        (
+            dir.join("muse-code-mcp/bin/muse-mcp")
+                .to_string_lossy()
+                .into_owned(),
+            dir.join("../share/manifest/muse-code-mcp/bin/muse-mcp")
+                .to_string_lossy()
+                .into_owned(),
+            Path::new(manifest_dir)
+                .join("../../bundled/muse-code-mcp/bin/muse-mcp")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    #[test]
+    fn env_wins_over_everything() {
+        let (sidecar, shared, dev) = exe_paths("/prefix/bin", "/repo/crates/manifest_mcp");
+        let got = resolve(
+            Some("/custom/muse-mcp"),
+            Some("/prefix/bin"),
+            "/repo/crates/manifest_mcp",
+            &[&sidecar, &shared, &dev],
+        );
+        assert_eq!(got, "/custom/muse-mcp");
+    }
+
+    #[test]
+    fn env_returned_verbatim_even_when_missing() {
+        let got = resolve(Some("/does/not/exist"), Some("/prefix/bin"), "/repo", &[]);
+        assert_eq!(got, "/does/not/exist");
+    }
+
+    #[test]
+    fn sidecar_beats_share_beats_dev() {
+        let (sidecar, shared, dev) = exe_paths("/prefix/bin", "/repo/crates/manifest_mcp");
+        let got = resolve(
+            None,
+            Some("/prefix/bin"),
+            "/repo/crates/manifest_mcp",
+            &[&sidecar, &shared, &dev],
+        );
+        assert_eq!(got, sidecar);
+
+        let got = resolve(
+            None,
+            Some("/prefix/bin"),
+            "/repo/crates/manifest_mcp",
+            &[&shared, &dev],
+        );
+        assert_eq!(got, shared);
+
+        let got = resolve(
+            None,
+            Some("/prefix/bin"),
+            "/repo/crates/manifest_mcp",
+            &[&dev],
+        );
+        assert_eq!(got, dev);
+    }
+
+    #[test]
+    fn dev_used_when_installed_candidates_absent() {
+        let (_, _, dev) = exe_paths("/prefix/bin", "/repo/crates/manifest_mcp");
+        let got = resolve(
+            None,
+            Some("/prefix/bin"),
+            "/repo/crates/manifest_mcp",
+            &[&dev],
+        );
+        assert_eq!(got, dev);
+    }
+
+    #[test]
+    fn falls_back_to_path_lookup_when_nothing_exists() {
+        let got = resolve(None, Some("/prefix/bin"), "/repo/crates/manifest_mcp", &[]);
+        assert_eq!(got, "muse-mcp");
+    }
+
+    #[test]
+    fn exe_dir_none_skips_installed_candidates() {
+        let (_, _, dev) = exe_paths("/prefix/bin", "/repo/crates/manifest_mcp");
+        let got = resolve(None, None, "/repo/crates/manifest_mcp", &[&dev]);
+        assert_eq!(got, dev);
+
+        let got = resolve(None, None, "/repo/crates/manifest_mcp", &[]);
+        assert_eq!(got, "muse-mcp");
     }
 }

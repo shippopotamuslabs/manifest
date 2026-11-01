@@ -1,3 +1,6 @@
 [submodule "contracts/gospel"]
 	path = contracts/gospel
 	url = https://github.com/shippopotamuslabs/gospels.git
+[submodule "bundled/muse-code-mcp"]
+	path = bundled/muse-code-mcp
+	url = https://github.com/shippopotamuslabs/muse-code-mcp.git
