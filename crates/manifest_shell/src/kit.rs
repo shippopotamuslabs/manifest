@@ -11,14 +11,14 @@
 //! is the one exception — its border marks where typing lands,
 //! an affordance rather than a card edge.
 //!
-use iced::widget::{button, container, text, text_input};
+use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BORDER_DEFAULT, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_M,
-    SPACE_S, SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY,
-    TEXT_TERTIARY,
+    BORDER_DEFAULT, COMPOSER_LINE_HEIGHT, FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL,
+    ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_M, SPACE_S, SPACE_XS, SURFACE_1,
+    SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The two pill-button treatments.
@@ -391,9 +391,168 @@ pub(crate) fn drawer_header<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// Status-aware style for the multi-line composer input: the bar
+/// surface, no border, faint placeholder, primary value text, and the
+/// muted accent selection wash.
+fn composer_input_style(_theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(SURFACE_1),
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+        placeholder: TEXT_FAINT,
+        value: TEXT_PRIMARY,
+        selection: ACCENT_MUTED_BG,
+    }
+}
+
+/// The multi-line composer input. Its height grows with
+/// `visible_lines` up to [`COMPOSER_MAX_LINES`]; past that cap the
+/// caller holds the height fixed and the editor scrolls internally,
+/// so later slices inherit the growth contract from this constructor.
+pub(crate) fn composer_input<'a, Message: Clone + 'a>(
+    content: &'a text_editor::Content,
+    visible_lines: usize,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
+    text_editor::TextEditor::new(content)
+        .placeholder("Message the agent...")
+        .on_action(on_action)
+        .size(FONT_SIZE_BODY)
+        .line_height(COMPOSER_LINE_HEIGHT / FONT_SIZE_BODY)
+        .padding(SPACE_XS)
+        .height(Length::Fixed(
+            visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * SPACE_XS,
+        ))
+        .style(composer_input_style)
+        .into()
+}
+
+/// The two icon-button treatments for the inside-bar buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IconButtonKind {
+    Accent,
+    Subtle,
+}
+
+/// Pure data mapping behind the icon-button styles: background and
+/// glyph color for a kind in a status. Kept as data (not `Style`) so
+/// the mapping is unit-testable without constructing widgets.
+pub(crate) fn icon_button_colors(
+    kind: IconButtonKind,
+    status: button::Status,
+) -> (Option<Color>, Color) {
+    match kind {
+        IconButtonKind::Accent => {
+            let background = match status {
+                button::Status::Active => ACCENT_BASE,
+                button::Status::Hovered => ACCENT_HOVER,
+                button::Status::Pressed => ACCENT_ACTIVE,
+                button::Status::Disabled => SURFACE_2,
+            };
+            let glyph = match status {
+                button::Status::Disabled => TEXT_FAINT,
+                _ => BG_BASE,
+            };
+            (Some(background), glyph)
+        }
+        IconButtonKind::Subtle => {
+            let background = match status {
+                button::Status::Hovered | button::Status::Pressed => Some(SURFACE_2),
+                button::Status::Active | button::Status::Disabled => None,
+            };
+            let glyph = match status {
+                button::Status::Active => TEXT_SECONDARY,
+                button::Status::Hovered | button::Status::Pressed => TEXT_PRIMARY,
+                button::Status::Disabled => TEXT_FAINT,
+            };
+            (background, glyph)
+        }
+    }
+}
+
+/// Status-aware style for [`IconButtonKind::Accent`].
+fn accent_icon_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = icon_button_colors(IconButtonKind::Accent, status);
+    // The accent mapping always yields a background; the fallback keeps
+    // styling total without a panic path.
+    let background = match background {
+        Some(color) => color,
+        None => SURFACE_2,
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
+        ..button::Style::default()
+    }
+}
+
+/// Status-aware style for [`IconButtonKind::Subtle`].
+fn subtle_icon_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = icon_button_colors(IconButtonKind::Subtle, status);
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
+        ..button::Style::default()
+    }
+}
+
+/// A circular icon button: a fixed-square button with the glyph
+/// centered. Accent follows the primary pill; Subtle is transparent
+/// at rest since it sits on the bar surface. `on_press: None` renders
+/// disabled and emits no message.
+pub(crate) fn icon_button<'a, Message: Clone + 'a>(
+    glyph: &'a str,
+    kind: IconButtonKind,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let style = match kind {
+        IconButtonKind::Accent => accent_icon_style,
+        IconButtonKind::Subtle => subtle_icon_style,
+    };
+    button(container(text(glyph).size(FONT_SIZE_HEADING)).center(Length::Fixed(ICON_BUTTON_SIZE)))
+        .width(Length::Fixed(ICON_BUTTON_SIZE))
+        .height(Length::Fixed(ICON_BUTTON_SIZE))
+        .padding(0.0)
+        .on_press_maybe(on_press)
+        .style(style)
+        .into()
+}
+
+/// A fixture label: static display only, deliberately not a button,
+/// for the composer sub-bar values in this slice.
+pub(crate) fn static_pill<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(FONT_SIZE_SMALL).color(TEXT_SECONDARY))
+        .padding([SPACE_XS, SPACE_S])
+        .style(panel_flat_pill_style)
+        .into()
+}
+
+/// Status-aware style for [`static_pill`]: flat surface fill, no
+/// border, pill radius.
+fn panel_flat_pill_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE_1)),
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
+        ..container::Style::default()
+    }
+}
+
+/// The composer input bar: a flat panel-surface container holding the
+/// input row, full width with bar padding.
+pub(crate) fn input_bar<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .style(panel_style)
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ButtonKind, button_colors};
+    use super::{ButtonKind, IconButtonKind, button_colors, icon_button_colors};
     use crate::theme::{
         ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, SURFACE_1, SURFACE_2, TEXT_FAINT,
         TEXT_PRIMARY, TEXT_SECONDARY,
@@ -417,6 +576,46 @@ mod tests {
         assert_eq!(
             button_colors(ButtonKind::Primary, button::Status::Disabled),
             (Some(SURFACE_2), TEXT_FAINT)
+        );
+    }
+
+    #[test]
+    fn accent_icon_colors_follow_primary() {
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Accent, button::Status::Active),
+            (Some(ACCENT_BASE), BG_BASE)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Accent, button::Status::Hovered),
+            (Some(ACCENT_HOVER), BG_BASE)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Accent, button::Status::Pressed),
+            (Some(ACCENT_ACTIVE), BG_BASE)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Accent, button::Status::Disabled),
+            (Some(SURFACE_2), TEXT_FAINT)
+        );
+    }
+
+    #[test]
+    fn subtle_icon_colors_stay_transparent_at_rest() {
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Subtle, button::Status::Active),
+            (None, TEXT_SECONDARY)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Subtle, button::Status::Hovered),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Subtle, button::Status::Pressed),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            icon_button_colors(IconButtonKind::Subtle, button::Status::Disabled),
+            (None, TEXT_FAINT)
         );
     }
 

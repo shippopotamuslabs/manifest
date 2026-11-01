@@ -81,6 +81,11 @@ pub const FONT_SIZE_TITLE: f32 = 20.0;
 
 // Modal dim over the workspace while a popup is open.
 pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
+// Composer input geometry: visible line cap, per-line height, and the
+// fixed square of the inside-bar icon buttons.
+pub const COMPOSER_MAX_LINES: usize = 5;
+pub const COMPOSER_LINE_HEIGHT: f32 = 21.0;
+pub const ICON_BUTTON_SIZE: f32 = 30.0;
 // Fixed width of the add-project popup.
 pub const POPUP_WIDTH: f32 = 420.0;
 

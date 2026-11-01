@@ -27,7 +27,7 @@ pub enum TodoDrawer {
 }
 
 /// Root messages, enumerated before the view (UI contract §1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// A session-list message, routed to [`sessions::State`].
     Sessions(sessions::Message),
@@ -250,6 +250,21 @@ fn todo_drawer_view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::widget::text_editor;
+
+    /// Types text into the composer through edit actions.
+    fn type_composer_text(app: &mut App, text: &str) {
+        for next in text.chars() {
+            let edit = if next == '\n' {
+                text_editor::Edit::Enter
+            } else {
+                text_editor::Edit::Insert(next)
+            };
+            let _ = app.update(Message::Composer(composer::Message::Edit(
+                text_editor::Action::Edit(edit),
+            )));
+        }
+    }
 
     #[test]
     fn drawer_toggle_opens_from_peek() {
@@ -302,26 +317,22 @@ mod tests {
         let target = got.sessions.groups[0].sessions[1].id.clone();
         let _ = got.update(Message::Sessions(sessions::Message::Select(target.clone())));
         assert_eq!(got.sessions.selected, target);
-        let _ = got.update(Message::Composer(composer::Message::DraftChanged(
-            String::from("draft text"),
-        )));
+        type_composer_text(&mut got, "draft text");
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.sessions.selected, target);
-        assert_eq!(got.composer.draft, "draft text");
+        assert_eq!(got.composer.content.text(), "draft text");
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
     }
 
     #[test]
     fn draft_preserved_across_drawer_toggles() {
         let mut got = App::boot();
-        let _ = got.update(Message::Composer(composer::Message::DraftChanged(
-            String::from("keep me"),
-        )));
+        type_composer_text(&mut got, "keep me");
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Peek);
-        assert_eq!(got.composer.draft, "keep me");
+        assert_eq!(got.composer.content.text(), "keep me");
     }
 
     #[test]
@@ -330,11 +341,9 @@ mod tests {
         let _ = got.update(Message::ToggleTodoDrawer);
         let target = got.sessions.groups[0].sessions[1].id.clone();
         let _ = got.update(Message::Sessions(sessions::Message::Select(target)));
-        let _ = got.update(Message::Composer(composer::Message::DraftChanged(
-            String::from("hello"),
-        )));
+        type_composer_text(&mut got, "hello");
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
-        assert_eq!(got.composer.draft, "hello");
+        assert_eq!(got.composer.content.text(), "hello");
     }
 
     #[test]
@@ -360,11 +369,9 @@ mod tests {
         let mut got = App::boot();
         let _ = got.update(Message::Sessions(sessions::Message::OpenAddProject));
         let _ = got.update(Message::ToggleTodoDrawer);
-        let _ = got.update(Message::Composer(composer::Message::DraftChanged(
-            String::from("draft text"),
-        )));
+        type_composer_text(&mut got, "draft text");
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
-        assert_eq!(got.composer.draft, "draft text");
+        assert_eq!(got.composer.content.text(), "draft text");
         assert_eq!(
             got.sessions.add_project,
             sessions::AddProject::Open {
