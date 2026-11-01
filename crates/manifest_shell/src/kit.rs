@@ -5,14 +5,20 @@
 //! themselves (UI contract §5, plan D5). Colors, spacing, radii, and
 //! type sizes come from [`crate::theme`] tokens only — no literals here.
 //!
+//! Surfaces are borderless: panels, rows, chips, and buttons keep
+//! their rounded corners but carry no border width, so state reads
+//! through flat background fills alone. The single-line text field
+//! is the one exception — its border marks where typing lands,
+//! an affordance rather than a card edge.
+//!
 use iced::widget::{button, container, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BORDER_DEFAULT, BORDER_SUBTLE, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, RADIUS_PILL,
-    SPACE_M, SPACE_S, SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_TERTIARY,
+    BORDER_DEFAULT, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, RADIUS_PILL, SPACE_M, SPACE_S,
+    SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY,
+    TEXT_TERTIARY,
 };
 
 /// The two pill-button treatments.
@@ -68,10 +74,7 @@ fn primary_style(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
         background: Some(Background::Color(background)),
         text_color,
-        border: Border::default()
-            .color(background)
-            .width(1.0)
-            .rounded(RADIUS_PILL),
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
         ..button::Style::default()
     }
 }
@@ -79,17 +82,10 @@ fn primary_style(_theme: &Theme, status: button::Status) -> button::Style {
 /// Status-aware style for [`ButtonKind::Ghost`].
 fn ghost_style(_theme: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = button_colors(ButtonKind::Ghost, status);
-    let border_color = match status {
-        button::Status::Disabled => BORDER_SUBTLE,
-        _ => BORDER_DEFAULT,
-    };
     button::Style {
         background: background.map(Background::Color),
         text_color,
-        border: Border::default()
-            .color(border_color)
-            .width(1.0)
-            .rounded(RADIUS_PILL),
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
         ..button::Style::default()
     }
 }
@@ -113,14 +109,11 @@ pub(crate) fn pill_button<'a, Message: Clone + 'a>(
         .into()
 }
 
-/// A panel: surface-1 fill, default border, panel radius, medium padding.
+/// A panel: surface-1 fill, no border, panel radius, medium padding.
 fn panel_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(SURFACE_1)),
-        border: Border::default()
-            .color(BORDER_DEFAULT)
-            .width(1.0)
-            .rounded(RADIUS_PANEL),
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
         ..container::Style::default()
     }
 }
@@ -193,18 +186,10 @@ fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style
                 button::Status::Active | button::Status::Disabled => None,
             }
         };
-        let border_color = if selected {
-            ACCENT_BORDER_SUBTLE
-        } else {
-            BORDER_DEFAULT
-        };
         button::Style {
             background: background.map(Background::Color),
             text_color: TEXT_PRIMARY,
-            border: Border::default()
-                .color(border_color)
-                .width(1.0)
-                .rounded(RADIUS_PANEL),
+            border: Border::default().width(0.0).rounded(RADIUS_PANEL),
             ..button::Style::default()
         }
     }
@@ -237,12 +222,8 @@ pub(crate) fn list_row<'a, Message: Clone + 'a>(
 /// Status-aware style for a toggle chip.
 fn chip_style(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme: &Theme, status: button::Status| {
-        let (background, border_color, text_color) = if on {
-            (
-                Some(ACCENT_MUTED_BG),
-                ACCENT_BORDER_SUBTLE,
-                TEXT_HIGH,
-            )
+        let (background, text_color) = if on {
+            (Some(ACCENT_MUTED_BG), TEXT_HIGH)
         } else {
             let background = match status {
                 button::Status::Hovered | button::Status::Pressed => Some(SURFACE_1),
@@ -253,22 +234,19 @@ fn chip_style(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
                 button::Status::Active => TEXT_SECONDARY,
                 button::Status::Disabled => TEXT_FAINT,
             };
-            (background, BORDER_DEFAULT, text_color)
+            (background, text_color)
         };
         button::Style {
             background: background.map(Background::Color),
             text_color,
-            border: Border::default()
-                .color(border_color)
-                .width(1.0)
-                .rounded(RADIUS_PILL),
+            border: Border::default().width(0.0).rounded(RADIUS_PILL),
             ..button::Style::default()
         }
     }
 }
 
 /// A pill toggle chip (a button, not a switch): the on state carries the
-/// muted accent wash with an accent border.
+/// muted accent wash fill and nothing else.
 pub(crate) fn toggle_chip<'a, Message: Clone + 'a>(
     label: &'a str,
     on: bool,
@@ -278,6 +256,83 @@ pub(crate) fn toggle_chip<'a, Message: Clone + 'a>(
         .padding(SPACE_S)
         .on_press(on_toggle)
         .style(chip_style(on))
+        .into()
+}
+
+/// The shared Todos bar row: a small label, the current todo in a
+/// fill-width container so it bounds the text, and the small summary.
+/// Both the peek strip and the expanded drawer header show this row.
+fn todo_bar_row<'a, Message: 'a>(
+    current: &'a str,
+    summary: &'a str,
+) -> iced::widget::Row<'a, Message> {
+    iced::widget::row![
+        text("Todos").size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
+        iced::widget::container(text(current).size(FONT_SIZE_SMALL).color(TEXT_PRIMARY),)
+            .width(Length::Fill),
+        text(summary).size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
+    ]
+    .spacing(SPACE_S)
+    .width(Length::Fill)
+}
+
+/// Status-aware style for the peek strip: flat surface-1 fill,
+/// surface-2 on hover and press, no border, no shadow.
+fn peek_strip_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => SURFACE_2,
+        button::Status::Active | button::Status::Disabled => SURFACE_1,
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: TEXT_PRIMARY,
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+        ..button::Style::default()
+    }
+}
+
+/// The collapsed Todos drawer: a full-width strip with a flat fill.
+/// Always rendered while todos exist; pressing it opens the drawer.
+pub(crate) fn peek_strip<'a, Message: Clone + 'a>(
+    current: &'a str,
+    summary: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    button(todo_bar_row(current, summary))
+        .width(Length::Fill)
+        .padding([SPACE_S, SPACE_M])
+        .on_press(on_press)
+        .style(peek_strip_style)
+        .into()
+}
+
+/// Status-aware style for the expanded drawer header: transparent at
+/// rest, surface-2 on hover and press, no border, no shadow.
+fn drawer_header_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(SURFACE_2),
+        button::Status::Active | button::Status::Disabled => None,
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color: TEXT_PRIMARY,
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+        ..button::Style::default()
+    }
+}
+
+/// The expanded drawer's header: the shared row on a transparent
+/// button. Pressing it collapses the drawer back to the peek strip.
+pub(crate) fn drawer_header<'a, Message: Clone + 'a>(
+    current: &'a str,
+    summary: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    button(todo_bar_row(current, summary))
+        .width(Length::Fill)
+        .padding([SPACE_S, SPACE_M])
+        .on_press(on_press)
+        .style(drawer_header_style)
         .into()
 }
 

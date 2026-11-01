@@ -27,6 +27,7 @@ pub const SURFACE_3: Color = Color::from_rgb8(0x27, 0x2A, 0x33);
 pub const BORDER_DEFAULT: Color = Color::from_rgb8(0x2A, 0x2E, 0x39);
 #[allow(dead_code)]
 pub const BORDER_STRONG: Color = Color::from_rgb8(0x34, 0x3A, 0x48);
+#[allow(dead_code)]
 pub const BORDER_SUBTLE: Color = Color::from_rgb8(0x20, 0x22, 0x2E);
 
 // Text ramp.

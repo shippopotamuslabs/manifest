@@ -10,8 +10,8 @@ use manifest_domain::{Fixture, TodoItem};
 
 use crate::kit;
 use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL, FONT_SIZE_TITLE, SPACE_M, SPACE_S,
-    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, SPACE_M, SPACE_S, TEXT_PRIMARY,
+    TEXT_SECONDARY, TEXT_TERTIARY,
 };
 use crate::{composer, sessions, transcript};
 
@@ -19,9 +19,9 @@ use crate::{composer, sessions, transcript};
 /// (UI contract §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TodoDrawer {
-    /// The drawer is hidden.
+    /// The drawer is a slim peek strip above the composer.
     #[default]
-    Closed,
+    Peek,
     /// The drawer lists fixture todos between transcript and composer.
     Open,
 }
@@ -33,7 +33,7 @@ pub enum Message {
     Sessions(sessions::Message),
     /// A composer message, routed to [`composer::State`].
     Composer(composer::Message),
-    /// Toggles the TODO drawer open and closed.
+    /// Toggles the TODO drawer between peek strip and open.
     ToggleTodoDrawer,
 }
 
@@ -60,22 +60,38 @@ pub struct App {
     pub composer: composer::State,
     /// Checklist shown in the drawer, from the fixture.
     pub todos: Vec<TodoItem>,
-    /// Whether the TODO drawer is visible.
+    /// Whether the TODO drawer is a peek strip or open.
     pub todo_drawer: TodoDrawer,
+    /// Precomputed "<done> of <total> done" line for the drawer bar.
+    pub todo_summary: String,
+    /// Label of the first unfinished todo, for the drawer bar.
+    pub current_todo: Option<String>,
 }
 
 impl App {
     /// Builds shell state from domain values. Pure: no Iced runtime, so
     /// headless tests drive it directly. Default selection is the first
-    /// session; the drawer starts closed. Empty session lists fall back
-    /// to the sessions-state placeholder (no `unwrap` / panic paths).
+    /// session; the drawer starts as a peek strip. The drawer bar
+    /// strings are precomputed here so the view formats nothing
+    /// (UI contract §2). Empty session lists fall back to the
+    /// sessions-state placeholder (no `unwrap` / panic paths).
     pub fn from_fixture(fixture: Fixture) -> Self {
+        let done = fixture.todos.iter().filter(|todo| todo.done).count();
+        let total = fixture.todos.len();
+        let todo_summary = format!("{done} of {total} done");
+        let current_todo = fixture
+            .todos
+            .iter()
+            .find(|todo| !todo.done)
+            .map(|todo| todo.label.clone());
         App {
             sessions: sessions::State::from_sessions(fixture.sessions),
             transcript: transcript::State::from_items(fixture.transcript),
             composer: composer::State::new(),
             todos: fixture.todos,
-            todo_drawer: TodoDrawer::Closed,
+            todo_drawer: TodoDrawer::Peek,
+            todo_summary,
+            current_todo,
         }
     }
 
@@ -92,8 +108,8 @@ impl App {
             Message::Composer(child) => self.composer.update(child),
             Message::ToggleTodoDrawer => {
                 self.todo_drawer = match self.todo_drawer {
-                    TodoDrawer::Closed => TodoDrawer::Open,
-                    TodoDrawer::Open => TodoDrawer::Closed,
+                    TodoDrawer::Peek => TodoDrawer::Open,
+                    TodoDrawer::Open => TodoDrawer::Peek,
                 };
             }
         }
@@ -102,19 +118,26 @@ impl App {
 
     /// Renders the four regions: top bar, then a row splitting the
     /// session panel (`FillPortion(1)`) from the main column
-    /// (`FillPortion(4)`) of transcript, drawer (when open), composer.
+    /// (`FillPortion(4)`) of transcript, drawer (peek or open),
+    /// composer. The drawer always renders while todos exist.
     pub fn view(&self) -> Element<'_, Message> {
         let mut main = iced::widget::column![
-            iced::widget::container(
-                self.transcript.view().map(|never| match never {}),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill),
+            iced::widget::container(self.transcript.view().map(|never| match never {}),)
+                .width(Length::Fill)
+                .height(Length::Fill),
         ]
+        .spacing(SPACE_S)
         .width(Length::FillPortion(4))
         .height(Length::Fill);
-        if self.todo_drawer == TodoDrawer::Open {
-            main = main.push(todo_drawer_view(&self.todos));
+        if !self.todos.is_empty() {
+            let current = self.current_todo.as_deref().unwrap_or("All done");
+            let drawer: Element<'_, Message> = match self.todo_drawer {
+                TodoDrawer::Peek => {
+                    kit::peek_strip(current, &self.todo_summary, Message::ToggleTodoDrawer)
+                }
+                TodoDrawer::Open => todo_drawer_view(&self.todos, current, &self.todo_summary),
+            };
+            main = main.push(drawer);
         }
         let main: Element<'_, Message> = main
             .push(
@@ -179,14 +202,19 @@ fn topbar(state: &App) -> Element<'_, Message> {
     .into()
 }
 
-/// The open TODO drawer: a panel listing each todo, finished steps in
-/// the tertiary tone. Plain text lines — no extra widget kinds.
-fn todo_drawer_view(todos: &[TodoItem]) -> Element<'_, Message> {
-    let mut list = iced::widget::column![
-        iced::widget::text("Todos")
-            .size(FONT_SIZE_HEADING)
-            .color(TEXT_SECONDARY),
-    ]
+/// The open TODO drawer: a panel whose first row is the shared bar
+/// header, followed by one line per todo with finished steps in the
+/// tertiary tone. Plain text lines — no extra widget kinds.
+fn todo_drawer_view<'a>(
+    todos: &'a [TodoItem],
+    current: &'a str,
+    summary: &'a str,
+) -> Element<'a, Message> {
+    let mut list = iced::widget::column![kit::drawer_header(
+        current,
+        summary,
+        Message::ToggleTodoDrawer
+    ),]
     .spacing(SPACE_S)
     .width(Length::Fill);
     for todo in todos {
@@ -220,32 +248,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drawer_toggle_opens_from_closed() {
+    fn drawer_toggle_opens_from_peek() {
         let mut got = App::boot();
-        assert_eq!(got.todo_drawer, TodoDrawer::Closed);
+        assert_eq!(got.todo_drawer, TodoDrawer::Peek);
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
     }
 
     #[test]
-    fn drawer_toggle_closes_from_open() {
+    fn drawer_toggle_peeks_from_open() {
         let mut got = App::boot();
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
         let _ = got.update(Message::ToggleTodoDrawer);
-        assert_eq!(got.todo_drawer, TodoDrawer::Closed);
+        assert_eq!(got.todo_drawer, TodoDrawer::Peek);
     }
 
     #[test]
-    fn boot_selects_first_session_with_drawer_closed() {
+    fn boot_precomputes_drawer_bar_strings() {
+        let got = App::boot();
+        assert_eq!(got.todo_summary, "1 of 4 done");
+        assert_eq!(
+            got.current_todo,
+            Some(String::from("Move token refresh into the request path")),
+        );
+    }
+
+    #[test]
+    fn boot_selects_first_session_with_drawer_peeking() {
         let fixture = manifest_domain::fixture();
         let got = App::from_fixture(fixture.clone());
         assert!(got.sessions.sessions.len() >= 3);
-        assert_eq!(got.todo_drawer, TodoDrawer::Closed);
-        let first_id = fixture
-            .sessions
-            .first()
-            .map(|summary| summary.id.clone());
+        assert_eq!(got.todo_drawer, TodoDrawer::Peek);
+        let first_id = fixture.sessions.first().map(|summary| summary.id.clone());
         assert!(first_id.is_some());
         assert_eq!(got.sessions.selected, first_id.unwrap());
     }
@@ -274,7 +309,7 @@ mod tests {
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
         let _ = got.update(Message::ToggleTodoDrawer);
-        assert_eq!(got.todo_drawer, TodoDrawer::Closed);
+        assert_eq!(got.todo_drawer, TodoDrawer::Peek);
         assert_eq!(got.composer.draft, "keep me");
     }
 
