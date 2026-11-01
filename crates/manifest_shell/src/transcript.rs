@@ -1,15 +1,14 @@
 //! Transcript: read-only history of the selected session.
 //!
 //! The transcript carries no messages in M1: it renders domain items
-//! and nothing else. State is the item list; each item is a plain
-//! column whose kind reads typographically, with no panel around it.
+//! and nothing else. State is the item list; items read typographically
+//! with no headers and no panel around them.
 
 use iced::{Element, Length};
 use manifest_domain::TranscriptItem;
 
-use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_SMALL, SPACE_M, SPACE_S, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
-};
+use crate::kit;
+use crate::theme::{FONT_SIZE_BODY, SPACE_M, TEXT_PRIMARY, TEXT_TERTIARY};
 
 /// Transcript state: the visible items in display order.
 #[derive(Debug, Clone, Default)]
@@ -24,8 +23,8 @@ impl State {
         State { items }
     }
 
-    /// Renders the scrollable transcript. Each item keeps its kind's
-    /// header ("You", "Assistant", "Tool note") and body text inside a
+    /// Renders the scrollable transcript. User prompts render as
+    /// filled bubbles; assistant and tool text sits unadorned in a
     /// fill-width container so long lines wrap (UI contract §4).
     pub fn view(&self) -> Element<'_, Message> {
         let mut list = iced::widget::column![].spacing(SPACE_M).width(Length::Fill);
@@ -47,27 +46,21 @@ pub enum Message {}
 /// Renders one transcript item, distinct by kind. Body text is borrowed,
 /// never cloned: the view reads `&self` (UI contract §2).
 fn render_item<'a>(item: &'a TranscriptItem) -> Element<'a, Message> {
-    let (header, header_color, body, body_color) = match item {
-        TranscriptItem::UserTurn { text } => ("You", TEXT_SECONDARY, text.as_str(), TEXT_PRIMARY),
-        TranscriptItem::AssistantTurn { text } => {
-            ("Assistant", TEXT_SECONDARY, text.as_str(), TEXT_PRIMARY)
-        }
-        TranscriptItem::ToolNote { text } => {
-            ("Tool note", TEXT_TERTIARY, text.as_str(), TEXT_TERTIARY)
-        }
-    };
-    iced::widget::column![
-        iced::widget::text(header)
-            .size(FONT_SIZE_SMALL)
-            .color(header_color),
-        iced::widget::container(
-            iced::widget::text(body)
+    match item {
+        TranscriptItem::UserTurn { text } => kit::prompt_bubble(text.as_str()),
+        TranscriptItem::AssistantTurn { text } => iced::widget::container(
+            iced::widget::text(text.as_str())
                 .size(FONT_SIZE_BODY)
-                .color(body_color),
+                .color(TEXT_PRIMARY),
         )
-        .width(Length::Fill),
-    ]
-    .spacing(SPACE_S)
-    .width(Length::Fill)
-    .into()
+        .width(Length::Fill)
+        .into(),
+        TranscriptItem::ToolNote { text } => iced::widget::container(
+            iced::widget::text(text.as_str())
+                .size(FONT_SIZE_BODY)
+                .color(TEXT_TERTIARY),
+        )
+        .width(Length::Fill)
+        .into(),
+    }
 }

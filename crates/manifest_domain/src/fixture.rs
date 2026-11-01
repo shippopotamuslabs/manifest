@@ -175,6 +175,56 @@ pub fn fixture() -> Fixture {
             TranscriptItem::UserTurn {
                 text: String::from("Go ahead and apply it, then rerun the suite."),
             },
+            TranscriptItem::AssistantTurn {
+                text: String::from(
+                    "Patch applied. The refresh now runs inside the request path, and an \
+                     expired token retries once before the sync reports an error.",
+                ),
+            },
+            TranscriptItem::ToolNote {
+                text: String::from("Ran checkout sync suite: 16 passed, 0 failed."),
+            },
+            TranscriptItem::AssistantTurn {
+                text: String::from(
+                    "All sixteen pass, including the two expired-token cases. The change \
+                     stays inside the sync client: no callers need updates, and the \
+                     startup refresh still runs as a warmup.",
+                ),
+            },
+            TranscriptItem::UserTurn {
+                text: String::from(
+                    "Good. Now check whether the settings sync has the same problem.",
+                ),
+            },
+            TranscriptItem::AssistantTurn {
+                text: String::from(
+                    "It does. Settings sync reads the token once when the screen opens \
+                     and never refreshes it, so a long-lived screen fails the same way \
+                     after expiry.",
+                ),
+            },
+            TranscriptItem::ToolNote {
+                text: String::from(
+                    "Searched token reads: settings sync reads at open (1 site), \
+                     checkout sync reads per request (1 site).",
+                ),
+            },
+            TranscriptItem::AssistantTurn {
+                text: String::from(
+                    "One read site to change. I can apply the same per-request refresh \
+                     there and add the expired-token case to the settings suite.",
+                ),
+            },
+            TranscriptItem::UserTurn {
+                text: String::from("Do it, then summarize both changes for the changelog."),
+            },
+            TranscriptItem::AssistantTurn {
+                text: String::from(
+                    "Done. Checkout sync and settings sync both refresh expired tokens \
+                     inside the request path and retry once. Both suites pass with the \
+                     new expired-token cases covered.",
+                ),
+            },
         ],
         todos: vec![
             TodoItem {

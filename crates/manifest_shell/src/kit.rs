@@ -528,6 +528,31 @@ pub(crate) fn static_pill<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a
         .into()
 }
 
+/// Status-aware style for [`prompt_bubble`]: flat surface-2 fill,
+/// no border, panel radius, no shadow.
+fn prompt_bubble_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE_2)),
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+        ..container::Style::default()
+    }
+}
+
+/// A user prompt bubble: body text on a flat surface-2 fill. Renders
+/// both the natural prompt in the scroll list and the sticky header
+/// copy, so it takes text only.
+pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'a, Message> {
+    container(
+        iced::widget::text(text)
+            .size(FONT_SIZE_BODY)
+            .color(TEXT_PRIMARY),
+    )
+    .width(Length::Fill)
+    .padding([SPACE_S, SPACE_M])
+    .style(prompt_bubble_style)
+    .into()
+}
+
 /// Status-aware style for [`static_pill`]: flat surface fill, no
 /// border, pill radius.
 fn panel_flat_pill_style(_theme: &Theme) -> container::Style {
