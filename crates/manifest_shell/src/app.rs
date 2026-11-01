@@ -10,8 +10,9 @@ use manifest_domain::{Fixture, TodoItem};
 
 use crate::kit;
 use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, SPACE_M, SPACE_S, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_TERTIARY,
+    FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
+    PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    WINDOW_RESIZE_HANDLE,
 };
 use crate::{composer, sessions, transcript};
 
@@ -24,6 +25,23 @@ pub enum TodoDrawer {
     Peek,
     /// The drawer lists fixture todos between transcript and composer.
     Open,
+}
+
+/// The side-panel divider drag has two real situations, so it is an
+/// enum, not a bool (UI contract §1).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PanelDrag {
+    /// No divider drag is in flight; panel events are not subscribed.
+    #[default]
+    Idle,
+    /// A divider drag is in flight. `offset` is the grab point: cursor x
+    /// minus panel width, captured on the first move after press so the
+    /// panel does not jump to the cursor.
+    Dragging {
+        /// Cursor-x minus panel-width at grab time; `None` until the
+        /// first move after press captures it.
+        offset: Option<f32>,
+    },
 }
 
 /// Root messages, enumerated before the view (UI contract §1).
@@ -39,6 +57,15 @@ pub enum Message {
     Transcript(transcript::Message),
     /// Toggles the TODO drawer between peek strip and open.
     ToggleTodoDrawer,
+    /// A press landed on the panel divider; the next moves resize.
+    PanelDragStarted,
+    /// The cursor moved; while a divider drag is in flight the panel
+    /// width tracks it.
+    PanelDragMoved(iced::Point),
+    /// The left button released; any divider drag ends.
+    PanelDragEnded,
+    /// Resizes the window from one corner while the handle is pressed.
+    ResizeWindow(iced::window::Direction),
     /// The runtime reported the latest window id at boot (or none).
     WindowIdentified(Option<iced::window::Id>),
     /// Starts dragging the (undecorated) window.
@@ -82,6 +109,10 @@ pub struct App {
     pub todos: Vec<TodoItem>,
     /// Whether the TODO drawer is a peek strip or open.
     pub todo_drawer: TodoDrawer,
+    /// Current width of the side panel; the divider drag rewrites it.
+    pub panel_width: f32,
+    /// Whether a divider drag is in flight.
+    pub panel_drag: PanelDrag,
     /// Precomputed "<done> of <total> done" line for the drawer bar.
     pub todo_summary: String,
     /// Label of the first unfinished todo, for the drawer bar.
@@ -114,6 +145,8 @@ impl App {
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
+            panel_width: PANEL_WIDTH_DEFAULT,
+            panel_drag: PanelDrag::Idle,
             window_id: None,
         }
     }
@@ -125,8 +158,9 @@ impl App {
 
     /// Root reducer. Child messages fold into child states; window
     /// messages run against the boot-reported window id, and fall back
-    /// to [`Task::none()`] while it is unknown. No `Subscription`
-    /// exists.
+    /// to [`Task::none()`] while it is unknown. Panel-drag moves only
+    /// fold while a drag is in flight; anything else is a no-op.
+    /// [`App::subscription`] feeds those moves while dragging.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Sessions(child) => {
@@ -148,6 +182,27 @@ impl App {
                 };
                 Task::none()
             }
+            Message::PanelDragStarted => {
+                self.panel_drag = PanelDrag::Dragging { offset: None };
+                Task::none()
+            }
+            Message::PanelDragMoved(point) => match self.panel_drag {
+                PanelDrag::Dragging { offset } => {
+                    let grab = offset.unwrap_or(point.x - self.panel_width);
+                    self.panel_drag = PanelDrag::Dragging { offset: Some(grab) };
+                    self.panel_width = (point.x - grab).clamp(PANEL_WIDTH_MIN, PANEL_WIDTH_MAX);
+                    Task::none()
+                }
+                PanelDrag::Idle => Task::none(),
+            },
+            Message::PanelDragEnded => {
+                self.panel_drag = PanelDrag::Idle;
+                Task::none()
+            }
+            Message::ResizeWindow(direction) => match self.window_id {
+                Some(id) => iced::window::drag_resize(id, direction),
+                None => Task::none(),
+            },
             Message::WindowIdentified(id) => {
                 self.window_id = id;
                 Task::none()
@@ -171,12 +226,23 @@ impl App {
         }
     }
 
-    /// Renders the title bar over a content row splitting the side
-    /// panel (`FillPortion(1)`) from the padded main column
-    /// (`FillPortion(4)`) of transcript, drawer (peek or open),
-    /// composer. The drawer always renders while todos exist. The
-    /// panel background and divider run the full height of the row:
-    /// the root column carries no outer padding.
+    /// Drag subscription: idle produces nothing; while a divider drag
+    /// is in flight, cursor moves resize the panel and releasing the
+    /// left button ends the drag. All other events map to nothing (the
+    /// status and window arguments are ignored).
+    pub fn subscription(&self) -> iced::Subscription<Message> {
+        match self.panel_drag {
+            PanelDrag::Idle => iced::Subscription::none(),
+            PanelDrag::Dragging { .. } => iced::event::listen_with(drag_event),
+        }
+    }
+
+    /// Renders the title bar over a content row splitting the fixed-width
+    /// side panel from the fill-width padded main column of transcript,
+    /// drawer (peek or open), composer. The drawer always renders while
+    /// todos exist. The panel background and divider run the full height
+    /// of the row: the root column carries no outer padding. Corner
+    /// resize handles float above the base layer, below any popup scrim.
     pub fn view(&self) -> Element<'_, Message> {
         // The stack root is unconditional so base keeps its widget state across popup changes.
         let mut main = iced::widget::column![
@@ -209,11 +275,13 @@ impl App {
                 iced::widget::container(kit::side_panel(
                     self.sessions.view().map(Message::Sessions)
                 ))
-                .width(Length::FillPortion(1))
+                .width(Length::Fixed(self.panel_width))
                 .height(Length::Fill),
-                kit::vertical_divider(),
+                iced::widget::mouse_area(kit::panel_divider())
+                    .on_press(Message::PanelDragStarted)
+                    .interaction(iced::mouse::Interaction::ResizingHorizontally),
                 iced::widget::container(main)
-                    .width(Length::FillPortion(4))
+                    .width(Length::Fill)
                     .height(Length::Fill)
                     .padding(SPACE_M),
             ]
@@ -224,6 +292,32 @@ impl App {
         .height(Length::Fill)
         .into();
         let mut stack = iced::widget::Stack::new().push(base);
+        // Window corner handles: NW-SE corners use the down-diagonal
+        // cursor, NE-SW corners the up-diagonal one.
+        stack = stack.push(resize_corner(
+            iced::window::Direction::NorthWest,
+            iced::mouse::Interaction::ResizingDiagonallyDown,
+            iced::alignment::Horizontal::Left,
+            iced::alignment::Vertical::Top,
+        ));
+        stack = stack.push(resize_corner(
+            iced::window::Direction::NorthEast,
+            iced::mouse::Interaction::ResizingDiagonallyUp,
+            iced::alignment::Horizontal::Right,
+            iced::alignment::Vertical::Top,
+        ));
+        stack = stack.push(resize_corner(
+            iced::window::Direction::SouthWest,
+            iced::mouse::Interaction::ResizingDiagonallyUp,
+            iced::alignment::Horizontal::Left,
+            iced::alignment::Vertical::Bottom,
+        ));
+        stack = stack.push(resize_corner(
+            iced::window::Direction::SouthEast,
+            iced::mouse::Interaction::ResizingDiagonallyDown,
+            iced::alignment::Horizontal::Right,
+            iced::alignment::Vertical::Bottom,
+        ));
         if let Some(popup) = self.sessions.add_project_view() {
             stack = stack.push(kit::scrim(popup.map(Message::Sessions)));
         }
@@ -247,10 +341,53 @@ fn drag_region<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Mess
         .into()
 }
 
-/// The title bar: the app title in a 1 share, then the selected
-/// session title truly centered in a 4 share with the Todos chip and
-/// window controls right-aligned. A plain function on the root state —
-/// no state of its own, no module.
+/// Maps runtime events to panel-drag messages for [`App::subscription`]:
+/// cursor moves track the panel, left-button release ends the drag,
+/// everything else maps to nothing.
+fn drag_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            Some(Message::PanelDragMoved(position))
+        }
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+            Some(Message::PanelDragEnded)
+        }
+        _ => None,
+    }
+}
+
+/// One window corner resize handle: a small press target pinned to a
+/// corner of the full window, with the diagonal cursor of its axis.
+fn resize_corner<'a>(
+    direction: iced::window::Direction,
+    interaction: iced::mouse::Interaction,
+    horizontal: iced::alignment::Horizontal,
+    vertical: iced::alignment::Vertical,
+) -> Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::mouse_area(
+            iced::widget::Space::new()
+                .width(Length::Fixed(WINDOW_RESIZE_HANDLE))
+                .height(Length::Fixed(WINDOW_RESIZE_HANDLE)),
+        )
+        .on_press(Message::ResizeWindow(direction))
+        .interaction(interaction),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(horizontal)
+    .align_y(vertical)
+    .into()
+}
+
+/// The title bar: the app title in the fixed panel share, then the
+/// selected session title truly centered in the fill share with the
+/// Todos chip and window controls right-aligned. A plain function on
+/// the root state — no state of its own, no module.
 fn topbar(state: &App) -> Element<'_, Message> {
     let selected_title: &str = state
         .sessions
@@ -305,9 +442,9 @@ fn topbar(state: &App) -> Element<'_, Message> {
                         .size(FONT_SIZE_TITLE)
                         .color(TEXT_PRIMARY),
                 )
-                .width(Length::FillPortion(1)),
+                .width(Length::Fixed(state.panel_width)),
             ),
-            iced::widget::container(title_row).width(Length::FillPortion(4)),
+            iced::widget::container(title_row).width(Length::Fill),
         ]
         .spacing(SPACE_M)
         .align_y(iced::alignment::Vertical::Center)
@@ -359,6 +496,7 @@ fn todo_drawer_view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN};
     use iced::widget::text_editor;
 
     /// Types text into the composer through edit actions.
@@ -394,9 +532,12 @@ mod tests {
         let _ = got.update(Message::MinimizeWindow);
         let _ = got.update(Message::ToggleMaximizeWindow);
         let _ = got.update(Message::CloseWindow);
+        let _ = got.update(Message::ResizeWindow(iced::window::Direction::SouthEast));
         assert_eq!(got.window_id, None);
         assert_eq!(got.todo_drawer, TodoDrawer::Open);
         assert_eq!(got.sessions.selected, target);
+        assert_eq!(got.panel_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(got.panel_drag, PanelDrag::Idle);
     }
 
     #[test]
@@ -541,5 +682,50 @@ mod tests {
                 name_edited: false,
             }
         );
+    }
+
+    #[test]
+    fn panel_drag_captures_offset_then_tracks() {
+        let mut got = App::boot();
+        assert_eq!(got.panel_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(got.panel_width, 260.0);
+        let _ = got.update(Message::PanelDragStarted);
+        assert_eq!(got.panel_drag, PanelDrag::Dragging { offset: None });
+        // Grab 40px into the hit zone: the panel must not jump.
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(300.0, 0.0)));
+        assert_eq!(got.panel_width, 260.0);
+        assert_eq!(got.panel_drag, PanelDrag::Dragging { offset: Some(40.0) });
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(340.0, 0.0)));
+        assert_eq!(got.panel_width, 300.0);
+        assert_eq!(got.panel_drag, PanelDrag::Dragging { offset: Some(40.0) });
+    }
+
+    #[test]
+    fn panel_drag_clamps_to_bounds() {
+        let mut got = App::boot();
+        let _ = got.update(Message::PanelDragStarted);
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(260.0, 0.0)));
+        assert_eq!(got.panel_width, 260.0);
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(100.0, 0.0)));
+        assert_eq!(got.panel_width, PANEL_WIDTH_MIN);
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(900.0, 0.0)));
+        assert_eq!(got.panel_width, PANEL_WIDTH_MAX);
+    }
+
+    #[test]
+    fn panel_drag_ends_and_idle_moves_are_noops() {
+        let mut got = App::boot();
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(500.0, 0.0)));
+        assert_eq!(got.panel_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(got.panel_drag, PanelDrag::Idle);
+        let _ = got.update(Message::PanelDragStarted);
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(260.0, 0.0)));
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(320.0, 0.0)));
+        assert_eq!(got.panel_width, 320.0);
+        let _ = got.update(Message::PanelDragEnded);
+        assert_eq!(got.panel_drag, PanelDrag::Idle);
+        let _ = got.update(Message::PanelDragMoved(iced::Point::new(200.0, 0.0)));
+        assert_eq!(got.panel_width, 320.0);
+        assert_eq!(got.panel_drag, PanelDrag::Idle);
     }
 }

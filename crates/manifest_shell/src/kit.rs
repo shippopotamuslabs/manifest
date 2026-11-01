@@ -16,10 +16,10 @@ use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_LINE_HEIGHT, FONT_SIZE_BODY,
-    FONT_SIZE_HEADING, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM,
-    SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH,
-    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_LINE_HEIGHT, DIVIDER_HIT_WIDTH,
+    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, RADIUS_PANEL,
+    RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SURFACE_1, SURFACE_2,
+    TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The two pill-button treatments.
@@ -161,11 +161,24 @@ fn vertical_divider_style(_theme: &Theme) -> container::Style {
 
 /// The thin divider between the side panel and the main chat: a 1px
 /// fixed-width, fill-height container in the subtle border tone.
-pub(crate) fn vertical_divider<'a, Message: Clone + 'a>() -> Element<'a, Message> {
+/// Only used as the visible line inside [`panel_divider`].
+fn vertical_divider<'a, Message: Clone + 'a>() -> Element<'a, Message> {
     container(text(""))
         .width(Length::Fixed(1.0))
         .height(Length::Fill)
         .style(vertical_divider_style)
+        .into()
+}
+
+/// The draggable divider between the side panel and the main chat: a
+/// fixed-width, fill-height hit zone with the 1px divider line
+/// centered horizontally inside it, so the grab target is wider than
+/// the visible line. The caller wraps this in a mouse area.
+pub(crate) fn panel_divider<'a, Message: Clone + 'a>() -> Element<'a, Message> {
+    container(vertical_divider())
+        .width(Length::Fixed(DIVIDER_HIT_WIDTH))
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
         .into()
 }
 
@@ -624,6 +637,63 @@ pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'
     .width(Length::Fill)
     .padding([SPACE_L, SPACE_XL])
     .style(prompt_bubble_style)
+    .into()
+}
+
+/// Status-aware style for [`sticky_bubble`]: the same flat surface-2
+/// fill as [`prompt_bubble_style`], no border, no shadow. While the
+/// bubble is pushed (`square_top`), its real top edge sits above the
+/// window, so the top corners are square and only the bottom corners
+/// keep the panel radius; once settled the full panel radius returns.
+fn sticky_bubble_style(square_top: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE_2)),
+        border: Border::default().width(0.0).rounded(if square_top {
+            iced::border::Radius {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_right: RADIUS_PANEL,
+                bottom_left: RADIUS_PANEL,
+            }
+        } else {
+            RADIUS_PANEL.into()
+        }),
+        ..container::Style::default()
+    }
+}
+
+/// The sticky prompt window: a container sized to exactly the visible
+/// slice of the stuck bubble, with its text slid up inside by `push`.
+///
+/// A styled container quad is never scissored to a clip rect in iced
+/// (`container::draw` paints `draw_background` with the container's
+/// full bounds whenever they intersect the viewport; only the text
+/// clips). So the bubble itself must be the window: its own bounds are
+/// the visible slice (`window_height`), and a negative top padding of
+/// `SPACE_L - push` performs the slide — the text glyphs clip at the
+/// window's top edge via the container's clipped viewport while the
+/// background can never paint above it. `push` is 0.0 when settled;
+/// positive while the incoming prompt pushes the sticky bubble out.
+pub(crate) fn sticky_bubble<'a, Message: Clone + 'a>(
+    text: &'a str,
+    window_height: f32,
+    push: f32,
+) -> Element<'a, Message> {
+    container(
+        iced::widget::text(text)
+            .size(FONT_SIZE_BODY)
+            .color(TEXT_PRIMARY),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(window_height.max(0.0)))
+    .padding(iced::Padding {
+        top: SPACE_L - push,
+        right: SPACE_XL,
+        bottom: SPACE_L,
+        left: SPACE_XL,
+    })
+    .clip(true)
+    .style(sticky_bubble_style(push > 0.0))
     .into()
 }
 

@@ -27,6 +27,7 @@ fn main() -> iced::Result {
     iced::application(boot, App::update, App::view)
         .title("Manifest")
         .theme(manifest_theme())
+        .subscription(App::subscription)
         .window(iced::window::Settings {
             decorations: false,
             ..iced::window::Settings::default()

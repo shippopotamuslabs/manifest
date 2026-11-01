@@ -12,14 +12,16 @@ use manifest_domain::TranscriptItem;
 use crate::kit;
 use crate::theme::{FONT_SIZE_BODY, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY, TEXT_TERTIARY};
 
-/// Default line spacing for transcript text. The transcript text
-/// widgets set no explicit line height, so they use the framework
-/// default of [`iced::widget::text::LineHeight::Relative`] 1.3.
+/// The text widgets' relative 1.3 line spacing. Confirmed against the
+/// live build in LOGICAL px: a one-line bubble measures ~55 logical px
+/// tall including its `2 * SPACE_L` vertical padding. Note screenshots
+/// are physical px and this desktop scales ~1.2x, so divide physical
+/// measurements by the scale factor before comparing.
 const LINE_HEIGHT: f32 = FONT_SIZE_BODY * 1.3;
-/// Mean glyph advance for the height estimator. Body-size proportional
-/// type averages near half an em; tune against the live build if the
+/// Mean glyph advance for the height estimator. Live ink extents measure
+/// ~0.45em at `FONT_SIZE_BODY`; tune against the live build if the
 /// sticky timing ever drifts from the real text.
-const ESTIMATED_CHAR_WIDTH: f32 = FONT_SIZE_BODY * 0.52;
+const ESTIMATED_CHAR_WIDTH: f32 = FONT_SIZE_BODY * 0.46;
 
 /// Transcript state: the visible items plus scroll-derived sticky data.
 #[derive(Debug, Clone, Default)]
@@ -148,12 +150,12 @@ impl State {
         let mut list = iced::widget::column![].width(Length::Fill);
         for (index, item) in self.items.iter().enumerate() {
             // The column carries no spacing of its own; every inter-item
-            // gap is an explicit spacer sized by `gap_after`, the same fn
+            // gap is an explicit spacer sized by `gap_between`, the same fn
             // `item_tops` accumulates, so view and estimator cannot drift.
             if index > 0 {
                 list = list.push(
                     iced::widget::Space::new()
-                        .height(Length::Fixed(gap_after(&self.items[index - 1]))),
+                        .height(Length::Fixed(gap_between(&self.items[index - 1], item))),
                 );
             }
             list = list.push(render_item(item));
@@ -171,19 +173,17 @@ impl State {
             self.sticky.and_then(|index| self.items.get(index))
         {
             let text = text.as_str();
-            // Top-anchored window onto the stuck bubble: the pin lifts the
-            // identical bubble up by `sticky_push` px and the clipped fixed
-            // container cuts whatever slides past the transcript's top edge,
-            // so the overlay can never paint over the top bar.
-            let overlay: Element<'_, Message> = iced::widget::container(
-                iced::widget::pin(kit::prompt_bubble(text)).y(-self.sticky_push),
-            )
-            .width(Length::Fill)
-            .height(Length::Fixed(
+            // The bubble is the window: it is sized to exactly the visible
+            // slice (the gap to the incoming prompt while pushing, the full
+            // height once settled) and its text slides up inside via
+            // negative top padding, clipping at the window's top edge. A
+            // styled container quad is never scissored to a clip rect, so
+            // no styled bounds may extend past the clip window.
+            let overlay: Element<'_, Message> = kit::sticky_bubble(
+                text,
                 (self.sticky_height - self.sticky_push).max(0.0),
-            ))
-            .clip(true)
-            .into();
+                self.sticky_push,
+            );
             stack = stack.push(overlay);
         }
         stack.into()
@@ -248,26 +248,28 @@ fn item_height(item: &TranscriptItem, content_width: f32) -> f32 {
     }
 }
 
-/// Gap before an item that follows `previous`: a user prompt leaves
-/// twice the column spacing behind it, every other kind leaves one.
+/// Gap between two adjacent items: double column spacing around a
+/// user prompt (above and below it), single spacing otherwise.
 /// Single source of truth for the view's extra spacer and `item_tops`.
-fn gap_after(previous: &TranscriptItem) -> f32 {
-    if matches!(previous, TranscriptItem::UserTurn { .. }) {
+fn gap_between(previous: &TranscriptItem, current: &TranscriptItem) -> f32 {
+    if matches!(previous, TranscriptItem::UserTurn { .. })
+        || matches!(current, TranscriptItem::UserTurn { .. })
+    {
         2.0 * SPACE_M
     } else {
         SPACE_M
     }
 }
 
-/// Top edge of every item in px. Items stack with [`gap_after`] of the
-/// previous item between them, no spacing before the first, and the
+/// Top edge of every item in px. Items stack with [`gap_between`] of the
+/// neighboring pair between them, no spacing before the first, and the
 /// content carries no other padding.
 fn item_tops(items: &[TranscriptItem], content_width: f32) -> Vec<f32> {
     let mut tops = Vec::with_capacity(items.len());
     let mut top = 0.0;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
-            top += gap_after(&items[index - 1]);
+            top += gap_between(&items[index - 1], item);
         }
         tops.push(top);
         top += item_height(item, content_width);
@@ -299,7 +301,7 @@ fn render_item<'a>(item: &'a TranscriptItem) -> Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ESTIMATED_CHAR_WIDTH, State, gap_after, item_height, item_tops, wrapped_lines};
+    use super::{ESTIMATED_CHAR_WIDTH, State, gap_between, item_height, item_tops, wrapped_lines};
     use crate::theme::{SPACE_L, SPACE_M};
     use manifest_domain::{TranscriptItem, fixture};
 
@@ -358,23 +360,30 @@ mod tests {
         for (index, top) in tops.iter().enumerate().skip(1) {
             let want = tops[index - 1]
                 + item_height(&state.items[index - 1], 600.0)
-                + gap_after(&state.items[index - 1]);
+                + gap_between(&state.items[index - 1], &state.items[index]);
             assert!((top - want).abs() < 0.001);
         }
     }
 
     #[test]
-    fn gap_after_user_is_double_and_after_assistant_is_single() {
+    fn gaps_are_double_around_user_turns_and_single_otherwise() {
         let user = TranscriptItem::UserTurn {
             text: String::from("prompt"),
         };
         let assistant = TranscriptItem::AssistantTurn {
             text: String::from("reply"),
         };
+        // Double below a user bubble.
         let items = vec![user.clone(), assistant.clone()];
         let tops = item_tops(&items, 600.0);
         let want = item_height(&user, 600.0) + 2.0 * SPACE_M;
         assert!((tops[1] - want).abs() < 0.001);
+        // Double above a user bubble.
+        let items = vec![assistant.clone(), user.clone()];
+        let tops = item_tops(&items, 600.0);
+        let want = item_height(&assistant, 600.0) + 2.0 * SPACE_M;
+        assert!((tops[1] - want).abs() < 0.001);
+        // Single between two non-user items.
         let items = vec![assistant.clone(), assistant.clone()];
         let tops = item_tops(&items, 600.0);
         let want = item_height(&assistant, 600.0) + SPACE_M;

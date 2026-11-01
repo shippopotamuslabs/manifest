@@ -84,6 +84,14 @@ pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
 // Fixed width of the add-project popup.
 pub const POPUP_WIDTH: f32 = 480.0;
+// Draggable side-panel geometry: default width with hard bounds, plus
+// the invisible grab width of the divider hit zone.
+pub const PANEL_WIDTH_DEFAULT: f32 = 260.0;
+pub const PANEL_WIDTH_MIN: f32 = 180.0;
+pub const PANEL_WIDTH_MAX: f32 = 480.0;
+pub const DIVIDER_HIT_WIDTH: f32 = 9.0;
+// Square edge of the window resize corner handles.
+pub const WINDOW_RESIZE_HANDLE: f32 = 12.0;
 
 /// Returns `base` with its alpha channel replaced.
 pub const fn with_alpha(base: Color, alpha: f32) -> Color {
