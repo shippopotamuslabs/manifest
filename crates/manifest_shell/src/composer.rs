@@ -31,7 +31,7 @@ pub enum Message {
 
 /// Composer state: the draft content plus the derived values the view
 /// reads without computing them itself (UI contract §2).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct State {
     /// Text the user has typed but not sent.
     pub content: text_editor::Content,
@@ -101,6 +101,12 @@ impl State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +121,18 @@ mod tests {
             };
             state.update(Message::Edit(text_editor::Action::Edit(edit)));
         }
+    }
+
+    #[test]
+    fn default_matches_new() {
+        let got = State::default();
+        let want = State::new();
+        assert_eq!(got.visible_lines, 1);
+        assert_eq!(got.visible_lines, want.visible_lines);
+        assert_eq!(got.has_text, want.has_text);
+        assert!(!got.has_text);
+        assert_eq!(got.content.text(), want.content.text());
+        assert_eq!(got.content.text(), "");
     }
 
     #[test]
