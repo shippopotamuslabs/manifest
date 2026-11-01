@@ -132,6 +132,28 @@ impl State {
         }
     }
 
+    /// Replaces the list with fresh domain rows, preserving UI state.
+    ///
+    /// Groups rebuild exactly as [`State::from_projects`] does. The
+    /// current selection survives when its id still exists in the new
+    /// data; otherwise the selection falls back to `from_projects`'
+    /// default (first in display order, placeholder when empty). The
+    /// expanded project becomes the (possibly preserved) selection's
+    /// project, and the add-project popup state carries over untouched.
+    pub fn replace(&mut self, projects: Vec<ProjectSummary>, sessions: Vec<SessionSummary>) {
+        let mut fresh = State::from_projects(projects, sessions);
+        if fresh.find(&self.selected).is_some() {
+            let selected = self.selected.clone();
+            let expanded = fresh
+                .find(&selected)
+                .and_then(|summary| summary.project.clone());
+            fresh.selected = selected;
+            fresh.expanded = expanded;
+        }
+        fresh.add_project = std::mem::take(&mut self.add_project);
+        *self = fresh;
+    }
+
     /// Finds the row with this id across groups, then unprojected rows.
     fn find_in<'a>(
         groups: &'a [ProjectGroup],
@@ -581,5 +603,79 @@ mod tests {
         assert_eq!(directory_name(""), "");
         assert_eq!(directory_name("/"), "");
         assert_eq!(directory_name("a/b/c"), "c");
+    }
+
+    fn project(id: &str, name: &str) -> ProjectSummary {
+        ProjectSummary {
+            id: ProjectId::new(id),
+            name: String::from(name),
+        }
+    }
+
+    fn row(id: &str, project: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
+            title: String::from(id),
+            status: SessionStatus::Idle,
+            project: project.map(ProjectId::new),
+            relative_time: String::from("now"),
+            stream_dropped_deltas: 0,
+        }
+    }
+
+    #[test]
+    fn replace_preserves_selection_and_expansion_when_session_remains() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a"), project("p-b", "b")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
+        );
+        got.update(Message::Select(SessionId::new("s-2")));
+        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        got.replace(
+            vec![project("p-b", "b"), project("p-a", "a")],
+            vec![row("s-2", Some("p-b")), row("s-3", Some("p-a"))],
+        );
+        assert_eq!(got.selected, SessionId::new("s-2"));
+        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        assert_eq!(got.groups.len(), 2);
+    }
+
+    #[test]
+    fn replace_falls_back_to_first_when_selection_gone() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-a"))],
+        );
+        got.replace(vec![project("p-b", "b")], vec![row("s-9", Some("p-b"))]);
+        assert_eq!(got.selected, SessionId::new("s-9"));
+        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+    }
+
+    #[test]
+    fn replace_with_empty_uses_placeholder_selection() {
+        let mut got = state();
+        got.replace(Vec::new(), Vec::new());
+        assert!(got.groups.is_empty());
+        assert!(got.unprojected.is_empty());
+        assert!(got.selected_summary().is_none());
+        assert_eq!(got.expanded, None);
+    }
+
+    #[test]
+    fn replace_preserves_open_add_project_popup() {
+        let mut got = state();
+        got.update(Message::OpenAddProject);
+        got.update(Message::DirectoryChanged(String::from(
+            "/x/y/billing-service",
+        )));
+        got.replace(Vec::new(), Vec::new());
+        assert_eq!(
+            got.add_project,
+            AddProject::Open {
+                directory: String::from("/x/y/billing-service"),
+                name: String::from("billing-service"),
+                name_edited: false,
+            }
+        );
     }
 }

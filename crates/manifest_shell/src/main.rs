@@ -6,6 +6,7 @@
 
 mod app;
 mod composer;
+mod engine;
 mod kit;
 mod sessions;
 mod theme;
@@ -14,11 +15,12 @@ mod transcript;
 use app::App;
 use theme::manifest_theme;
 
-/// Boots the shell and asks the runtime for the latest window id so
-/// the title-bar controls know which window they drive.
+/// Production boot: connects to the real server through the engine
+/// subscription, then asks the runtime for the latest window id so the
+/// title-bar controls know which window they drive.
 fn boot() -> (App, iced::Task<app::Message>) {
     (
-        App::boot(),
+        App::live(manifest_mcp::ServerConfig::from_env()),
         iced::window::latest().map(app::Message::WindowIdentified),
     )
 }

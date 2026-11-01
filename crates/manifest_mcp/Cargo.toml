@@ -3,6 +3,23 @@ name = "manifest_mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 manifest_domain = { path = "../manifest_domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "fake_muse_mcp"
+path = "tests/fake_muse_mcp.rs"
+test = false
+bench = false
+
+[[test]]
+name = "transport"
+path = "tests/transport.rs"
+
+[[test]]
+name = "live"
+path = "tests/live.rs"

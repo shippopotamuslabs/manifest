@@ -61,6 +61,8 @@ pub struct SessionSummary {
     pub project: Option<ProjectId>,
     /// Precomputed relative-time label for the row's right edge, e.g. '20h'.
     pub relative_time: String,
+    /// Cumulative stream delta events whose send failed for this session (0 in the fixture; live values come from muse_status).
+    pub stream_dropped_deltas: u64,
 }
 
 /// One entry in a session transcript.
@@ -119,6 +121,7 @@ pub fn fixture() -> Fixture {
                 status: SessionStatus::Running,
                 project: Some(ProjectId::new("project-checkout-api")),
                 relative_time: String::from("20h"),
+                stream_dropped_deltas: 0,
             },
             SessionSummary {
                 id: SessionId::new("session-migration-cleanup"),
@@ -126,6 +129,7 @@ pub fn fixture() -> Fixture {
                 status: SessionStatus::Idle,
                 project: Some(ProjectId::new("project-checkout-api")),
                 relative_time: String::from("1d"),
+                stream_dropped_deltas: 0,
             },
             SessionSummary {
                 id: SessionId::new("session-settings-copy"),
@@ -133,6 +137,7 @@ pub fn fixture() -> Fixture {
                 status: SessionStatus::AwaitingApproval,
                 project: Some(ProjectId::new("project-storefront-web")),
                 relative_time: String::from("2d"),
+                stream_dropped_deltas: 0,
             },
             SessionSummary {
                 id: SessionId::new("session-empty-cart"),
@@ -140,6 +145,7 @@ pub fn fixture() -> Fixture {
                 status: SessionStatus::Idle,
                 project: Some(ProjectId::new("project-storefront-web")),
                 relative_time: String::from("4d"),
+                stream_dropped_deltas: 0,
             },
             SessionSummary {
                 id: SessionId::new("session-cron-scratch"),
@@ -147,6 +153,7 @@ pub fn fixture() -> Fixture {
                 status: SessionStatus::Idle,
                 project: None,
                 relative_time: String::from("6d"),
+                stream_dropped_deltas: 0,
             },
         ],
         transcript: vec![

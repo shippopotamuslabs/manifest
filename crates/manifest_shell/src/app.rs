@@ -6,8 +6,9 @@
 //! routes messages down, and maps child messages up (UI contract §7).
 
 use iced::{Element, Length, Task};
-use manifest_domain::{Fixture, TodoItem};
+use manifest_domain::{Connection, EngineEvent, Fixture, StreamEvent, TodoItem};
 
+use crate::engine;
 use crate::kit;
 use crate::theme::{
     FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
@@ -76,6 +77,17 @@ pub enum Message {
     ToggleMaximizeWindow,
     /// Closes the window.
     CloseWindow,
+    /// One engine-stream item, stamped with the connection attempt that
+    /// produced it; items from older attempts are stale and ignored.
+    Engine {
+        /// The connection attempt the item belongs to.
+        attempt: u64,
+        /// The handle (sent once, first) or one engine event.
+        input: engine::Input,
+    },
+    /// The user pressed Retry after a connection failure; drops the old
+    /// handle and starts a fresh connection attempt.
+    Reconnect,
 }
 
 impl From<sessions::Message> for Message {
@@ -119,6 +131,20 @@ pub struct App {
     pub current_todo: Option<String>,
     /// The window id from boot, for the title-bar window controls.
     pub window_id: Option<iced::window::Id>,
+    /// The named connection situation the top bar renders.
+    pub connection: Connection,
+    /// Counts connection attempts; engine-stream items carry the attempt
+    /// that produced them so stale streams are ignored.
+    pub connection_attempt: u64,
+    /// The live engine handle, present once the stream delivers it and
+    /// cleared on failure or retry. `None` in fixture mode.
+    pub engine: Option<engine::EngineHandle>,
+    /// The server config to connect with; `None` in fixture mode, where
+    /// no server is ever spawned.
+    pub engine_config: Option<manifest_mcp::ServerConfig>,
+    /// The latest session-load failure or diagnostic message, shown in
+    /// the side panel until a retry clears it.
+    pub engine_notice: Option<String>,
 }
 
 impl App {
@@ -148,7 +174,24 @@ impl App {
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: PanelDrag::Idle,
             window_id: None,
+            connection: Connection::Disconnected,
+            connection_attempt: 0,
+            engine: None,
+            engine_config: None,
+            engine_notice: None,
         }
+    }
+
+    /// Production boot: connects to the real server. Starts from the
+    /// fixture (transcript and todos stay fixture until later slices own
+    /// them) with an empty session list, then connects on the first
+    /// subscription tick; sessions arrive through the engine stream.
+    pub fn live(config: manifest_mcp::ServerConfig) -> Self {
+        let mut app = Self::from_fixture(manifest_domain::fixture());
+        app.sessions = sessions::State::from_projects(Vec::new(), Vec::new());
+        app.connection = Connection::Connecting;
+        app.engine_config = Some(config);
+        app
     }
 
     /// Boots the shell from [`manifest_domain::fixture()`].
@@ -223,18 +266,82 @@ impl App {
                 Some(id) => iced::window::close(id),
                 None => Task::none(),
             },
+            Message::Engine { attempt, input } => {
+                if attempt != self.connection_attempt || self.engine_config.is_none() {
+                    return Task::none();
+                }
+                match input {
+                    engine::Input::Ready(handle) => {
+                        self.engine = Some(handle);
+                    }
+                    engine::Input::Event(EngineEvent::ConnectionChanged(next)) => {
+                        self.connection = next;
+                        if self.connection == Connection::Connected {
+                            if let Some(engine) = &self.engine {
+                                engine.list_sessions();
+                            }
+                        } else if matches!(self.connection, Connection::Failed(_)) {
+                            self.engine = None;
+                        }
+                    }
+                    engine::Input::Event(EngineEvent::SessionsLoaded { projects, sessions }) => {
+                        self.sessions.replace(projects, sessions);
+                    }
+                    engine::Input::Event(EngineEvent::SessionsLoadFailed(message)) => {
+                        self.engine_notice = Some(message);
+                    }
+                    engine::Input::Event(EngineEvent::Diagnostic(message)) => {
+                        self.engine_notice = Some(message);
+                    }
+                    engine::Input::Event(EngineEvent::Stream(StreamEvent::Pending { .. })) => {
+                        if self.connection == Connection::Connected
+                            && let Some(engine) = &self.engine
+                        {
+                            engine.list_sessions();
+                        }
+                    }
+                    // M2 owns no transcript: other stream events are
+                    // consumed as no-ops until M3 renders them.
+                    engine::Input::Event(EngineEvent::Stream(_)) => {}
+                }
+                Task::none()
+            }
+            Message::Reconnect => {
+                if self.engine_config.is_some() {
+                    // Dropping the handle shuts the old worker down; the
+                    // subscription restarts under the new attempt.
+                    self.engine = None;
+                    self.connection = Connection::Connecting;
+                    self.engine_notice = None;
+                    self.connection_attempt += 1;
+                }
+                Task::none()
+            }
         }
     }
 
-    /// Drag subscription: idle produces nothing; while a divider drag
-    /// is in flight, cursor moves resize the panel and releasing the
-    /// left button ends the drag. All other events map to nothing (the
-    /// status and window arguments are ignored).
+    /// Drag subscription plus the engine stream: idle produces nothing
+    /// for the drag; while a divider drag is in flight, cursor moves
+    /// resize the panel and releasing the left button ends the drag.
+    /// The engine stream runs only while connecting or connected with a
+    /// config; a finished stream whose recipe is still returned gets
+    /// restarted, which would respawn against a dead server in a loop,
+    /// so failure and fixture mode return no engine recipe until the
+    /// user retries.
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        match self.panel_drag {
+        let drag = match self.panel_drag {
             PanelDrag::Idle => iced::Subscription::none(),
             PanelDrag::Dragging { .. } => iced::event::listen_with(drag_event),
-        }
+        };
+        let engine = match (&self.engine_config, &self.connection) {
+            (Some(config), Connection::Connecting | Connection::Connected) => {
+                let attempt = self.connection_attempt;
+                engine::subscription(attempt, config)
+                    .map(move |(attempt, input)| Message::Engine { attempt, input })
+            }
+            _ => iced::Subscription::none(),
+        };
+        iced::Subscription::batch([drag, engine])
     }
 
     /// Renders the title bar over a content row splitting the fixed-width
@@ -269,14 +376,26 @@ impl App {
                     .width(Length::Fill),
             )
             .into();
+        let mut panel = iced::widget::column![];
+        if let Some(notice) = side_notice(self) {
+            panel = panel.push(
+                iced::widget::text(notice)
+                    .size(FONT_SIZE_SMALL)
+                    .color(TEXT_TERTIARY),
+            );
+        }
+        let panel: Element<'_, Message> = panel
+            .push(self.sessions.view().map(Message::Sessions))
+            .spacing(SPACE_S)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         let base: Element<'_, Message> = iced::widget::column![
             topbar(self),
             iced::widget::row![
-                iced::widget::container(kit::side_panel(
-                    self.sessions.view().map(Message::Sessions)
-                ))
-                .width(Length::Fixed(self.panel_width))
-                .height(Length::Fill),
+                iced::widget::container(kit::side_panel(panel))
+                    .width(Length::Fixed(self.panel_width))
+                    .height(Length::Fill),
                 iced::widget::mouse_area(kit::panel_divider())
                     .on_press(Message::PanelDragStarted)
                     .interaction(iced::mouse::Interaction::ResizingHorizontally),
@@ -384,6 +503,34 @@ fn resize_corner<'a>(
     .into()
 }
 
+/// Static label for the connection state. The view performs no
+/// formatting: this match returns a static label, keeping string
+/// building out of the view (UI contract §2).
+fn connection_label(connection: &Connection) -> &'static str {
+    match connection {
+        Connection::Disconnected => "Offline",
+        Connection::Connecting => "Connecting...",
+        Connection::Connected => "Connected",
+        Connection::Failed(_) => "Connection failed",
+    }
+}
+
+/// The side-panel notice line, if there is something true to show, in
+/// priority order: the failure message, then the latest load or
+/// diagnostic notice, then the connecting line. Borrows stored text so
+/// the view formats nothing (UI contract §2).
+fn side_notice(state: &App) -> Option<&str> {
+    if let Connection::Failed(message) = &state.connection {
+        Some(message.as_str())
+    } else if let Some(notice) = state.engine_notice.as_deref() {
+        Some(notice)
+    } else if state.engine_config.is_some() && state.connection == Connection::Connecting {
+        Some("Connecting to the MCP server...")
+    } else {
+        None
+    }
+}
+
 /// The title bar: the app title in the fixed panel share, then the
 /// selected session title truly centered in the fill share with the
 /// window controls right-aligned. A plain function on the root state
@@ -407,23 +554,43 @@ fn topbar(state: &App) -> Element<'_, Message> {
                 .size(FONT_SIZE_BODY)
                 .color(TEXT_SECONDARY),
         )),
-        iced::widget::container(
-            iced::widget::row![
-                kit::icon_button(
+        iced::widget::container({
+            let mut controls = iced::widget::row![];
+            // Fixture mode shows no cluster; live mode names the
+            // connection state and offers Retry while failed.
+            if state.engine_config.is_some() {
+                controls = controls.push(
+                    iced::widget::text(connection_label(&state.connection))
+                        .size(FONT_SIZE_SMALL)
+                        .color(TEXT_TERTIARY),
+                );
+                if matches!(state.connection, Connection::Failed(_)) {
+                    controls = controls.push(kit::pill_button(
+                        "Retry",
+                        kit::ButtonKind::Ghost,
+                        Some(Message::Reconnect),
+                    ));
+                }
+            }
+            controls
+                .push(kit::icon_button(
                     "−",
                     kit::IconButtonKind::Subtle,
                     Some(Message::MinimizeWindow),
-                ),
-                kit::icon_button(
+                ))
+                .push(kit::icon_button(
                     "□",
                     kit::IconButtonKind::Subtle,
                     Some(Message::ToggleMaximizeWindow),
-                ),
-                kit::icon_button("✕", kit::IconButtonKind::Subtle, Some(Message::CloseWindow)),
-            ]
-            .spacing(SPACE_S)
-            .align_y(iced::alignment::Vertical::Center),
-        )
+                ))
+                .push(kit::icon_button(
+                    "✕",
+                    kit::IconButtonKind::Subtle,
+                    Some(Message::CloseWindow),
+                ))
+                .spacing(SPACE_S)
+                .align_y(iced::alignment::Vertical::Center)
+        })
         .align_right(Length::Fill),
     ]
     .spacing(SPACE_M)
@@ -705,6 +872,195 @@ mod tests {
         assert_eq!(got.panel_width, PANEL_WIDTH_MIN);
         let _ = got.update(Message::PanelDragMoved(iced::Point::new(900.0, 0.0)));
         assert_eq!(got.panel_width, PANEL_WIDTH_MAX);
+    }
+
+    /// Test engine: counts `list_sessions` calls like the real worker
+    /// would serve them, without spawning anything.
+    struct FakeEngine {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl manifest_domain::SessionEngine for FakeEngine {
+        fn list_sessions(&self) {
+            *self.calls.lock().unwrap() += 1;
+        }
+    }
+
+    /// Production boot with the handle already delivered, as the
+    /// subscription's first item would.
+    fn live_app() -> (App, std::sync::Arc<FakeEngine>) {
+        let fake = std::sync::Arc::new(FakeEngine {
+            calls: std::sync::Mutex::new(0),
+        });
+        let mut app = App::live(manifest_mcp::ServerConfig::new("fake"));
+        let attempt = app.connection_attempt;
+        let _ = app.update(Message::Engine {
+            attempt,
+            input: engine::Input::Ready(engine::EngineHandle::new(fake.clone())),
+        });
+        (app, fake)
+    }
+
+    /// Delivers one engine input stamped with the current attempt, as
+    /// the subscription maps it.
+    fn deliver(app: &mut App, input: engine::Input) {
+        let attempt = app.connection_attempt;
+        let _ = app.update(Message::Engine { attempt, input });
+    }
+
+    /// Delivers the connected state change.
+    fn deliver_connected(app: &mut App) {
+        deliver(
+            app,
+            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Connected,
+            )),
+        );
+    }
+
+    fn live_project() -> manifest_domain::ProjectSummary {
+        manifest_domain::ProjectSummary {
+            id: manifest_domain::ProjectId::new("project-live"),
+            name: String::from("live"),
+        }
+    }
+
+    fn live_session(id: &str) -> manifest_domain::SessionSummary {
+        manifest_domain::SessionSummary {
+            id: manifest_domain::SessionId::new(id),
+            title: String::from(id),
+            status: manifest_domain::SessionStatus::Idle,
+            project: Some(manifest_domain::ProjectId::new("project-live")),
+            relative_time: String::from("now"),
+            stream_dropped_deltas: 0,
+        }
+    }
+
+    #[test]
+    fn connected_requests_sessions_once() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        assert_eq!(app.connection, manifest_domain::Connection::Connected);
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn sessions_loaded_replaces_the_list() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoaded {
+                projects: vec![live_project()],
+                sessions: vec![live_session("s-1"), live_session("s-2")],
+            }),
+        );
+        assert_eq!(app.sessions.groups.len(), 1);
+        assert_eq!(app.sessions.groups[0].sessions.len(), 2);
+        assert_eq!(
+            app.sessions.selected,
+            manifest_domain::SessionId::new("s-1")
+        );
+    }
+
+    #[test]
+    fn failed_clears_engine_and_keeps_message() {
+        let (mut app, _) = live_app();
+        assert!(app.engine.is_some());
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Failed(String::from("boom")),
+            )),
+        );
+        assert_eq!(
+            app.connection,
+            manifest_domain::Connection::Failed(String::from("boom"))
+        );
+        assert!(app.engine.is_none());
+    }
+
+    #[test]
+    fn reconnect_bumps_attempt_and_resets_state() {
+        let (mut app, _) = live_app();
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Failed(String::from("boom")),
+            )),
+        );
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoadFailed(
+                String::from("load broke"),
+            )),
+        );
+        let before = app.connection_attempt;
+        let _ = app.update(Message::Reconnect);
+        assert_eq!(app.connection_attempt, before + 1);
+        assert_eq!(app.connection, manifest_domain::Connection::Connecting);
+        assert!(app.engine_notice.is_none());
+        assert!(app.engine.is_none());
+    }
+
+    #[test]
+    fn stale_attempt_inputs_are_ignored() {
+        let (mut app, _) = live_app();
+        let stale = app.connection_attempt;
+        let _ = app.update(Message::Reconnect);
+        let _ = app.update(Message::Engine {
+            attempt: stale,
+            input: engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Connected,
+            )),
+        });
+        assert_eq!(app.connection, manifest_domain::Connection::Connecting);
+        assert!(app.engine.is_none());
+    }
+
+    #[test]
+    fn pending_hint_refreshes_sessions() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-1"),
+                    turn: None,
+                    request_id: String::from("req-1"),
+                    kind: manifest_domain::PendingKind::Approval,
+                    phase: manifest_domain::PendingPhase::Requested,
+                },
+            )),
+        );
+        assert_eq!(*fake.calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn load_failed_and_diagnostic_set_notice() {
+        let (mut app, _) = live_app();
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoadFailed(
+                String::from("x"),
+            )),
+        );
+        assert_eq!(app.engine_notice, Some(String::from("x")));
+        deliver(
+            &mut app,
+            engine::Input::Event(manifest_domain::EngineEvent::Diagnostic(String::from("y"))),
+        );
+        assert_eq!(app.engine_notice, Some(String::from("y")));
+    }
+
+    #[test]
+    fn fixture_boot_stays_offline() {
+        let app = App::boot();
+        assert_eq!(app.connection, manifest_domain::Connection::Disconnected);
+        assert!(app.engine_config.is_none());
+        assert!(app.engine.is_none());
     }
 
     #[test]
