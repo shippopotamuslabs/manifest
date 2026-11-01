@@ -27,12 +27,16 @@ pub enum TodoDrawer {
 }
 
 /// Root messages, enumerated before the view (UI contract §1).
-#[derive(Debug, Clone, PartialEq)]
+/// No `PartialEq`: [`transcript::Message`] carries a scroll viewport,
+/// which is `Debug + Clone` but not `PartialEq`.
+#[derive(Debug, Clone)]
 pub enum Message {
     /// A session-list message, routed to [`sessions::State`].
     Sessions(sessions::Message),
     /// A composer message, routed to [`composer::State`].
     Composer(composer::Message),
+    /// A transcript scroll message, routed to [`transcript::State`].
+    Transcript(transcript::Message),
     /// Toggles the TODO drawer between peek strip and open.
     ToggleTodoDrawer,
 }
@@ -40,6 +44,12 @@ pub enum Message {
 impl From<sessions::Message> for Message {
     fn from(message: sessions::Message) -> Self {
         Message::Sessions(message)
+    }
+}
+
+impl From<transcript::Message> for Message {
+    fn from(message: transcript::Message) -> Self {
+        Message::Transcript(message)
     }
 }
 
@@ -54,7 +64,7 @@ impl From<composer::Message> for Message {
 pub struct App {
     /// Left-panel session list; owns the selection.
     pub sessions: sessions::State,
-    /// Selected-session transcript (read-only in M1).
+    /// Selected-session transcript; only scroll state changes in M1.
     pub transcript: transcript::State,
     /// Draft input cluster.
     pub composer: composer::State,
@@ -106,6 +116,7 @@ impl App {
         match message {
             Message::Sessions(child) => self.sessions.update(child),
             Message::Composer(child) => self.composer.update(child),
+            Message::Transcript(child) => self.transcript.update(child),
             Message::ToggleTodoDrawer => {
                 self.todo_drawer = match self.todo_drawer {
                     TodoDrawer::Peek => TodoDrawer::Open,
@@ -122,7 +133,7 @@ impl App {
     /// composer. The drawer always renders while todos exist.
     pub fn view(&self) -> Element<'_, Message> {
         let mut main = iced::widget::column![
-            iced::widget::container(self.transcript.view().map(|never| match never {}),)
+            iced::widget::container(self.transcript.view().map(Message::Transcript))
                 .width(Length::Fill)
                 .height(Length::Fill),
         ]
@@ -333,6 +344,26 @@ mod tests {
         let _ = got.update(Message::ToggleTodoDrawer);
         assert_eq!(got.todo_drawer, TodoDrawer::Peek);
         assert_eq!(got.composer.content.text(), "keep me");
+    }
+
+    #[test]
+    fn transcript_scroll_state_survives_other_messages() {
+        // A scroll viewport has no public constructor outside iced, so
+        // no headless test can feed `Message::Transcript` directly; the
+        // reducer itself is covered through `transcript::State` tests.
+        // This pins the routing contract instead: other messages leave
+        // the transcript scroll state alone.
+        let mut got = App::boot();
+        assert_eq!(got.transcript.sticky, None);
+        assert_eq!(got.transcript.scroll_offset, 0.0);
+        let target = got.sessions.groups[0].sessions[1].id.clone();
+        let _ = got.update(Message::Sessions(sessions::Message::Select(target.clone())));
+        type_composer_text(&mut got, "hello");
+        let _ = got.update(Message::ToggleTodoDrawer);
+        assert_eq!(got.sessions.selected, target);
+        assert_eq!(got.composer.content.text(), "hello");
+        assert_eq!(got.transcript.sticky, None);
+        assert_eq!(got.transcript.scroll_offset, 0.0);
     }
 
     #[test]
