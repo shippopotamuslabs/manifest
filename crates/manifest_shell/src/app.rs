@@ -132,6 +132,7 @@ impl App {
     /// (`FillPortion(4)`) of transcript, drawer (peek or open),
     /// composer. The drawer always renders while todos exist.
     pub fn view(&self) -> Element<'_, Message> {
+        // The stack root is unconditional so base keeps its widget state across popup changes.
         let mut main = iced::widget::column![
             iced::widget::container(self.transcript.view().map(Message::Transcript))
                 .width(Length::Fill)
@@ -175,10 +176,11 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        let mut stack = iced::widget::Stack::new().push(base);
         if let Some(popup) = self.sessions.add_project_view() {
-            return iced::widget::stack![base, kit::scrim(popup.map(Message::Sessions))].into();
+            stack = stack.push(kit::scrim(popup.map(Message::Sessions)));
         }
-        base
+        stack.into()
     }
 }
 

@@ -144,6 +144,7 @@ impl State {
     /// pin forward events without capturing them, so wheel and pointer
     /// input still reach the scrollable beneath.
     pub fn view(&self) -> Element<'_, Message> {
+        // The stack root is unconditional so the scrollable keeps its widget state across sticky changes.
         let mut list = iced::widget::column![].spacing(SPACE_M).width(Length::Fill);
         for item in &self.items {
             list = list.push(render_item(item));
@@ -153,27 +154,30 @@ impl State {
             .height(Length::Fill)
             .on_scroll(Message::Scrolled)
             .into();
-        let text = match self.sticky.and_then(|index| self.items.get(index)) {
-            Some(TranscriptItem::UserTurn { text }) => text.as_str(),
-            _ => return base,
-        };
-        // Top-anchored window onto the stuck bubble: the pin lifts the
-        // identical bubble up by `sticky_push` px and the clipped fixed
-        // container cuts whatever slides past the transcript's top edge,
-        // so the overlay can never paint over the top bar.
-        let overlay: Element<'_, Message> = iced::widget::container(
-            iced::widget::pin(kit::prompt_bubble(text)).y(-self.sticky_push),
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(
-            (self.sticky_height - self.sticky_push).max(0.0),
-        ))
-        .clip(true)
-        .into();
-        iced::widget::stack![base, overlay]
+        let mut stack = iced::widget::Stack::new()
+            .push(base)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+        if let Some(TranscriptItem::UserTurn { text }) =
+            self.sticky.and_then(|index| self.items.get(index))
+        {
+            let text = text.as_str();
+            // Top-anchored window onto the stuck bubble: the pin lifts the
+            // identical bubble up by `sticky_push` px and the clipped fixed
+            // container cuts whatever slides past the transcript's top edge,
+            // so the overlay can never paint over the top bar.
+            let overlay: Element<'_, Message> = iced::widget::container(
+                iced::widget::pin(kit::prompt_bubble(text)).y(-self.sticky_push),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(
+                (self.sticky_height - self.sticky_push).max(0.0),
+            ))
+            .clip(true)
+            .into();
+            stack = stack.push(overlay);
+        }
+        stack.into()
     }
 }
 
