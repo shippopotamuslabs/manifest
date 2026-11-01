@@ -640,6 +640,45 @@ pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'
     .into()
 }
 
+/// Status-aware style for [`sticky_bubble`]: the same flat surface-2
+/// fill as [`prompt_bubble_style`], no border, no shadow. While the
+/// bubble is pushed (`square_top`), its real top edge sits above the
+/// window, so the top corners are square and only the bottom corners
+/// keep the panel radius; once settled the full panel radius returns.
+///
+/// Pinned/settled at the top (`push == 0.0`) the bubble looks exactly
+/// like a natural prompt bubble with rounded top corners, clean against
+/// the background. While being pushed under the top bar (`push > 0.0`)
+/// the top corners are square: the rounded corners are conceptually
+/// already hidden under the bar, so the visible top edge is a straight
+/// cut.
+fn sticky_bubble_style(square_top: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE_2)),
+        border: Border::default().width(0.0).rounded(if square_top {
+            iced::border::Radius {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_right: RADIUS_PANEL,
+                bottom_left: RADIUS_PANEL,
+            }
+        } else {
+            RADIUS_PANEL.into()
+        }),
+        ..container::Style::default()
+    }
+}
+
+/// Status-aware style for the sticky bubble's notch backdrop: a flat
+/// [`BG_BASE`] fill and nothing else, so the layer is invisible against
+/// the window background.
+fn sticky_backdrop_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_BASE)),
+        ..container::Style::default()
+    }
+}
+
 /// The sticky prompt window: a container sized to exactly the visible
 /// slice of the stuck bubble, with its text slid up inside by `push`.
 ///
@@ -652,12 +691,24 @@ pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'
 /// window's top edge via the container's clipped viewport while the
 /// background can never paint above it. `push` is 0.0 when settled;
 /// positive while the incoming prompt pushes the sticky bubble out.
+///
+/// The bubble sits in a [`Stack`](iced::widget::Stack) over the
+/// scrollable transcript, so its rounded-corner notches are transparent
+/// and would show scrolling text slivers through them. An opaque
+/// [`BG_BASE`] backdrop layer behind the bubble keeps the corner notches
+/// clean over the scrolling list, in both corner modes.
+/// Returned as a small [`Stack`](iced::widget::Stack): layer 1 is the
+/// backdrop sized to the same window, layer 2 is the bubble itself.
 pub(crate) fn sticky_bubble<'a, Message: Clone + 'a>(
     text: &'a str,
     window_height: f32,
     push: f32,
 ) -> Element<'a, Message> {
-    container(
+    let backdrop = container(iced::widget::text(""))
+        .width(Length::Fill)
+        .height(Length::Fixed(window_height.max(0.0)))
+        .style(sticky_backdrop_style);
+    let bubble = container(
         iced::widget::text(text)
             .size(FONT_SIZE_BODY)
             .color(TEXT_PRIMARY),
@@ -671,8 +722,12 @@ pub(crate) fn sticky_bubble<'a, Message: Clone + 'a>(
         left: SPACE_XL,
     })
     .clip(true)
-    .style(prompt_bubble_style)
-    .into()
+    .style(sticky_bubble_style(push > 0.0));
+    iced::widget::Stack::new()
+        .push(backdrop)
+        .push(bubble)
+        .width(Length::Fill)
+        .into()
 }
 
 /// Status-aware style for [`static_pill`]: flat surface fill, no
