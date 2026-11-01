@@ -39,6 +39,16 @@ pub enum Message {
     Transcript(transcript::Message),
     /// Toggles the TODO drawer between peek strip and open.
     ToggleTodoDrawer,
+    /// The runtime reported the latest window id at boot (or none).
+    WindowIdentified(Option<iced::window::Id>),
+    /// Starts dragging the (undecorated) window.
+    DragWindow,
+    /// Minimizes the window.
+    MinimizeWindow,
+    /// Toggles the window between maximized and restored.
+    ToggleMaximizeWindow,
+    /// Closes the window.
+    CloseWindow,
 }
 
 impl From<sessions::Message> for Message {
@@ -76,6 +86,8 @@ pub struct App {
     pub todo_summary: String,
     /// Label of the first unfinished todo, for the drawer bar.
     pub current_todo: Option<String>,
+    /// The window id from boot, for the title-bar window controls.
+    pub window_id: Option<iced::window::Id>,
 }
 
 impl App {
@@ -102,6 +114,7 @@ impl App {
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
+            window_id: None,
         }
     }
 
@@ -110,27 +123,60 @@ impl App {
         Self::from_fixture(manifest_domain::fixture())
     }
 
-    /// Root reducer. M1 performs no asynchronous work, so every branch
-    /// returns [`Task::none()`]; no `Subscription` exists either.
+    /// Root reducer. Child messages fold into child states; window
+    /// messages run against the boot-reported window id, and fall back
+    /// to [`Task::none()`] while it is unknown. No `Subscription`
+    /// exists.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Sessions(child) => self.sessions.update(child),
-            Message::Composer(child) => self.composer.update(child),
-            Message::Transcript(child) => self.transcript.update(child),
+            Message::Sessions(child) => {
+                self.sessions.update(child);
+                Task::none()
+            }
+            Message::Composer(child) => {
+                self.composer.update(child);
+                Task::none()
+            }
+            Message::Transcript(child) => {
+                self.transcript.update(child);
+                Task::none()
+            }
             Message::ToggleTodoDrawer => {
                 self.todo_drawer = match self.todo_drawer {
                     TodoDrawer::Peek => TodoDrawer::Open,
                     TodoDrawer::Open => TodoDrawer::Peek,
                 };
+                Task::none()
             }
+            Message::WindowIdentified(id) => {
+                self.window_id = id;
+                Task::none()
+            }
+            Message::DragWindow => match self.window_id {
+                Some(id) => iced::window::drag(id),
+                None => Task::none(),
+            },
+            Message::MinimizeWindow => match self.window_id {
+                Some(id) => iced::window::minimize(id, true),
+                None => Task::none(),
+            },
+            Message::ToggleMaximizeWindow => match self.window_id {
+                Some(id) => iced::window::toggle_maximize(id),
+                None => Task::none(),
+            },
+            Message::CloseWindow => match self.window_id {
+                Some(id) => iced::window::close(id),
+                None => Task::none(),
+            },
         }
-        Task::none()
     }
 
-    /// Renders the four regions: top bar, then a row splitting the
-    /// session panel (`FillPortion(1)`) from the main column
+    /// Renders the title bar over a content row splitting the side
+    /// panel (`FillPortion(1)`) from the padded main column
     /// (`FillPortion(4)`) of transcript, drawer (peek or open),
-    /// composer. The drawer always renders while todos exist.
+    /// composer. The drawer always renders while todos exist. The
+    /// panel background and divider run the full height of the row:
+    /// the root column carries no outer padding.
     pub fn view(&self) -> Element<'_, Message> {
         // The stack root is unconditional so base keeps its widget state across popup changes.
         let mut main = iced::widget::column![
@@ -139,7 +185,7 @@ impl App {
                 .height(Length::Fill),
         ]
         .spacing(SPACE_S)
-        .width(Length::FillPortion(4))
+        .width(Length::Fill)
         .height(Length::Fill);
         if !self.todos.is_empty() {
             let current = self.current_todo.as_deref().unwrap_or("All done");
@@ -160,19 +206,20 @@ impl App {
         let base: Element<'_, Message> = iced::widget::column![
             topbar(self),
             iced::widget::row![
-                iced::widget::container(self.sessions.view().map(Message::Sessions))
-                    .width(Length::FillPortion(1))
-                    .height(Length::Fill),
+                iced::widget::container(kit::side_panel(
+                    self.sessions.view().map(Message::Sessions)
+                ))
+                .width(Length::FillPortion(1))
+                .height(Length::Fill),
+                kit::vertical_divider(),
                 iced::widget::container(main)
                     .width(Length::FillPortion(4))
-                    .height(Length::Fill),
+                    .height(Length::Fill)
+                    .padding(SPACE_M),
             ]
-            .spacing(SPACE_M)
             .width(Length::Fill)
             .height(Length::Fill),
         ]
-        .spacing(SPACE_S)
-        .padding(SPACE_M)
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
@@ -190,33 +237,82 @@ impl Default for App {
     }
 }
 
-/// The top bar: app title, selected session title, and the Todos chip.
-/// A plain function on the root state — no state of its own, no module.
+/// Drags the window on press and toggles maximize on double click.
+/// Only non-interactive title regions opt into this; the chip and the
+/// window controls stay out so they never start a drag.
+fn drag_region<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    iced::widget::mouse_area(content)
+        .on_press(Message::DragWindow)
+        .on_double_click(Message::ToggleMaximizeWindow)
+        .into()
+}
+
+/// The title bar: the app title in a 1 share, then the selected
+/// session title truly centered in a 4 share with the Todos chip and
+/// window controls right-aligned. A plain function on the root state —
+/// no state of its own, no module.
 fn topbar(state: &App) -> Element<'_, Message> {
     let selected_title: &str = state
         .sessions
         .selected_summary()
         .map(|summary| summary.title.as_str())
         .unwrap_or("No session");
-    iced::widget::row![
-        iced::widget::text("Manifest")
-            .size(FONT_SIZE_TITLE)
-            .color(TEXT_PRIMARY),
-        iced::widget::container(
+    // The two Fill regions flanking the title share the leftover
+    // width equally, so the title stays centered no matter how wide
+    // the chip and window controls run.
+    let title_row = iced::widget::row![
+        drag_region(
+            iced::widget::container(iced::widget::text("").size(FONT_SIZE_BODY))
+                .width(Length::Fill),
+        ),
+        drag_region(iced::widget::container(
             iced::widget::text(selected_title)
                 .size(FONT_SIZE_BODY)
                 .color(TEXT_SECONDARY),
+        )),
+        iced::widget::container(
+            iced::widget::row![
+                kit::toggle_chip(
+                    "Todos",
+                    state.todo_drawer == TodoDrawer::Open,
+                    Message::ToggleTodoDrawer,
+                ),
+                kit::icon_button(
+                    "−",
+                    kit::IconButtonKind::Subtle,
+                    Some(Message::MinimizeWindow),
+                ),
+                kit::icon_button(
+                    "□",
+                    kit::IconButtonKind::Subtle,
+                    Some(Message::ToggleMaximizeWindow),
+                ),
+                kit::icon_button("✕", kit::IconButtonKind::Subtle, Some(Message::CloseWindow)),
+            ]
+            .spacing(SPACE_S)
+            .align_y(iced::alignment::Vertical::Center),
         )
-        .width(Length::Fill),
-        kit::toggle_chip(
-            "Todos",
-            state.todo_drawer == TodoDrawer::Open,
-            Message::ToggleTodoDrawer,
-        ),
+        .align_right(Length::Fill),
     ]
     .spacing(SPACE_M)
-    .width(Length::Fill)
-    .into()
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    kit::title_bar(
+        iced::widget::row![
+            drag_region(
+                iced::widget::container(
+                    iced::widget::text("Manifest")
+                        .size(FONT_SIZE_TITLE)
+                        .color(TEXT_PRIMARY),
+                )
+                .width(Length::FillPortion(1)),
+            ),
+            iced::widget::container(title_row).width(Length::FillPortion(4)),
+        ]
+        .spacing(SPACE_M)
+        .align_y(iced::alignment::Vertical::Center)
+        .width(Length::Fill),
+    )
 }
 
 /// The open TODO drawer: a panel whose first row is the shared bar
@@ -277,6 +373,38 @@ mod tests {
                 text_editor::Action::Edit(edit),
             )));
         }
+    }
+
+    #[test]
+    fn window_identified_none_leaves_window_id_none() {
+        let mut got = App::boot();
+        assert_eq!(got.window_id, None);
+        let _ = got.update(Message::WindowIdentified(None));
+        assert_eq!(got.window_id, None);
+    }
+
+    #[test]
+    fn window_messages_without_id_leave_state_unchanged() {
+        let mut got = App::boot();
+        let _ = got.update(Message::ToggleTodoDrawer);
+        assert_eq!(got.todo_drawer, TodoDrawer::Open);
+        let target = got.sessions.groups[0].sessions[0].id.clone();
+        let _ = got.update(Message::Sessions(sessions::Message::Select(target.clone())));
+        let _ = got.update(Message::DragWindow);
+        let _ = got.update(Message::MinimizeWindow);
+        let _ = got.update(Message::ToggleMaximizeWindow);
+        let _ = got.update(Message::CloseWindow);
+        assert_eq!(got.window_id, None);
+        assert_eq!(got.todo_drawer, TodoDrawer::Open);
+        assert_eq!(got.sessions.selected, target);
+    }
+
+    #[test]
+    fn window_identified_stores_unique_id() {
+        let mut got = App::boot();
+        let id = iced::window::Id::unique();
+        let _ = got.update(Message::WindowIdentified(Some(id)));
+        assert_eq!(got.window_id, Some(id));
     }
 
     #[test]

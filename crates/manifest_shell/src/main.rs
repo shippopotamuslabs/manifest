@@ -14,9 +14,22 @@ mod transcript;
 use app::App;
 use theme::manifest_theme;
 
+/// Boots the shell and asks the runtime for the latest window id so
+/// the title-bar controls know which window they drive.
+fn boot() -> (App, iced::Task<app::Message>) {
+    (
+        App::boot(),
+        iced::window::latest().map(app::Message::WindowIdentified),
+    )
+}
+
 fn main() -> iced::Result {
-    iced::application(App::default, App::update, App::view)
+    iced::application(boot, App::update, App::view)
         .title("Manifest")
         .theme(manifest_theme())
+        .window(iced::window::Settings {
+            decorations: false,
+            ..iced::window::Settings::default()
+        })
         .run()
 }

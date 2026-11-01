@@ -10,7 +10,7 @@ use iced::{Element, Length};
 use manifest_domain::TranscriptItem;
 
 use crate::kit;
-use crate::theme::{FONT_SIZE_BODY, SPACE_M, SPACE_S, TEXT_PRIMARY, TEXT_TERTIARY};
+use crate::theme::{FONT_SIZE_BODY, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY, TEXT_TERTIARY};
 
 /// Default line spacing for transcript text. The transcript text
 /// widgets set no explicit line height, so they use the framework
@@ -145,8 +145,17 @@ impl State {
     /// input still reach the scrollable beneath.
     pub fn view(&self) -> Element<'_, Message> {
         // The stack root is unconditional so the scrollable keeps its widget state across sticky changes.
-        let mut list = iced::widget::column![].spacing(SPACE_M).width(Length::Fill);
-        for item in &self.items {
+        let mut list = iced::widget::column![].width(Length::Fill);
+        for (index, item) in self.items.iter().enumerate() {
+            // The column carries no spacing of its own; every inter-item
+            // gap is an explicit spacer sized by `gap_after`, the same fn
+            // `item_tops` accumulates, so view and estimator cannot drift.
+            if index > 0 {
+                list = list.push(
+                    iced::widget::Space::new()
+                        .height(Length::Fixed(gap_after(&self.items[index - 1]))),
+                );
+            }
             list = list.push(render_item(item));
         }
         let base: Element<'_, Message> = iced::widget::scrollable(list)
@@ -226,28 +235,39 @@ fn item_height(item: &TranscriptItem, content_width: f32) -> f32 {
         TranscriptItem::ToolNote { text } => (text.as_str(), false),
     };
     let text_width = if is_user {
-        content_width - 2.0 * SPACE_M
+        content_width - 2.0 * SPACE_XL
     } else {
         content_width
     }
     .max(ESTIMATED_CHAR_WIDTH);
     let height = wrapped_lines(text, text_width) as f32 * LINE_HEIGHT;
     if is_user {
-        height + 2.0 * SPACE_S
+        height + 2.0 * SPACE_L
     } else {
         height
     }
 }
 
-/// Top edge of every item in px. Items stack with `SPACE_M` between
-/// them, no spacing before the first, and the content carries no other
-/// padding.
+/// Gap before an item that follows `previous`: a user prompt leaves
+/// twice the column spacing behind it, every other kind leaves one.
+/// Single source of truth for the view's extra spacer and `item_tops`.
+fn gap_after(previous: &TranscriptItem) -> f32 {
+    if matches!(previous, TranscriptItem::UserTurn { .. }) {
+        2.0 * SPACE_M
+    } else {
+        SPACE_M
+    }
+}
+
+/// Top edge of every item in px. Items stack with [`gap_after`] of the
+/// previous item between them, no spacing before the first, and the
+/// content carries no other padding.
 fn item_tops(items: &[TranscriptItem], content_width: f32) -> Vec<f32> {
     let mut tops = Vec::with_capacity(items.len());
     let mut top = 0.0;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
-            top += SPACE_M;
+            top += gap_after(&items[index - 1]);
         }
         tops.push(top);
         top += item_height(item, content_width);
@@ -279,8 +299,8 @@ fn render_item<'a>(item: &'a TranscriptItem) -> Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ESTIMATED_CHAR_WIDTH, State, item_height, item_tops, wrapped_lines};
-    use crate::theme::{SPACE_M, SPACE_S};
+    use super::{ESTIMATED_CHAR_WIDTH, State, gap_after, item_height, item_tops, wrapped_lines};
+    use crate::theme::{SPACE_L, SPACE_M};
     use manifest_domain::{TranscriptItem, fixture};
 
     /// Indices of the user prompts in display order.
@@ -326,7 +346,7 @@ mod tests {
         let assistant = TranscriptItem::AssistantTurn { text };
         let width = 600.0;
         let gap = item_height(&user, width) - item_height(&assistant, width);
-        assert!((gap - 2.0 * SPACE_S).abs() < 0.001);
+        assert!((gap - 2.0 * SPACE_L).abs() < 0.001);
     }
 
     #[test]
@@ -336,9 +356,29 @@ mod tests {
         assert_eq!(tops.len(), state.items.len());
         assert_eq!(tops[0], 0.0);
         for (index, top) in tops.iter().enumerate().skip(1) {
-            let want = tops[index - 1] + item_height(&state.items[index - 1], 600.0) + SPACE_M;
+            let want = tops[index - 1]
+                + item_height(&state.items[index - 1], 600.0)
+                + gap_after(&state.items[index - 1]);
             assert!((top - want).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn gap_after_user_is_double_and_after_assistant_is_single() {
+        let user = TranscriptItem::UserTurn {
+            text: String::from("prompt"),
+        };
+        let assistant = TranscriptItem::AssistantTurn {
+            text: String::from("reply"),
+        };
+        let items = vec![user.clone(), assistant.clone()];
+        let tops = item_tops(&items, 600.0);
+        let want = item_height(&user, 600.0) + 2.0 * SPACE_M;
+        assert!((tops[1] - want).abs() < 0.001);
+        let items = vec![assistant.clone(), assistant.clone()];
+        let tops = item_tops(&items, 600.0);
+        let want = item_height(&assistant, 600.0) + SPACE_M;
+        assert!((tops[1] - want).abs() < 0.001);
     }
 
     #[test]

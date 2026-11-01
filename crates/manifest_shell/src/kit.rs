@@ -16,9 +16,10 @@ use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BORDER_DEFAULT, COMPOSER_LINE_HEIGHT, FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL,
-    ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_M, SPACE_S, SPACE_XS, SURFACE_1,
-    SURFACE_2, TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_LINE_HEIGHT, FONT_SIZE_BODY,
+    FONT_SIZE_HEADING, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM,
+    SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_HIGH,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The two pill-button treatments.
@@ -125,6 +126,67 @@ pub(crate) fn panel<'a, Message: Clone + 'a>(
     container(content)
         .padding(SPACE_M)
         .style(panel_style)
+        .into()
+}
+
+/// Status-aware style for [`side_panel`]: the subtle background step,
+/// edge to edge with no border and no radius.
+fn side_panel_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SUBTLE)),
+        ..container::Style::default()
+    }
+}
+
+/// The left panel: the subtle background fill running edge to edge,
+/// medium padding, mirroring [`panel`]'s shape without its radius.
+pub(crate) fn side_panel<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .padding(SPACE_M)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(side_panel_style)
+        .into()
+}
+
+/// Status-aware style for [`vertical_divider`]: the subtle border step.
+fn vertical_divider_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BORDER_SUBTLE)),
+        ..container::Style::default()
+    }
+}
+
+/// The thin divider between the side panel and the main chat: a 1px
+/// fixed-width, fill-height container in the subtle border tone.
+pub(crate) fn vertical_divider<'a, Message: Clone + 'a>() -> Element<'a, Message> {
+    container(text(""))
+        .width(Length::Fixed(1.0))
+        .height(Length::Fill)
+        .style(vertical_divider_style)
+        .into()
+}
+
+/// Status-aware style for [`title_bar`]: the same subtle background
+/// step as the side panel, so header and panel read as one L.
+fn title_bar_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SUBTLE)),
+        ..container::Style::default()
+    }
+}
+
+/// The themed title bar replacing the OS decorations: full width with
+/// bar padding on the subtle background fill.
+pub(crate) fn title_bar<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .padding([SPACE_S, SPACE_M])
+        .style(title_bar_style)
         .into()
 }
 
@@ -314,18 +376,30 @@ pub(crate) fn toggle_chip<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// Maps the drawer situation to its chevron glyph: the drawer grows
+/// upward when opened, so the collapsed peek strip shows an up chevron
+/// (expand) and the open header shows a down chevron (collapse).
+pub(crate) fn drawer_chevron(expanded: bool) -> &'static str {
+    if expanded { "▾" } else { "▴" }
+}
+
 /// The shared Todos bar row: a small label, the current todo in a
-/// fill-width container so it bounds the text, and the small summary.
-/// Both the peek strip and the expanded drawer header show this row.
+/// fill-width container so it bounds the text, the small summary, and
+/// the expand/collapse chevron at the right end. Both the peek strip
+/// and the expanded drawer header show this row.
 fn todo_bar_row<'a, Message: 'a>(
     current: &'a str,
     summary: &'a str,
+    expanded: bool,
 ) -> iced::widget::Row<'a, Message> {
     iced::widget::row![
         text("Todos").size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
         iced::widget::container(text(current).size(FONT_SIZE_SMALL).color(TEXT_PRIMARY),)
             .width(Length::Fill),
         text(summary).size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
+        text(drawer_chevron(expanded))
+            .size(FONT_SIZE_SMALL)
+            .color(TEXT_TERTIARY),
     ]
     .spacing(SPACE_S)
     .width(Length::Fill)
@@ -353,7 +427,7 @@ pub(crate) fn peek_strip<'a, Message: Clone + 'a>(
     summary: &'a str,
     on_press: Message,
 ) -> Element<'a, Message> {
-    button(todo_bar_row(current, summary))
+    button(todo_bar_row(current, summary, false))
         .width(Length::Fill)
         .padding([SPACE_S, SPACE_M])
         .on_press(on_press)
@@ -383,7 +457,7 @@ pub(crate) fn drawer_header<'a, Message: Clone + 'a>(
     summary: &'a str,
     on_press: Message,
 ) -> Element<'a, Message> {
-    button(todo_bar_row(current, summary))
+    button(todo_bar_row(current, summary, true))
         .width(Length::Fill)
         .padding([SPACE_S, SPACE_M])
         .on_press(on_press)
@@ -548,7 +622,7 @@ pub(crate) fn prompt_bubble<'a, Message: Clone + 'a>(text: &'a str) -> Element<'
             .color(TEXT_PRIMARY),
     )
     .width(Length::Fill)
-    .padding([SPACE_S, SPACE_M])
+    .padding([SPACE_L, SPACE_XL])
     .style(prompt_bubble_style)
     .into()
 }
@@ -577,7 +651,7 @@ pub(crate) fn input_bar<'a, Message: Clone + 'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ButtonKind, IconButtonKind, button_colors, icon_button_colors};
+    use super::{ButtonKind, IconButtonKind, button_colors, drawer_chevron, icon_button_colors};
     use crate::theme::{
         ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, SURFACE_1, SURFACE_2, TEXT_FAINT,
         TEXT_PRIMARY, TEXT_SECONDARY,
@@ -642,6 +716,12 @@ mod tests {
             icon_button_colors(IconButtonKind::Subtle, button::Status::Disabled),
             (None, TEXT_FAINT)
         );
+    }
+
+    #[test]
+    fn drawer_chevron_points_up_when_collapsed_and_down_when_open() {
+        assert_eq!(drawer_chevron(false), "▴");
+        assert_eq!(drawer_chevron(true), "▾");
     }
 
     #[test]

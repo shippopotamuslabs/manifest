@@ -16,7 +16,6 @@ use iced::{Color, Theme};
 
 // Background layers.
 pub const BG_BASE: Color = Color::from_rgb8(0x0D, 0x0E, 0x11);
-#[allow(dead_code)]
 pub const BG_SUBTLE: Color = Color::from_rgb8(0x11, 0x12, 0x16);
 pub const SURFACE_1: Color = Color::from_rgb8(0x18, 0x1A, 0x20);
 pub const SURFACE_2: Color = Color::from_rgb8(0x1F, 0x22, 0x2A);
@@ -27,7 +26,6 @@ pub const SURFACE_3: Color = Color::from_rgb8(0x27, 0x2A, 0x33);
 pub const BORDER_DEFAULT: Color = Color::from_rgb8(0x2A, 0x2E, 0x39);
 #[allow(dead_code)]
 pub const BORDER_STRONG: Color = Color::from_rgb8(0x34, 0x3A, 0x48);
-#[allow(dead_code)]
 pub const BORDER_SUBTLE: Color = Color::from_rgb8(0x20, 0x22, 0x2E);
 
 // Text ramp.
@@ -61,9 +59,7 @@ pub const SPACE_XXS: f32 = 2.0;
 pub const SPACE_XS: f32 = 4.0;
 pub const SPACE_S: f32 = 8.0;
 pub const SPACE_M: f32 = 12.0;
-#[allow(dead_code)]
 pub const SPACE_L: f32 = 16.0;
-#[allow(dead_code)]
 pub const SPACE_XL: f32 = 24.0;
 #[allow(dead_code)]
 pub const SPACE_XXL: f32 = 32.0;
