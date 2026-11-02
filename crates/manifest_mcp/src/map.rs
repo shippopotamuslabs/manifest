@@ -86,6 +86,7 @@ pub(crate) fn map_status_rows(
                 projects.push(ProjectSummary {
                     id: id.clone(),
                     name: name.clone(),
+                    workspace: Some(dto.workspace.clone()),
                 });
                 (id, name)
             })
@@ -612,6 +613,15 @@ mod tests {
             sessions[2].project,
             Some(ProjectId::new("workspace:/home/dev/beta"))
         );
+    }
+
+    #[test]
+    fn projects_carry_their_workspace() {
+        let rows = vec![row("s1", "idle", "/home/dev/beta", 0, None)];
+        let (projects, _, _) = map_status_rows(&rows);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, String::from("beta"));
+        assert_eq!(projects[0].workspace, Some(String::from("/home/dev/beta")));
     }
 
     #[test]

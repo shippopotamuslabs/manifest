@@ -30,6 +30,7 @@ pub const BORDER_SUBTLE: Color = Color::from_rgb8(0x20, 0x22, 0x2E);
 
 // Text ramp.
 pub const TEXT_PRIMARY: Color = Color::from_rgb8(0xED, 0xEE, 0xF0);
+#[allow(dead_code)]
 pub const TEXT_HIGH: Color = Color::from_rgb8(0xC5, 0xC7, 0xDD);
 pub const TEXT_SECONDARY: Color = Color::from_rgb8(0xA1, 0xA5, 0xB0);
 pub const TEXT_TERTIARY: Color = Color::from_rgb8(0x85, 0x89, 0x94);
@@ -70,6 +71,11 @@ pub const RADIUS_PANEL: f32 = 8.0;
 pub const RADIUS_PILL: f32 = 999.0;
 
 // Type sizes in logical pixels.
+// Dense panel sizes for the left session list: single-line rows and
+// quiet headers (the panel restyle). Transcript, composer, and topbar
+// keep the body sizes below.
+pub const FONT_SIZE_PANEL: f32 = 14.0;
+pub const FONT_SIZE_PANEL_SMALL: f32 = 12.0;
 pub const FONT_SIZE_SMALL: f32 = 15.0;
 pub const FONT_SIZE_BODY: f32 = 18.0;
 pub const FONT_SIZE_HEADING: f32 = 20.0;

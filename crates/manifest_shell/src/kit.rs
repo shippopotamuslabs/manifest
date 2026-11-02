@@ -17,9 +17,10 @@ use iced::{Background, Border, Color, Element, Length, Theme};
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
     BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_LINE_HEIGHT, DIVIDER_HIT_WIDTH,
-    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, RADIUS_PANEL,
-    RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SURFACE_1, SURFACE_2,
-    TEXT_FAINT, TEXT_HIGH, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL,
+    ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
+    SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
+    TEXT_TERTIARY,
 };
 
 /// The two pill-button treatments.
@@ -236,49 +237,72 @@ pub(crate) fn text_field<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// Pure data mapping behind the session-row styles: background and
+/// title color for a selection state in a button status. Kept as data
+/// (not `Style`) so the mapping is unit-testable without constructing
+/// widgets. Selection is a quiet surface-2 step, not the accent wash.
+pub(crate) fn row_colors(selected: bool, status: button::Status) -> (Option<Color>, Color) {
+    let background = if selected {
+        Some(SURFACE_2)
+    } else {
+        match status {
+            button::Status::Hovered | button::Status::Pressed => Some(SURFACE_1),
+            button::Status::Active | button::Status::Disabled => None,
+        }
+    };
+    let title = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    (background, title)
+}
+
 /// Status-aware style for a session list row.
 fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme: &Theme, status: button::Status| {
-        let background = if selected {
-            Some(ACCENT_MUTED_BG)
-        } else {
-            match status {
-                button::Status::Hovered | button::Status::Pressed => Some(SURFACE_1),
-                button::Status::Active | button::Status::Disabled => None,
-            }
-        };
+        let (background, text_color) = row_colors(selected, status);
         button::Style {
             background: background.map(Background::Color),
-            text_color: TEXT_PRIMARY,
+            text_color,
             border: Border::default().width(0.0).rounded(RADIUS_PANEL),
             ..button::Style::default()
         }
     }
 }
 
-/// A full-width session row: title plus a small subtitle, with a faint
-/// trailing label pinned to the right edge. Selected rows sit on the
-/// muted accent wash; unselected rows are transparent until hovered.
+/// A dense single-line session row: the title clips on one line with
+/// a faint trailing label pinned to the right edge. Selected titles
+/// read primary on surface-2; unselected titles read secondary and sit
+/// transparent until hovered.
 pub(crate) fn list_row<'a, Message: Clone + 'a>(
     title: &'a str,
-    subtitle: &'a str,
     trailing: &'a str,
     selected: bool,
     on_press: Message,
 ) -> Element<'a, Message> {
-    let title_color = if selected { TEXT_HIGH } else { TEXT_PRIMARY };
-    let body = iced::widget::column![
-        text(title).size(FONT_SIZE_BODY).color(title_color),
-        text(subtitle).size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let content = iced::widget::row![
+        container(
+            text(title)
+                .size(FONT_SIZE_PANEL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(title_color)
+        )
+        .width(Length::Fill)
+        .clip(true),
+        text(trailing).size(FONT_SIZE_PANEL_SMALL).color(TEXT_FAINT),
     ]
-    .spacing(SPACE_XS)
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
     .width(Length::Fill);
-    let content = iced::widget::row![body, text(trailing).size(FONT_SIZE_SMALL).color(TEXT_FAINT),]
-        .spacing(SPACE_S)
-        .width(Length::Fill);
     button(content)
         .width(Length::Fill)
-        .padding(SPACE_S)
+        .padding([SPACE_XS, SPACE_S])
         .on_press(on_press)
         .style(row_style(selected))
         .into()
@@ -302,29 +326,46 @@ fn label_row_style(rest: Color, hot: Color) -> impl Fn(&Theme, button::Status) -
     }
 }
 
-/// A full-width project section header: a small label button that
-/// expands or collapses the group below it.
-pub(crate) fn section_header<'a, Message: Clone + 'a>(
+/// A project header row: the expand/collapse button fills the row with
+/// a small subtle "+" button pinned to its right end for starting a
+/// new session in that project. The whole header stays pressable for
+/// expand; the "+" is a distinct button.
+pub(crate) fn project_header<'a, Message: Clone + 'a>(
     label: &'a str,
-    on_press: Message,
+    on_expand: Message,
+    on_new: Message,
 ) -> Element<'a, Message> {
-    button(text(label).size(FONT_SIZE_SMALL))
+    iced::widget::row![
+        button(
+            container(
+                text(label)
+                    .size(FONT_SIZE_PANEL)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        )
         .width(Length::Fill)
         .padding([SPACE_XS, SPACE_S])
-        .on_press(on_press)
-        .style(label_row_style(TEXT_TERTIARY, TEXT_SECONDARY))
-        .into()
+        .on_press(on_expand)
+        .style(label_row_style(TEXT_SECONDARY, TEXT_PRIMARY)),
+        icon_button("+", IconButtonKind::Subtle, Some(on_new)),
+    ]
+    .spacing(SPACE_XXS)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill)
+    .into()
 }
 
-/// A full-width add row: same shape as [`section_header`] with a body
+/// A full-width add row: same shape as the project header with a body
 /// label tone, for actions like "+ New Project".
 pub(crate) fn action_row<'a, Message: Clone + 'a>(
     label: &'a str,
     on_press: Message,
 ) -> Element<'a, Message> {
-    button(text(label).size(FONT_SIZE_BODY))
+    button(text(label).size(FONT_SIZE_PANEL))
         .width(Length::Fill)
-        .padding([SPACE_S, SPACE_S])
+        .padding([SPACE_XS, SPACE_S])
         .on_press(on_press)
         .style(label_row_style(TEXT_SECONDARY, TEXT_PRIMARY))
         .into()
@@ -332,7 +373,7 @@ pub(crate) fn action_row<'a, Message: Clone + 'a>(
 
 /// A full-width transcript group header: a chevron glyph plus the
 /// precomputed headline, expanding or collapsing the run below it.
-/// Same shape as [`section_header`]: the whole row is the press target.
+/// Same shape as the project header: the whole row is the press target.
 pub(crate) fn group_header<'a, Message: Clone + 'a>(
     headline: &'a str,
     expanded: bool,
@@ -738,7 +779,9 @@ pub(crate) fn input_bar<'a, Message: Clone + 'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ButtonKind, IconButtonKind, button_colors, drawer_chevron, icon_button_colors};
+    use super::{
+        ButtonKind, IconButtonKind, button_colors, drawer_chevron, icon_button_colors, row_colors,
+    };
     use crate::theme::{
         ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, SURFACE_1, SURFACE_2, TEXT_FAINT,
         TEXT_PRIMARY, TEXT_SECONDARY,
@@ -802,6 +845,30 @@ mod tests {
         assert_eq!(
             icon_button_colors(IconButtonKind::Subtle, button::Status::Disabled),
             (None, TEXT_FAINT)
+        );
+    }
+
+    #[test]
+    fn row_colors_select_with_a_quiet_surface_step() {
+        assert_eq!(
+            row_colors(true, button::Status::Active),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            row_colors(true, button::Status::Hovered),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            row_colors(false, button::Status::Active),
+            (None, TEXT_SECONDARY)
+        );
+        assert_eq!(
+            row_colors(false, button::Status::Hovered),
+            (Some(SURFACE_1), TEXT_SECONDARY)
+        );
+        assert_eq!(
+            row_colors(false, button::Status::Disabled),
+            (None, TEXT_SECONDARY)
         );
     }
 

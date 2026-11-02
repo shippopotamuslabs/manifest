@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length, Task};
-use manifest_domain::{Connection, EngineEvent, Fixture, SessionId, StreamEvent, TodoItem};
+use manifest_domain::{
+    Connection, EngineEvent, Fixture, ProjectId, SessionId, StreamEvent, TodoItem,
+};
 
 use crate::engine;
 use crate::kit;
@@ -110,6 +112,16 @@ impl From<composer::Message> for Message {
     }
 }
 
+/// A session being composed before it exists: entered from a project's
+/// "+" button, resolved into a real session on the next send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSessionDraft {
+    /// Folder the spawned session will run in, from the project.
+    pub workspace: String,
+    /// Precomputed "project · New session" title the topbar reads.
+    pub title: String,
+}
+
 /// Root state: the child states plus the drawer.
 ///
 /// `transcript::State` holds incrementally parsed markdown, which is not
@@ -134,6 +146,11 @@ pub struct App {
     /// its optimistic prompt; cleared on `SessionSpawned` (which
     /// adopts the transcript) or `CommandFailed`.
     pub awaiting_spawn: bool,
+    /// A new session being composed in a project's workspace; set by
+    /// the project's "+" button, cleared on send (which spawns it) or
+    /// on session select. While set, the visible transcript is the
+    /// draft's, and list syncs must not steal it.
+    pub new_session: Option<NewSessionDraft>,
     /// Draft input cluster.
     pub composer: composer::State,
     /// Checklist shown in the drawer, from the fixture.
@@ -187,6 +204,7 @@ impl App {
             running: HashSet::new(),
             select_on_load: None,
             awaiting_spawn: false,
+            new_session: None,
             composer: composer::State::new(),
             todos: fixture.todos,
             todo_drawer: TodoDrawer::Peek,
@@ -237,6 +255,11 @@ impl App {
     /// listed session parks the visible state and shows an empty
     /// transcript. Fixture mode shows the boot transcript and never syncs.
     fn sync_visible_transcript(&mut self) {
+        // Draft mode owns the visible transcript; background list
+        // loads must not steal it.
+        if self.new_session.is_some() {
+            return;
+        }
         if self.engine_config.is_none() {
             return;
         }
@@ -261,6 +284,37 @@ impl App {
                 .insert(owner, std::mem::take(&mut self.transcript));
         }
         self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
+    }
+
+    /// Enters new-session draft mode for the named project: parks the
+    /// visible transcript under its owner (when one is showing) and
+    /// shows an empty draft transcript with the precomputed title.
+    /// Live mode only, never while a spawn is in flight, and only when
+    /// the project is listed with a known workspace; anything else
+    /// leaves the list expansion (done by the child) as the whole
+    /// effect.
+    fn enter_new_session_draft(&mut self, project: &ProjectId) {
+        if self.engine_config.is_none() || self.awaiting_spawn {
+            return;
+        }
+        let Some(group) = self
+            .sessions
+            .groups
+            .iter()
+            .find(|group| group.project.id == *project)
+        else {
+            return;
+        };
+        let Some(workspace) = group.project.workspace.clone() else {
+            return;
+        };
+        let title = format!("{} · New session", group.project.name);
+        if let Some(owner) = self.visible_session.take() {
+            self.transcripts
+                .insert(owner, std::mem::take(&mut self.transcript));
+        }
+        self.transcript = transcript::State::default();
+        self.new_session = Some(NewSessionDraft { workspace, title });
     }
 
     /// Whether the id names a session in the current list.
@@ -293,20 +347,37 @@ impl App {
             .sessions
             .selected_summary()
             .is_some_and(|summary| self.running.contains(&summary.id));
+        // A draft is a spawn, not a follow-up: the selected session's
+        // running state does not gate it.
+        let gated_by_selection = selected_running && self.new_session.is_none();
         self.composer.send_enabled = self.engine_config.is_some()
             && self.connection == Connection::Connected
             && self.engine.is_some()
             && !self.awaiting_spawn
-            && !selected_running;
+            && !gated_by_selection;
+    }
+
+    /// Spawns a session in the given workspace with the draft prompt:
+    /// the shared tail of the draft spawn and the no-selection cwd
+    /// fallback. Echoes the prompt optimistically, clears the draft,
+    /// and marks the spawn in flight until `SessionSpawned` adopts it.
+    fn spawn_session(&mut self, workspace: String, prompt: String) -> Task<Message> {
+        if let Some(engine) = self.engine.clone() {
+            engine.spawn_session(workspace, prompt.clone());
+        }
+        self.awaiting_spawn = true;
+        self.transcript.push_user(prompt);
+        self.composer.clear();
+        transcript::scroll_to_end().map(Message::Transcript)
     }
 
     /// Routes the composer send button press. In order: fixture mode
     /// is a no-op with the draft untouched; a blank draft sends
     /// nothing; while not connected the visible transcript gains a
-    /// friendly note and the draft stays; a listed selection sends a
+    /// friendly note and the draft stays; a new-session draft spawns
+    /// into its project workspace; a listed selection sends a
     /// follow-up turn unless one is already in flight; otherwise the
-    /// draft spawns a session in the process working directory
-    /// (spawning into a chosen project folder is a later slice).
+    /// draft spawns a session in the process working directory.
     /// Sends echo the prompt optimistically, clear the draft, and
     /// snap the transcript to the end.
     fn send_from_composer(&mut self) -> Task<Message> {
@@ -320,6 +391,9 @@ impl App {
         if self.connection != Connection::Connected || self.engine.is_none() {
             let appended = self.transcript.push_error(not_connected_message());
             return scroll_transcript_to_end(appended);
+        }
+        if let Some(draft) = self.new_session.take() {
+            return self.spawn_session(draft.workspace, text);
         }
         if let Some(summary) = self.sessions.selected_summary() {
             let session = summary.id.clone();
@@ -343,13 +417,7 @@ impl App {
                 return scroll_transcript_to_end(appended);
             }
         };
-        if let Some(engine) = self.engine.clone() {
-            engine.spawn_session(workspace, text.clone());
-        }
-        self.awaiting_spawn = true;
-        self.transcript.push_user(text);
-        self.composer.clear();
-        transcript::scroll_to_end().map(Message::Transcript)
+        self.spawn_session(workspace, text)
     }
 
     /// Folds one stream event into the owning session's transcript:
@@ -433,7 +501,19 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Sessions(child) => {
+                let select = matches!(child, sessions::Message::Select(_));
+                let draft_project = match &child {
+                    sessions::Message::NewSession(project) => Some(project.clone()),
+                    _ => None,
+                };
                 self.sessions.update(child);
+                if let Some(project) = draft_project {
+                    self.enter_new_session_draft(&project);
+                } else if select {
+                    // Leaving the draft restores the selected session's
+                    // parked transcript through the usual sync below.
+                    self.new_session = None;
+                }
                 self.sync_visible_transcript();
                 self.refresh_send_gate();
                 Task::none()
@@ -799,11 +879,17 @@ fn dropped_deltas_message(dropped: u64) -> String {
 /// window controls right-aligned. A plain function on the root state
 /// — no state of its own, no module.
 fn topbar(state: &App) -> Element<'_, Message> {
-    let selected_title: &str = state
-        .sessions
-        .selected_summary()
-        .map(|summary| summary.title.as_str())
-        .unwrap_or("No session");
+    // Draft mode shows the precomputed draft title; the view formats
+    // nothing (UI contract §2).
+    let selected_title: &str = if let Some(draft) = &state.new_session {
+        draft.title.as_str()
+    } else {
+        state
+            .sessions
+            .selected_summary()
+            .map(|summary| summary.title.as_str())
+            .unwrap_or("No session")
+    };
     // The two Fill regions flanking the title share the leftover
     // width equally, so the title stays centered no matter how wide
     // the window controls run.
@@ -1192,6 +1278,15 @@ mod tests {
         manifest_domain::ProjectSummary {
             id: manifest_domain::ProjectId::new("project-live"),
             name: String::from("live"),
+            workspace: None,
+        }
+    }
+
+    fn draft_project() -> manifest_domain::ProjectSummary {
+        manifest_domain::ProjectSummary {
+            id: manifest_domain::ProjectId::new("project-live"),
+            name: String::from("live"),
+            workspace: Some(String::from("/live/workspace")),
         }
     }
 
@@ -1773,5 +1868,161 @@ mod tests {
         assert!(app.composer.send_enabled);
         loaded(&mut app, &["s-1"]);
         assert!(app.composer.send_enabled);
+    }
+
+    /// Loads one project carrying a workspace, for draft tests.
+    fn loaded_with_workspace(app: &mut App) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                projects: vec![draft_project()],
+                sessions: vec![live_session("s-1"), live_session("s-2")],
+            }),
+        );
+    }
+
+    /// Presses the project's "+" button through the root reducer.
+    fn new_session_pressed(app: &mut App) {
+        let _ = app.update(Message::Sessions(sessions::Message::NewSession(
+            manifest_domain::ProjectId::new("project-live"),
+        )));
+    }
+
+    #[test]
+    fn new_session_enters_draft_mode_with_parked_transcript() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        stream(&mut app, agent_completed("s-1", "a-1", "one"));
+        assert_eq!(app.transcript.entries.len(), 1);
+        new_session_pressed(&mut app);
+        assert_eq!(
+            app.new_session,
+            Some(NewSessionDraft {
+                workspace: String::from("/live/workspace"),
+                title: String::from("live · New session"),
+            })
+        );
+        assert_eq!(
+            app.sessions.expanded,
+            Some(manifest_domain::ProjectId::new("project-live"))
+        );
+        // The s-1 transcript parks; the draft shows empty.
+        assert!(app.transcript.entries.is_empty());
+        assert_eq!(app.visible_session, None);
+        assert_eq!(stored_len(&app, "s-1"), 1);
+    }
+
+    #[test]
+    fn draft_send_spawns_into_project_workspace_and_clears_draft() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        type_composer_text(&mut app, "fresh idea");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(String::from("/live/workspace"), String::from("fresh idea"))]
+        );
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert!(app.new_session.is_none());
+        assert!(app.awaiting_spawn);
+        assert_eq!(user_entries(&app), vec!["fresh idea"]);
+        assert_eq!(app.composer.content.text(), "");
+    }
+
+    #[test]
+    fn select_exits_draft_mode_and_restores_parked_transcript() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        stream(&mut app, agent_completed("s-1", "a-1", "one"));
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        let first = SessionId::new("s-1");
+        let _ = app.update(Message::Sessions(sessions::Message::Select(first.clone())));
+        assert_eq!(app.new_session, None);
+        assert_eq!(app.visible_session, Some(first));
+        assert_eq!(app.transcript.entries.len(), 1);
+        assert!(matches!(
+            &app.transcript.entries[0].kind,
+            crate::transcript::EntryKind::Assistant { text, .. } if text == "one"
+        ));
+    }
+
+    #[test]
+    fn sessions_loaded_during_draft_keeps_the_draft_view() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        new_session_pressed(&mut app);
+        loaded_with_workspace(&mut app);
+        assert!(app.new_session.is_some());
+        assert_eq!(app.visible_session, None);
+        assert!(app.transcript.entries.is_empty());
+    }
+
+    #[test]
+    fn send_gate_stays_enabled_in_draft_while_selection_runs() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        assert!(!app.composer.send_enabled);
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        assert!(app.composer.send_enabled);
+    }
+
+    #[test]
+    fn new_session_without_workspace_expands_without_draft() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        new_session_pressed(&mut app);
+        assert_eq!(
+            app.sessions.expanded,
+            Some(manifest_domain::ProjectId::new("project-live"))
+        );
+        assert_eq!(app.new_session, None);
+    }
+
+    #[test]
+    fn new_session_while_awaiting_spawn_expands_without_draft() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        new_session_pressed(&mut app);
+        type_composer_text(&mut app, "fresh idea");
+        send_pressed(&mut app);
+        assert!(app.awaiting_spawn);
+        new_session_pressed(&mut app);
+        assert_eq!(app.new_session, None);
+        assert_eq!(
+            app.sessions.expanded,
+            Some(manifest_domain::ProjectId::new("project-live"))
+        );
+    }
+
+    #[test]
+    fn fixture_new_session_expands_without_draft() {
+        let mut app = App::boot();
+        let _ = app.update(Message::Sessions(sessions::Message::NewSession(
+            manifest_domain::ProjectId::new("project-checkout-api"),
+        )));
+        assert_eq!(app.new_session, None);
+        assert_eq!(
+            app.sessions.expanded,
+            Some(manifest_domain::ProjectId::new("project-checkout-api"))
+        );
     }
 }

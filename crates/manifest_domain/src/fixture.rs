@@ -53,6 +53,9 @@ pub struct ProjectSummary {
     pub id: ProjectId,
     /// Short human name, e.g. "checkout-api".
     pub name: String,
+    /// Folder sessions in this project run in; `None` when unknown,
+    /// as in the fixture.
+    pub workspace: Option<String>,
 }
 
 /// One row in the session list.
@@ -119,10 +122,12 @@ pub fn fixture() -> Fixture {
             ProjectSummary {
                 id: ProjectId::new("project-checkout-api"),
                 name: String::from("checkout-api"),
+                workspace: None,
             },
             ProjectSummary {
                 id: ProjectId::new("project-storefront-web"),
                 name: String::from("storefront-web"),
+                workspace: None,
             },
         ],
         sessions: vec![
