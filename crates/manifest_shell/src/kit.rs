@@ -344,6 +344,16 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     .into()
 }
 
+/// Icon for a TODO drawer row: check-in-circle when done, empty
+/// circle when pending.
+pub(crate) fn todo_status_icon(done: bool) -> lucide_icons::Icon {
+    if done {
+        lucide_icons::Icon::CircleCheck
+    } else {
+        lucide_icons::Icon::Circle
+    }
+}
+
 /// Icon for a selection row: filled dot/check when selected.
 pub(crate) fn selection_icon(selected: bool, multi: bool) -> lucide_icons::Icon {
     match (multi, selected) {
@@ -1592,6 +1602,18 @@ mod tests {
     fn pending_badge_label_hides_at_zero() {
         assert_eq!(super::pending_badge_label(0), None);
         assert_eq!(super::pending_badge_label(2).as_deref(), Some("2 pending"));
+    }
+
+    #[test]
+    fn todo_status_icon_maps_done_to_check() {
+        assert!(matches!(
+            super::todo_status_icon(true),
+            lucide_icons::Icon::CircleCheck
+        ));
+        assert!(matches!(
+            super::todo_status_icon(false),
+            lucide_icons::Icon::Circle
+        ));
     }
 
     #[test]

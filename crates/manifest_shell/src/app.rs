@@ -2822,8 +2822,10 @@ fn worktree_bar_view(draft: &NewSessionDraft) -> Element<'_, Message> {
 }
 
 /// The open TODO drawer: a panel whose first row is the shared bar
-/// header, followed by one line per todo with finished steps in the
-/// tertiary tone. Plain text lines — no extra widget kinds.
+/// header, followed by one line per todo: the label in full width with
+/// a trailing status icon (check-in-circle for finished steps, empty
+/// circle for pending ones). Finished rows read in the tertiary tone;
+/// pending rows read in the primary tone.
 fn todo_drawer_view<'a>(
     todos: &'a [TodoItem],
     current: &'a str,
@@ -2837,24 +2839,24 @@ fn todo_drawer_view<'a>(
     .spacing(SPACE_S)
     .width(Length::Fill);
     for todo in todos {
-        // No string building in the view (UI contract §2): the done
-        // marker is a static label beside the borrowed todo text.
-        let (marker, color) = if todo.done {
-            ("Done", TEXT_TERTIARY)
+        // No string building in the view (UI contract §2): the status
+        // icon is a static mapping beside the borrowed todo text.
+        let color = if todo.done {
+            TEXT_TERTIARY
         } else {
-            ("Todo", TEXT_PRIMARY)
+            TEXT_PRIMARY
         };
         list = list.push(
             iced::widget::container(
                 iced::widget::row![
-                    iced::widget::text(marker)
-                        .size(FONT_SIZE_SMALL)
-                        .color(color),
                     iced::widget::text(todo.label.as_str())
                         .size(FONT_SIZE_SMALL)
-                        .color(color),
+                        .color(color)
+                        .width(Length::Fill),
+                    kit::icon(kit::todo_status_icon(todo.done), FONT_SIZE_SMALL, color),
                 ]
-                .spacing(SPACE_S),
+                .spacing(SPACE_S)
+                .align_y(iced::alignment::Vertical::Center),
             )
             .width(Length::Fill),
         );
