@@ -13,4 +13,5 @@ manifest_domain = { path = "../manifest_domain" }
 manifest_mcp = { path = "../manifest_mcp" }
 manifest_store = { path = "../manifest_store" }
 iced = { version = "0.14", features = ["markdown"] }
+lucide_icons = { package = "lucide-icons", version = "1", features = ["iced"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

@@ -34,9 +34,9 @@ const ESTIMATED_CHAR_WIDTH: f32 = FONT_SIZE_BODY * 0.46;
 /// Tune against the release build if the header drifts from the real row.
 const GROUP_HEADER_HEIGHT: f32 = FONT_SIZE_SMALL * 1.3 + 2.0 * crate::theme::SPACE_XS;
 /// Height of the Copy row under a completed assistant message in px.
-/// Matches a ghost pill button: default text at [`LINE_HEIGHT`] plus its
-/// vertical padding. Tune against the release build if it drifts.
-const COPY_ROW_HEIGHT: f32 = FONT_SIZE_BODY * 1.3 + 2.0 * crate::theme::SPACE_S;
+/// Matches the fixed square of the kit icon button it now renders.
+/// Tune against the release build if it drifts.
+const COPY_ROW_HEIGHT: f32 = crate::theme::ICON_BUTTON_SIZE;
 /// Separator between headline parts, e.g. `Thinking · 2 tool calls`.
 const MIDDOT: &str = " · ";
 
@@ -997,9 +997,10 @@ fn render_entry<'a>(entry: &'a Entry, settings: markdown::Settings) -> Element<'
                 iced::widget::column![markdown::view_with(markdown.items(), settings, &Viewer)]
                     .width(Length::Fill);
             if entry.completed {
-                column = column.push(kit::pill_button(
+                column = column.push(kit::tooltip_icon_button(
+                    lucide_icons::Icon::Copy,
+                    kit::IconButtonKind::Subtle,
                     "Copy",
-                    kit::ButtonKind::Ghost,
                     Some(Message::Copy(text.clone())),
                 ));
             }
@@ -1107,9 +1108,10 @@ impl<'a> markdown::Viewer<'a, Message> for Viewer {
             iced::widget::container(iced::widget::text("").size(FONT_SIZE_SMALL))
                 .width(Length::Fill),
         );
-        header = header.push(kit::pill_button(
+        header = header.push(kit::tooltip_icon_button(
+            lucide_icons::Icon::Copy,
+            kit::IconButtonKind::Subtle,
             "Copy",
-            kit::ButtonKind::Ghost,
             Some(Message::Copy(code.to_string())),
         ));
         iced::widget::column![

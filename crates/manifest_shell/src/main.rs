@@ -33,6 +33,7 @@ fn boot() -> (App, iced::Task<app::Message>) {
 
 fn main() -> iced::Result {
     iced::application(boot, App::update, App::view)
+        .font(lucide_icons::LUCIDE_FONT_BYTES)
         .title("Manifest")
         .theme(manifest_theme())
         .subscription(App::subscription)
