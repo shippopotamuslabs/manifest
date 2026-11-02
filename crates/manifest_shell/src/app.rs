@@ -2849,11 +2849,11 @@ fn todo_drawer_view<'a>(
         list = list.push(
             iced::widget::container(
                 iced::widget::row![
+                    kit::icon(kit::todo_status_icon(todo.done), FONT_SIZE_SMALL, color),
                     iced::widget::text(todo.label.as_str())
                         .size(FONT_SIZE_SMALL)
                         .color(color)
                         .width(Length::Fill),
-                    kit::icon(kit::todo_status_icon(todo.done), FONT_SIZE_SMALL, color),
                 ]
                 .spacing(SPACE_S)
                 .align_y(iced::alignment::Vertical::Center),
