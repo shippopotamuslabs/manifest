@@ -16,7 +16,37 @@
 use std::sync::Arc;
 
 use iced::futures::StreamExt;
-use manifest_domain::{Connection, EngineEvent, SessionEngine};
+use manifest_domain::{Connection, EngineEvent, SessionEngine, SessionId, StreamEvent};
+
+/// Folds `next` into `into` when both are item deltas for the same
+/// session, item, and field: the delta texts concatenate and the first
+/// event's other fields (turn, cursor) are kept. Returns whether the
+/// merge happened; a refusal leaves both events untouched so the caller
+/// can emit `into` and retry from `next`, preserving order.
+fn try_merge_delta(into: &mut EngineEvent, next: &EngineEvent) -> bool {
+    match (into, next) {
+        (
+            EngineEvent::Stream(StreamEvent::ItemDelta {
+                session: into_session,
+                item_id: into_item,
+                field: into_field,
+                delta: into_delta,
+                ..
+            }),
+            EngineEvent::Stream(StreamEvent::ItemDelta {
+                session: next_session,
+                item_id: next_item,
+                field: next_field,
+                delta: next_delta,
+                ..
+            }),
+        ) if into_session == next_session && into_item == next_item && into_field == next_field => {
+            into_delta.push_str(next_delta);
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Cloneable handle to the session engine behind the subscription.
 ///
@@ -41,6 +71,16 @@ impl EngineHandle {
     pub fn list_sessions(&self) {
         self.inner.list_sessions();
     }
+
+    /// Spawns a session; success arrives as `SessionSpawned`.
+    pub fn spawn_session(&self, workspace: String, prompt: String) {
+        self.inner.spawn_session(workspace, prompt);
+    }
+
+    /// Sends a follow-up turn; success arrives as `TurnAccepted`.
+    pub fn send_turn(&self, session: SessionId, prompt: String) {
+        self.inner.send_turn(session, prompt);
+    }
 }
 
 impl std::fmt::Debug for EngineHandle {
@@ -56,8 +96,16 @@ impl std::fmt::Debug for EngineHandle {
 pub enum Input {
     /// The engine handle; the forwarder sends this before any event.
     Ready(EngineHandle),
-    /// One engine event from the worker.
-    Event(EngineEvent),
+    /// One engine event from the worker, boxed so the hot app message
+    /// enum stays small.
+    Event(Box<EngineEvent>),
+}
+
+impl Input {
+    /// Wraps one worker event for the subscription stream.
+    pub fn event(event: EngineEvent) -> Self {
+        Self::Event(Box::new(event))
+    }
 }
 
 /// Folds one engine input into the held engine/connection state.
@@ -181,8 +229,28 @@ pub fn subscription(
             if tx.unbounded_send(Input::Ready(handle)).is_err() {
                 return;
             }
-            for event in std_rx {
-                if tx.unbounded_send(Input::Event(event)).is_err() {
+            // A disconnected channel ends the loop; an empty channel ends
+            // the current coalescing pass, keeping the discipline of one
+            // UI message per burst without timers (UI contract §3).
+            let mut stash: Option<EngineEvent> = None;
+            loop {
+                let first = match stash.take() {
+                    Some(event) => event,
+                    None => match std_rx.recv() {
+                        Ok(event) => event,
+                        Err(_) => break,
+                    },
+                };
+                let mut event = first;
+                if matches!(event, EngineEvent::Stream(StreamEvent::ItemDelta { .. })) {
+                    while let Ok(next) = std_rx.try_recv() {
+                        if !try_merge_delta(&mut event, &next) {
+                            stash = Some(next);
+                            break;
+                        }
+                    }
+                }
+                if tx.unbounded_send(Input::event(event)).is_err() {
                     break;
                 }
             }
@@ -226,4 +294,65 @@ pub fn connection_cluster<'a, M: Clone + 'a>(
         .spacing(crate::theme::SPACE_S)
         .align_y(iced::alignment::Vertical::Center)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(session: &str, item: &str, field: &str, text: &str) -> EngineEvent {
+        EngineEvent::Stream(StreamEvent::ItemDelta {
+            session: SessionId::new(session),
+            turn: None,
+            view_cursor: Some(String::from("cursor-first")),
+            item_id: String::from(item),
+            field: String::from(field),
+            delta: String::from(text),
+        })
+    }
+
+    #[test]
+    fn merges_same_item_and_field_concatenating_text() {
+        let mut into = delta("s-1", "a-1", "text", "foo");
+        let next = delta("s-1", "a-1", "text", "bar");
+        assert!(try_merge_delta(&mut into, &next));
+        assert!(matches!(
+            &into,
+            EngineEvent::Stream(StreamEvent::ItemDelta { delta, view_cursor, .. })
+                if delta == "foobar" && view_cursor.as_deref() == Some("cursor-first")
+        ));
+    }
+
+    #[test]
+    fn refuses_different_field_item_or_session() {
+        let mut into = delta("s-1", "a-1", "text", "foo");
+        assert!(!try_merge_delta(
+            &mut into,
+            &delta("s-1", "a-1", "output", "bar")
+        ));
+        assert!(!try_merge_delta(
+            &mut into,
+            &delta("s-1", "a-2", "text", "bar")
+        ));
+        assert!(!try_merge_delta(
+            &mut into,
+            &delta("s-2", "a-1", "text", "bar")
+        ));
+        // A refusal leaves the first event untouched.
+        assert!(matches!(
+            &into,
+            EngineEvent::Stream(StreamEvent::ItemDelta { delta, .. }) if delta == "foo"
+        ));
+    }
+
+    #[test]
+    fn refuses_non_delta_events() {
+        let mut into = delta("s-1", "a-1", "text", "foo");
+        let other = EngineEvent::Diagnostic(String::from("note"));
+        assert!(!try_merge_delta(&mut into, &other));
+        assert!(!try_merge_delta(
+            &mut EngineEvent::Diagnostic(String::from("note")),
+            &into
+        ));
+    }
 }

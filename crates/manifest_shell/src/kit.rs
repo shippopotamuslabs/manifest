@@ -330,6 +330,30 @@ pub(crate) fn action_row<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// A full-width transcript group header: a chevron glyph plus the
+/// precomputed headline, expanding or collapsing the run below it.
+/// Same shape as [`section_header`]: the whole row is the press target.
+pub(crate) fn group_header<'a, Message: Clone + 'a>(
+    headline: &'a str,
+    expanded: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let content = iced::widget::row![
+        text(drawer_chevron(expanded))
+            .size(FONT_SIZE_SMALL)
+            .color(TEXT_TERTIARY),
+        text(headline).size(FONT_SIZE_SMALL).color(TEXT_SECONDARY),
+    ]
+    .spacing(SPACE_S)
+    .width(Length::Fill);
+    button(content)
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(label_row_style(TEXT_TERTIARY, TEXT_SECONDARY))
+        .into()
+}
+
 /// Status-aware style for the modal dim: the scrim token, no border.
 fn scrim_style(_theme: &Theme) -> container::Style {
     container::Style {
