@@ -18,6 +18,109 @@ impl TurnId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    /// Borrow the stored handle for wire calls.
+    ///
+    /// Callers still compare and match by the whole handle.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// How far a transcript item got on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemStatus {
+    /// The item is still streaming.
+    InProgress,
+    /// The item finished cleanly.
+    Completed,
+    /// The item finished with an error; details ride on the item.
+    Failed,
+    /// Any other wire status, carried verbatim for forward compatibility.
+    ///
+    /// Holds the raw status text, or an empty string when the wire sent
+    /// none. Unknown statuses stay values, never parse failures.
+    Other(String),
+}
+
+/// One transcript item, typed from the wire object.
+///
+/// The mapper classifies every item the host streams; the shell renders
+/// from these variants instead of raw JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamItem {
+    /// Something the user wrote; the prompt echo.
+    UserMessage {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Prompt text; empty when the wire sent none.
+        text: String,
+    },
+    /// Something the agent wrote.
+    AgentMessage {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Assistant markdown; empty at started, authoritative at completed.
+        text: String,
+        /// Raw message phase (only `finalAnswer` observed); other phases
+        /// stay forward-compatible values.
+        phase: Option<String>,
+    },
+    /// The host's abstract of the turn's plan, not raw thinking text.
+    Reasoning {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Summary sentences; string entries only, empty when none sent.
+        summary: Vec<String>,
+    },
+    /// One tool invocation with its headline and result.
+    ToolCall {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Tool name; empty when the wire sent none.
+        tool: String,
+        /// One-line headline parsed from the args; none when no arg fits.
+        headline: Option<String>,
+        /// Raw args JSON text, kept for later slices; empty when none sent.
+        args_json: String,
+        /// How far the call got.
+        status: ItemStatus,
+        /// Renderable result text after envelope unwrap; none until sent.
+        output: Option<String>,
+        /// Machine-readable failure detail; present on failed calls.
+        failure: Option<String>,
+    },
+    /// Host bookkeeping with no user-facing content.
+    ///
+    /// Known kinds (for example `reminderChild`) the shell deliberately
+    /// does not render.
+    System {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Wire kind, kept so new system kinds stay classifiable.
+        kind: String,
+    },
+    /// Any other kind; the shell renders a generic note, never a drop.
+    Unknown {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Wire kind, kept so the note can name it.
+        kind: String,
+    },
+}
+
+impl StreamItem {
+    /// Borrow the host item handle, whatever the variant.
+    pub fn item_id(&self) -> &str {
+        match self {
+            Self::UserMessage { item_id, .. }
+            | Self::AgentMessage { item_id, .. }
+            | Self::Reasoning { item_id, .. }
+            | Self::ToolCall { item_id, .. }
+            | Self::System { item_id, .. }
+            | Self::Unknown { item_id, .. } => item_id,
+        }
+    }
 }
 
 /// The named connection situations the shell renders.
@@ -72,8 +175,10 @@ pub enum StreamEvent {
         session: SessionId,
         /// Turn that started, when known.
         turn: Option<TurnId>,
+        /// Cursor into the transcript view, when known.
+        view_cursor: Option<String>,
     },
-    /// A transcript item started; the full item object as raw JSON text.
+    /// A transcript item started, typed from the wire object.
     ItemStarted {
         /// Session the item belongs to.
         session: SessionId,
@@ -81,8 +186,8 @@ pub enum StreamEvent {
         turn: Option<TurnId>,
         /// Cursor into the transcript view, when known.
         view_cursor: Option<String>,
-        /// Full item object as raw JSON text, passed through uninterpreted in M2.
-        item_json: String,
+        /// The typed item.
+        item: StreamItem,
     },
     /// A delta appended to one field of a transcript item.
     ItemDelta {
@@ -107,8 +212,8 @@ pub enum StreamEvent {
         turn: Option<TurnId>,
         /// Cursor into the transcript view, when known.
         view_cursor: Option<String>,
-        /// Full item object as raw JSON text.
-        item_json: String,
+        /// The typed item.
+        item: StreamItem,
     },
     /// A turn completed.
     TurnCompleted {
@@ -172,6 +277,25 @@ pub enum EngineEvent {
     ///
     /// Carries the boundary-composed message.
     SessionsLoadFailed(String),
+    /// A session spawn succeeded; the first turn streams next, when sent.
+    SessionSpawned {
+        /// Spawned session.
+        session: SessionId,
+        /// First turn, when the server returned one.
+        turn: Option<TurnId>,
+    },
+    /// A follow-up turn was accepted; its events stream next.
+    TurnAccepted {
+        /// Session the turn belongs to.
+        session: SessionId,
+        /// Accepted turn, when the server returned one.
+        turn: Option<TurnId>,
+    },
+    /// A spawn or send-turn command failed while the connection stays up.
+    ///
+    /// Carries the boundary-composed or server-authored friendly message,
+    /// mirroring [`EngineEvent::SessionsLoadFailed`].
+    CommandFailed(String),
     /// One stream event arrived.
     Stream(StreamEvent),
     /// Partial-success diagnostic: something was skipped or degraded.
@@ -190,6 +314,21 @@ pub enum EngineEvent {
 pub trait SessionEngine: Send + Sync {
     /// Request a session-list refresh; results arrive as [`EngineEvent`] values.
     fn list_sessions(&self);
+    /// Spawn a session on `workspace` with `prompt` as its first turn.
+    ///
+    /// Non-blocking; success arrives as
+    /// [`EngineEvent::SessionSpawned`], failure as
+    /// [`EngineEvent::CommandFailed`]. Commands submitted while
+    /// disconnected fail fast with [`EngineEvent::CommandFailed`]
+    /// rather than queueing.
+    fn spawn_session(&self, workspace: String, prompt: String);
+    /// Send a follow-up turn to `session`.
+    ///
+    /// Non-blocking; success arrives as [`EngineEvent::TurnAccepted`],
+    /// failure as [`EngineEvent::CommandFailed`]. Commands submitted
+    /// while disconnected fail fast with [`EngineEvent::CommandFailed`]
+    /// rather than queueing.
+    fn send_turn(&self, session: SessionId, prompt: String);
 }
 
 #[cfg(test)]
@@ -205,5 +344,68 @@ mod tests {
     fn turn_id_equality_is_by_whole_handle() {
         assert_eq!(TurnId::new("turn-1"), TurnId::new("turn-1"));
         assert_ne!(TurnId::new("turn-1"), TurnId::new("turn-2"));
+    }
+
+    #[test]
+    fn id_handles_borrow_back() {
+        assert_eq!(TurnId::new("turn-1").as_str(), "turn-1");
+        assert_eq!(SessionId::new("session-1").as_str(), "session-1");
+    }
+
+    #[test]
+    fn stream_item_id_covers_every_variant() {
+        let items = vec![
+            (
+                StreamItem::UserMessage {
+                    item_id: String::from("u"),
+                    text: String::new(),
+                },
+                "u",
+            ),
+            (
+                StreamItem::AgentMessage {
+                    item_id: String::from("a"),
+                    text: String::new(),
+                    phase: None,
+                },
+                "a",
+            ),
+            (
+                StreamItem::Reasoning {
+                    item_id: String::from("r"),
+                    summary: Vec::new(),
+                },
+                "r",
+            ),
+            (
+                StreamItem::ToolCall {
+                    item_id: String::from("t"),
+                    tool: String::new(),
+                    headline: None,
+                    args_json: String::new(),
+                    status: ItemStatus::InProgress,
+                    output: None,
+                    failure: None,
+                },
+                "t",
+            ),
+            (
+                StreamItem::System {
+                    item_id: String::from("s"),
+                    kind: String::from("reminderChild"),
+                },
+                "s",
+            ),
+            (
+                StreamItem::Unknown {
+                    item_id: String::from("x"),
+                    kind: String::from("from-the-future"),
+                },
+                "x",
+            ),
+        ];
+        for (item, want) in items {
+            assert_eq!(item.item_id(), want);
+        }
     }
 }

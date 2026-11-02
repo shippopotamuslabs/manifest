@@ -3,10 +3,10 @@
 //! This crate spawns the `muse-code-mcp` server as a child process and
 //! speaks JSON-RPC 2.0 with it over newline-delimited JSON on its stdio:
 //! `initialize` declaring the `muse.stream` experimental capability,
-//! `tools/call` for `muse_status`, and `notifications/muse/event`
-//! mapped into domain [`StreamEvent`](manifest_domain::StreamEvent)
-//! values. The client is blocking and thread-based; there is no async
-//! runtime in this crate.
+//! `tools/call` for `muse_status`, `muse_spawn`, and `muse_turn`, and
+//! `notifications/muse/event` mapped into domain
+//! [`StreamEvent`](manifest_domain::StreamEvent) values. The client is
+//! blocking and thread-based; there is no async runtime in this crate.
 //!
 //! Wire types stay private to this crate. The public surface is
 //! [`ServerConfig`], [`MuseEngine`], and [`connect`].
@@ -18,7 +18,7 @@ mod worker;
 
 use std::sync::mpsc::Sender;
 
-use manifest_domain::{EngineEvent, SessionEngine};
+use manifest_domain::{EngineEvent, SessionEngine, SessionId};
 
 use worker::{Command, WorkerMsg};
 
@@ -121,6 +121,23 @@ impl SessionEngine for MuseEngine {
         let _ = self
             .worker_tx
             .send(WorkerMsg::Command(Command::ListSessions));
+    }
+
+    fn spawn_session(&self, workspace: String, prompt: String) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::SpawnSession {
+                workspace,
+                prompt,
+            }));
+    }
+
+    fn send_turn(&self, session: SessionId, prompt: String) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::SendTurn { session, prompt }));
     }
 }
 

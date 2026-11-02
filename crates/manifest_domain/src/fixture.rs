@@ -12,6 +12,13 @@ impl SessionId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    /// Borrow the stored handle for wire calls.
+    ///
+    /// Callers still compare and match by the whole handle.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The situation a session is in. One variant per real situation;

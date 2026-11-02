@@ -25,6 +25,358 @@ fn write_raw(stdout: &mut std::io::StdoutLock<'_>, line: &str) {
     stdout.flush().expect("fake flushes stdout");
 }
 
+fn tool_result(
+    stdout: &mut std::io::StdoutLock<'_>,
+    call_id: &serde_json::Value,
+    text: &str,
+    is_error: bool,
+) {
+    write_line(
+        stdout,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "isError": is_error,
+            },
+        }),
+    );
+}
+
+fn notify(stdout: &mut std::io::StdoutLock<'_>, params: serde_json::Value) {
+    write_line(
+        stdout,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/muse/event",
+            "params": params,
+        }),
+    );
+}
+
+fn cursor(session: &str, seq: u64) -> String {
+    format!("v4:{session}:{seq}")
+}
+
+/// Full spawn stream for `fake-session-1` / `fake-turn-1`.
+///
+/// The user message echoes the spawn prompt; the reasoning summary is
+/// one sentence; the bash call streams its output before completing
+/// with a JSON envelope whose `output` equals the delta text; the final
+/// answer is markdown with a fenced code block.
+fn emit_spawn_stream(stdout: &mut std::io::StdoutLock<'_>, prompt: &str) {
+    let session = "fake-session-1";
+    let turn = "fake-turn-1";
+    let summary = "Planning the turn, listing the workspace, and quoting the note.";
+    let command = "ls -la /tmp/ws";
+    let description = "List workspace directory contents";
+    let args = serde_json::json!({"command": command, "description": description}).to_string();
+    let ls_output = "total 0";
+    let envelope = serde_json::json!({
+        "chunk_id": "exec-1-1",
+        "command": command,
+        "description": description,
+        "exit_code": 0,
+        "terminal_status": "completed",
+        "output": ls_output,
+        "original_output_bytes": 7,
+        "original_output_tokens": 2,
+        "truncated": false,
+    })
+    .to_string();
+    let answer = "Done. The workspace holds:\n\n```\ntotal 0\n```\n\n- listed\n- read\n- quoted\n";
+    let (first, second) = answer.split_at(28);
+    let mut n = 0_u64;
+    let mut at = || {
+        n += 1;
+        cursor(session, n)
+    };
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "turn-started",
+            "sessionId": session,
+            "turnId": turn,
+            "viewCursor": at(),
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-user-1",
+                "kind": "userMessage",
+                "recordedAt": "2026-11-02T21:00:00Z",
+                "revision": 1,
+                "status": "completed",
+                "text": prompt,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-started",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-reasoning-1",
+                "kind": "reasoning",
+                "revision": 1,
+                "status": "inProgress",
+                "summary": [""],
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-delta",
+            "sessionId": session,
+            "viewCursor": at(),
+            "itemId": "fake-item-reasoning-1",
+            "field": "summary.0",
+            "delta": summary,
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-reasoning-1",
+                "kind": "reasoning",
+                "recordedAt": "2026-11-02T21:00:01Z",
+                "revision": 2,
+                "status": "completed",
+                "summary": [summary],
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-started",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-bash-1",
+                "kind": "toolCall",
+                "callId": "call_fakebash1",
+                "recordedAt": "2026-11-02T21:00:02Z",
+                "revision": 1,
+                "status": "inProgress",
+                "tool": "bash",
+                "args": args,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-delta",
+            "sessionId": session,
+            "viewCursor": at(),
+            "itemId": "fake-item-bash-1",
+            "field": "output",
+            "delta": ls_output,
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-bash-1",
+                "kind": "toolCall",
+                "callId": "call_fakebash1",
+                "recordedAt": "2026-11-02T21:00:03Z",
+                "revision": 3,
+                "status": "completed",
+                "tool": "bash",
+                "args": args,
+                "visibleOutput": envelope,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-started",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-agent-1",
+                "kind": "agentMessage",
+                "revision": 1,
+                "status": "inProgress",
+                "text": "",
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-delta",
+            "sessionId": session,
+            "viewCursor": at(),
+            "itemId": "fake-item-agent-1",
+            "field": "text",
+            "delta": first,
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-delta",
+            "sessionId": session,
+            "viewCursor": at(),
+            "itemId": "fake-item-agent-1",
+            "field": "text",
+            "delta": second,
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-agent-1",
+                "kind": "agentMessage",
+                "messagePhase": "finalAnswer",
+                "recordedAt": "2026-11-02T21:00:04Z",
+                "revision": 2,
+                "status": "completed",
+                "text": answer,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "turn-completed",
+            "sessionId": session,
+            "turnId": turn,
+            "viewCursor": at(),
+            "terminal": "completed",
+            "answer": answer,
+            "droppedDeltas": 0,
+        }),
+    );
+}
+
+/// Short follow-up stream for `muse_turn`: prompt echo, one streaming
+/// agent message, and the turn close-out.
+fn emit_turn_stream(stdout: &mut std::io::StdoutLock<'_>, session: &str, prompt: &str) {
+    let turn = "fake-turn-2";
+    let answer = "Second turn done.";
+    let mut n = 0_u64;
+    let mut at = || {
+        n += 1;
+        cursor(session, n)
+    };
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "turn-started",
+            "sessionId": session,
+            "turnId": turn,
+            "viewCursor": at(),
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-user-2",
+                "kind": "userMessage",
+                "recordedAt": "2026-11-02T21:01:00Z",
+                "revision": 1,
+                "status": "completed",
+                "text": prompt,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-started",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-agent-2",
+                "kind": "agentMessage",
+                "revision": 1,
+                "status": "inProgress",
+                "text": "",
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-delta",
+            "sessionId": session,
+            "viewCursor": at(),
+            "itemId": "fake-item-agent-2",
+            "field": "text",
+            "delta": answer,
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "item-completed",
+            "sessionId": session,
+            "viewCursor": at(),
+            "item": {
+                "itemId": "fake-item-agent-2",
+                "kind": "agentMessage",
+                "messagePhase": "finalAnswer",
+                "recordedAt": "2026-11-02T21:01:01Z",
+                "revision": 2,
+                "status": "completed",
+                "text": answer,
+                "turnId": turn,
+            },
+        }),
+    );
+    notify(
+        stdout,
+        serde_json::json!({
+            "type": "turn-completed",
+            "sessionId": session,
+            "turnId": turn,
+            "viewCursor": at(),
+            "terminal": "completed",
+            "answer": answer,
+            "droppedDeltas": 0,
+        }),
+    );
+}
+
 fn main() {
     let mode = std::env::var("FAKE_MCP_MODE").unwrap_or_else(|_| String::from("ok"));
     if mode == "exit-early" {
@@ -143,6 +495,71 @@ fn main() {
                     .get("id")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                let tool = message
+                    .get("params")
+                    .and_then(|params| params.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let arguments = message
+                    .get("params")
+                    .and_then(|params| params.get("arguments"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                if tool == "muse_spawn" {
+                    let workspace = arguments
+                        .get("workspace")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if workspace.contains("does-not-exist") {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            &format!("workspace does not exist: {workspace}"),
+                            true,
+                        );
+                        continue;
+                    }
+                    let prompt = arguments
+                        .get("prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({
+                            "session_id": "fake-session-1",
+                            "turn_id": "fake-turn-1",
+                            "status": "running",
+                        })
+                        .to_string(),
+                        false,
+                    );
+                    emit_spawn_stream(&mut out, prompt);
+                    continue;
+                }
+                if tool == "muse_turn" {
+                    let session = arguments
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("fake-session-1");
+                    let prompt = arguments
+                        .get("prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({
+                            "session_id": session,
+                            "turn_id": "fake-turn-2",
+                            "status": "running",
+                        })
+                        .to_string(),
+                        false,
+                    );
+                    emit_turn_stream(&mut out, session, prompt);
+                    continue;
+                }
                 status_calls += 1;
                 if status_calls == 1 {
                     let rows = serde_json::to_string(&serde_json::json!([
