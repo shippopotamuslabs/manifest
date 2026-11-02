@@ -247,7 +247,8 @@ pub fn connection_cluster<'a, M: Clone + 'a>(
             .color(crate::theme::TEXT_TERTIARY),
     ];
     if matches!(connection, Connection::Failed(_)) {
-        cluster = cluster.push(crate::kit::pill_button(
+        cluster = cluster.push(crate::kit::icon_pill_button(
+            lucide_icons::Icon::RotateCw,
             "Retry",
             crate::kit::ButtonKind::Ghost,
             Some(on_reconnect),

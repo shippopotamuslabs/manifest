@@ -15,8 +15,9 @@ use manifest_domain::{
 
 use crate::kit::{self, IconButtonKind};
 use crate::theme::{
-    COMPOSER_MAX_LINES, EFFORT_POPUP_WIDTH, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT,
-    MODEL_POPUP_WIDTH, PERMISSION_POPUP_WIDTH, SPACE_S, SPACE_XS,
+    ATTACH_POPUP_WIDTH, COMPOSER_MAX_LINES, CONTEXT_POPUP_WIDTH, EFFORT_POPUP_WIDTH,
+    FONT_SIZE_PANEL, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH,
+    PERMISSION_POPUP_WIDTH, SPACE_S, SPACE_XS, TEXT_FAINT, TEXT_TERTIARY,
 };
 
 /// The attach popup has two real situations, so it is an enum, not a
@@ -93,6 +94,8 @@ pub enum Message {
     /// The OS file picker returned; `Some` inserts a path ref into
     /// the draft, `None` (dismissed) is a no-op.
     AttachPicked(Option<String>),
+    /// A press landed outside the floating attach menu; closes it.
+    AttachDismissed,
     /// The send button was pressed; the App sends, spawns, or steers.
     SendPressed,
     /// The stop button was pressed; the App cancels the running turn.
@@ -116,6 +119,8 @@ pub enum Message {
     ModelDismissed,
     /// The context meter was pressed; toggles the popover.
     ContextPressed,
+    /// A press landed outside the floating context popup; closes it.
+    ContextDismissed,
 }
 
 /// Composer state: the draft content plus the live picker state and
@@ -314,6 +319,9 @@ impl State {
                     AttachPopup::Open => AttachPopup::Closed,
                 };
             }
+            Message::AttachDismissed => {
+                self.attach_popup = AttachPopup::Closed;
+            }
             Message::PermissionPressed => {
                 self.permission_menu = match self.permission_menu {
                     PermissionMenu::Closed => {
@@ -376,6 +384,9 @@ impl State {
                     ContextPopover::Open => ContextPopover::Closed,
                 };
             }
+            Message::ContextDismissed => {
+                self.context_popover = ContextPopover::Closed;
+            }
             Message::SendPressed
             | Message::StopPressed
             | Message::AttachFilesPressed
@@ -423,13 +434,18 @@ impl State {
     }
 
     /// Renders the input bar with the inside-bar buttons, the
-    /// attachment refs, and the live sub-bar. The model and permission
-    /// menus are not part of this flow; they float via
-    /// [`State::model_menu_overlay`] and
-    /// [`State::permission_menu_overlay`].
+    /// attachment refs, and the live sub-bar. The attach, model,
+    /// permission, and context popups are not part of this flow; they
+    /// float via [`State::attach_menu_overlay`],
+    /// [`State::model_menu_overlay`], [`State::permission_menu_overlay`],
+    /// and [`State::context_popover_overlay`].
     pub fn view(&self) -> Element<'_, Message> {
         let mut row = iced::widget::row![
-            kit::icon_button("+", IconButtonKind::Subtle, Some(Message::AttachPressed)),
+            kit::composer_icon_slot(kit::icon_button(
+                lucide_icons::Icon::Plus,
+                IconButtonKind::Subtle,
+                Some(Message::AttachPressed),
+            )),
             iced::widget::container(kit::composer_input(
                 &self.content,
                 self.visible_lines,
@@ -441,35 +457,29 @@ impl State {
         .align_y(iced::alignment::Vertical::Bottom);
         if self.running_visible {
             if self.has_text {
-                row = row.push(kit::icon_button(
-                    "⤴",
+                row = row.push(kit::composer_icon_slot(kit::icon_button(
+                    lucide_icons::Icon::ArrowUp,
                     IconButtonKind::Accent,
                     self.send_enabled.then_some(Message::SendPressed),
-                ));
+                )));
             }
-            row = row.push(kit::icon_button(
-                "■",
+            row = row.push(kit::composer_icon_slot(kit::icon_button(
+                lucide_icons::Icon::Square,
                 IconButtonKind::Subtle,
                 Some(Message::StopPressed),
-            ));
+            )));
         } else if self.has_text {
-            row = row.push(kit::icon_button(
-                "↑",
+            row = row.push(kit::composer_icon_slot(kit::icon_button(
+                lucide_icons::Icon::ArrowUp,
                 IconButtonKind::Accent,
                 self.send_enabled.then_some(Message::SendPressed),
-            ));
+            )));
         }
         let mut column = iced::widget::column![kit::input_bar(row)].spacing(SPACE_XS);
-        if self.attach_popup == AttachPopup::Open {
-            column = column.push(self.attach_popup_view());
-        }
         if !self.attachments.is_empty() {
             column = column.push(self.attachments_view());
         }
         column = column.push(self.sub_bar_view());
-        if self.context_popover == ContextPopover::Open {
-            column = column.push(self.context_popover_view());
-        }
         column.width(Length::Fill).into()
     }
 
@@ -501,24 +511,68 @@ impl State {
         }
     }
 
-    /// The attach popup: a Files row that opens the OS picker, and a
+    /// The floating attach menu for the App to overlay above the
+    /// composer, or `None` when the menu is closed. The menu never
+    /// sits in the composer's layout flow, so opening it cannot
+    /// change the composer's height or push the transcript around;
+    /// the App anchors this card at the bottom-left of the window,
+    /// just above the input bar.
+    pub(crate) fn attach_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        if matches!(self.attach_popup, AttachPopup::Closed) {
+            None
+        } else {
+            Some(self.attach_menu_view())
+        }
+    }
+
+    /// The floating context popup for the App to overlay above the
+    /// composer, or `None` when the popover is closed. The popup never
+    /// sits in the composer's layout flow, so opening it cannot
+    /// change the composer's height or push the transcript around;
+    /// the App anchors this card at the bottom-right of the window,
+    /// just above the sub-bar.
+    pub(crate) fn context_popover_overlay(&self) -> Option<Element<'_, Message>> {
+        if matches!(self.context_popover, ContextPopover::Closed) {
+            None
+        } else {
+            Some(self.context_popover_view())
+        }
+    }
+
+    /// The attach menu: a Files row that opens the OS picker, and a
     /// disabled Photos row with a plain note. Photos stay disabled
     /// because the bundled engine reports no image probe; the note
     /// says so rather than inventing one.
-    fn attach_popup_view(&self) -> Element<'_, Message> {
-        let files = kit::action_row("Files", Message::AttachFilesPressed);
-        let photos = iced::widget::column![
-            kit::static_pill("Photos"),
-            iced::widget::text("Photos aren't available with this engine yet.")
-                .size(crate::theme::FONT_SIZE_SMALL)
-                .color(crate::theme::TEXT_TERTIARY),
-        ]
-        .spacing(SPACE_XS)
+    fn attach_menu_view(&self) -> Element<'_, Message> {
+        let files = kit::action_row(
+            "Files",
+            Some(lucide_icons::Icon::Paperclip),
+            Message::AttachFilesPressed,
+        );
+        let photos = iced::widget::container(
+            iced::widget::column![
+                iced::widget::row![
+                    kit::icon(lucide_icons::Icon::Image, FONT_SIZE_PANEL, TEXT_FAINT),
+                    iced::widget::text("Photos")
+                        .size(FONT_SIZE_PANEL)
+                        .color(TEXT_TERTIARY),
+                ]
+                .spacing(SPACE_XS)
+                .align_y(iced::alignment::Vertical::Center),
+                iced::widget::text("Photos aren't available with this engine yet.")
+                    .size(crate::theme::FONT_SIZE_SMALL)
+                    .color(TEXT_TERTIARY),
+            ]
+            .spacing(SPACE_XS)
+            .width(Length::Fill),
+        )
+        .padding([SPACE_XS, SPACE_S])
         .width(Length::Fill);
-        kit::panel(
+        kit::popup_card(
             iced::widget::column![files, photos]
                 .spacing(SPACE_XS)
                 .width(Length::Fill),
+            ATTACH_POPUP_WIDTH,
         )
     }
 
@@ -679,7 +733,7 @@ impl State {
                 .size(crate::theme::FONT_SIZE_SMALL)
                 .color(crate::theme::TEXT_SECONDARY),
         );
-        kit::panel(popover.width(Length::Fill))
+        kit::popup_card(popover.width(Length::Fill), CONTEXT_POPUP_WIDTH)
     }
 }
 
@@ -901,6 +955,43 @@ mod tests {
         assert_eq!(got.attach_popup, AttachPopup::Open);
         got.update(Message::AttachPressed);
         assert_eq!(got.attach_popup, AttachPopup::Closed);
+    }
+
+    #[test]
+    fn attach_dismissed_closes_menu_and_is_harmless_when_closed() {
+        let mut got = State::new();
+        got.update(Message::AttachDismissed);
+        assert_eq!(got.attach_popup, AttachPopup::Closed);
+        got.update(Message::AttachPressed);
+        assert_eq!(got.attach_popup, AttachPopup::Open);
+        got.update(Message::AttachDismissed);
+        assert_eq!(got.attach_popup, AttachPopup::Closed);
+    }
+
+    #[test]
+    fn attach_menu_overlay_follows_popup_state() {
+        let mut got = State::new();
+        assert!(got.attach_menu_overlay().is_none());
+        got.update(Message::AttachPressed);
+        assert!(got.attach_menu_overlay().is_some());
+        got.update(Message::AttachDismissed);
+        assert!(got.attach_menu_overlay().is_none());
+    }
+
+    #[test]
+    fn opening_attach_closes_permission_and_model_menus() {
+        let mut got = State::new();
+        got.update(Message::PermissionPressed);
+        assert_eq!(got.permission_menu, PermissionMenu::Open);
+        got.update(Message::AttachPressed);
+        assert_eq!(got.attach_popup, AttachPopup::Open);
+        assert_eq!(got.permission_menu, PermissionMenu::Closed);
+        got.update(Message::ModelPressed);
+        assert_eq!(got.model_menu, ModelMenu::Open);
+        assert_eq!(got.attach_popup, AttachPopup::Closed);
+        got.update(Message::AttachPressed);
+        assert_eq!(got.attach_popup, AttachPopup::Open);
+        assert_eq!(got.model_menu, ModelMenu::Closed);
     }
 
     #[test]
@@ -1193,6 +1284,27 @@ mod tests {
         assert!((percent - 28.54).abs() < 0.01);
         got.update(Message::ContextPressed);
         assert_eq!(got.context_popover, ContextPopover::Closed);
+    }
+
+    #[test]
+    fn context_dismissed_closes_popover_and_is_harmless_when_closed() {
+        let mut got = State::new();
+        got.update(Message::ContextDismissed);
+        assert_eq!(got.context_popover, ContextPopover::Closed);
+        got.update(Message::ContextPressed);
+        assert_eq!(got.context_popover, ContextPopover::Open);
+        got.update(Message::ContextDismissed);
+        assert_eq!(got.context_popover, ContextPopover::Closed);
+    }
+
+    #[test]
+    fn context_popover_overlay_follows_popover_state() {
+        let mut got = State::new();
+        assert!(got.context_popover_overlay().is_none());
+        got.update(Message::ContextPressed);
+        assert!(got.context_popover_overlay().is_some());
+        got.update(Message::ContextDismissed);
+        assert!(got.context_popover_overlay().is_none());
     }
 
     #[test]

@@ -1577,6 +1577,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
+name = "lucide-icons"
+version = "1.67.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8bf43e74c58a6a8ce01ff3516feb4e509ad6623b00d39700f180babe62c9058"
+dependencies = [
+ "iced",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1603,6 +1612,7 @@ name = "manifest_shell"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "lucide-icons",
  "manifest_domain",
  "manifest_mcp",
  "manifest_store",
