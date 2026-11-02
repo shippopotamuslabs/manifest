@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length};
 use manifest_domain::{
-    AnswerValue, ApprovalDecision, PendingAnswer, PendingRequest, PendingResolution, Question,
-    SessionId,
+    AnswerValue, ApprovalDecision, ApprovalRequest, PendingAnswer, PendingKind, PendingRequest,
+    PendingResolution, Question, QuestionRequest, SessionId,
 };
 
 use crate::kit;
@@ -352,6 +352,12 @@ pub struct LoadedDiff {
 pub struct State {
     /// Cards per session, in fetch order.
     pub cards: HashMap<SessionId, Vec<PendingCardState>>,
+    /// `Requested` stream hints not yet satisfied by a successful
+    /// fetch: `(session, request_id, kind)`. A failed fetch turns
+    /// each hint with no loaded card into a placeholder card; a
+    /// successful fetch (or a settlement) clears the hints it
+    /// resolves, present or absent.
+    pub hinted: Vec<(SessionId, String, PendingKind)>,
 }
 
 impl State {
@@ -410,6 +416,71 @@ impl State {
             .any(PendingCardState::is_awaiting)
     }
 
+    /// Remember a `Requested` hint so a failed fetch can name the
+    /// request it could not load. Deduped by `(session, request_id)`.
+    pub fn record_hint(&mut self, session: SessionId, request_id: String, kind: PendingKind) {
+        if !self
+            .hinted
+            .iter()
+            .any(|(s, id, _)| s == &session && id == &request_id)
+        {
+            self.hinted.push((session, request_id, kind));
+        }
+    }
+
+    /// Snapshot of the unsettled hinted requests, in hint order.
+    pub fn hinted_requests(&self) -> Vec<(SessionId, String, PendingKind)> {
+        self.hinted.clone()
+    }
+
+    /// Materialize a placeholder card for a hinted request whose
+    /// fetch failed: minimal payload of the hinted kind, in
+    /// [`Phase::Failed`] so the card renders the named error with a
+    /// Retry that re-fetches. Returns true when a new card was
+    /// inserted (the caller then pushes its transcript entry). An
+    /// existing card is never replaced; an existing failed card
+    /// only refreshes its failure message.
+    pub fn mark_hint_failed(
+        &mut self,
+        session: &SessionId,
+        request_id: &str,
+        kind: PendingKind,
+        message: String,
+    ) -> bool {
+        if let Some(card) = self
+            .cards
+            .get_mut(session)
+            .and_then(|cards| cards.iter_mut().find(|c| c.request_id() == request_id))
+        {
+            if matches!(card.phase, Phase::Failed(_)) {
+                card.phase = Phase::Failed(message);
+            }
+            return false;
+        }
+        let request = match kind {
+            PendingKind::Approval => PendingRequest::Approval {
+                session: session.clone(),
+                request_id: String::from(request_id),
+                approval: ApprovalRequest {
+                    tool: String::new(),
+                    subject_line: String::new(),
+                    choices: Vec::new(),
+                },
+            },
+            PendingKind::UserInput => PendingRequest::Question {
+                session: session.clone(),
+                request_id: String::from(request_id),
+                question: QuestionRequest {
+                    questions: Vec::new(),
+                },
+            },
+        };
+        let mut card = PendingCardState::new(request);
+        card.phase = Phase::Failed(message);
+        self.cards.entry(session.clone()).or_default().push(card);
+        true
+    }
+
     /// Replace the set wholesale from a fetch (source of truth).
     /// Present cards update their payload and keep interaction;
     /// a failed card that is present again returns to awaiting.
@@ -454,6 +525,10 @@ impl State {
                 }
             }
         }
+        // A successful fetch is the truth for every hint: present
+        // hints are satisfied by their loaded (or revived) card,
+        // absent hints settled elsewhere and need no placeholder.
+        self.hinted.clear();
         diff
     }
 
@@ -465,6 +540,8 @@ impl State {
         request_id: &str,
         resolution: PendingResolution,
     ) -> Option<String> {
+        self.hinted
+            .retain(|(s, id, _)| !(s == session && id == request_id));
         let card = self
             .cards
             .get_mut(session)?
@@ -1312,6 +1389,66 @@ mod tests {
                 request: String::from("r1")
             }),
             Effect::None
+        );
+    }
+
+    #[test]
+    fn hint_failed_materializes_placeholder_and_load_clears_hint() {
+        let mut state = State::default();
+        state.record_hint(
+            SessionId::new("s-1"),
+            String::from("r1"),
+            PendingKind::UserInput,
+        );
+        // Settled-style duplicate hint for the same request dedupes.
+        state.record_hint(
+            SessionId::new("s-1"),
+            String::from("r1"),
+            PendingKind::UserInput,
+        );
+        assert_eq!(state.hinted_requests().len(), 1);
+        assert!(state.mark_hint_failed(
+            &SessionId::new("s-1"),
+            "r1",
+            PendingKind::UserInput,
+            String::from("write EPIPE"),
+        ));
+        let card = state.card("r1").unwrap();
+        assert!(matches!(
+            card.phase,
+            Phase::Failed(ref m) if m == "write EPIPE"
+        ));
+        assert_eq!(card.request.questions(), Some(&[][..]));
+        assert!(card.is_pending());
+        assert!(!state.has_awaiting(&SessionId::new("s-1")));
+        // The Failed card still renders an element (named error + Retry).
+        assert!(
+            state
+                .card_element(Some(&SessionId::new("s-1")), "r1")
+                .is_some()
+        );
+        // A second failure only refreshes the message, no new card.
+        assert!(!state.mark_hint_failed(
+            &SessionId::new("s-1"),
+            "r1",
+            PendingKind::UserInput,
+            String::from("write EPIPE"),
+        ));
+        assert_eq!(state.cards_for(&SessionId::new("s-1")).len(), 1);
+        // A successful fetch with the request absent clears the hint
+        // without inserting a card; the placeholder expires instead.
+        state.record_hint(
+            SessionId::new("s-1"),
+            String::from("r2"),
+            PendingKind::Approval,
+        );
+        let diff = state.apply_loaded(Vec::new());
+        assert!(diff.inserted.is_empty());
+        assert!(state.hinted_requests().is_empty());
+        assert_eq!(
+            state.card("r1").unwrap().phase,
+            Phase::Expired,
+            "absent placeholder expires, never silently drops"
         );
     }
 

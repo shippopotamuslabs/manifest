@@ -1171,9 +1171,21 @@ impl App {
                 }
                 false
             }
-            StreamEvent::Pending { .. } => {
+            StreamEvent::Pending {
+                session,
+                request_id,
+                kind,
+                phase,
+                ..
+            } => {
                 // Hint only: the fetch is the source of truth, for
-                // both Requested and Settled hints.
+                // both Requested and Settled hints. A Requested hint
+                // is remembered so a failed fetch can still name
+                // the request with a placeholder card; Settled
+                // hints never add.
+                if matches!(phase, manifest_domain::PendingPhase::Requested) {
+                    self.pending.record_hint(session, request_id, kind);
+                }
                 if self.connection == Connection::Connected
                     && let Some(engine) = &self.engine
                 {
@@ -1545,8 +1557,30 @@ impl App {
                                     // clears running.
                                 }
                                 manifest_domain::FailedCommand::PendingFetch => {
-                                    // No card owns a global fetch
-                                    // failure; the error shows above.
+                                    // No loaded card owns a global fetch
+                                    // failure (the error shows above), but
+                                    // a hinted request with no card must
+                                    // not hang silently: materialize a
+                                    // Failed placeholder with a Retry.
+                                    for (session, request_id, kind) in
+                                        self.pending.hinted_requests()
+                                    {
+                                        if self.pending.mark_hint_failed(
+                                            &session,
+                                            &request_id,
+                                            kind,
+                                            message.clone(),
+                                        ) {
+                                            let visible = self.is_visible(&session);
+                                            if self
+                                                .target_transcript(&session)
+                                                .push_pending(request_id)
+                                                && visible
+                                            {
+                                                appended = true;
+                                            }
+                                        }
+                                    }
                                 }
                                 manifest_domain::FailedCommand::Decide(session, request_id)
                                 | manifest_domain::FailedCommand::Answer(session, request_id) => {
@@ -2988,6 +3022,146 @@ mod tests {
             request: String::from("r1"),
         }));
         assert_eq!(*fake.fetches.lock().unwrap(), before + 1);
+    }
+
+    #[test]
+    fn hinted_fetch_failure_materializes_placeholder_and_retry_revives() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-1"),
+                    turn: None,
+                    request_id: String::from("r1"),
+                    kind: manifest_domain::PendingKind::Approval,
+                    phase: manifest_domain::PendingPhase::Requested,
+                },
+            )),
+        );
+        assert_eq!(*fake.fetches.lock().unwrap(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        let card = app
+            .pending
+            .card("r1")
+            .expect("failed fetch must materialize a placeholder card");
+        assert!(matches!(
+            card.phase,
+            crate::pending::Phase::Failed(ref m) if m == "write EPIPE"
+        ));
+        assert!(
+            app.transcript.has_pending("r1"),
+            "placeholder has a transcript entry"
+        );
+        assert!(
+            app.composer.send_enabled,
+            "a Failed placeholder must not gate send"
+        );
+        // Retry re-fetches truth.
+        let before = *fake.fetches.lock().unwrap();
+        let _ = app.update(Message::Pending(crate::pending::Message::RetryFetch {
+            request: String::from("r1"),
+        }));
+        assert_eq!(*fake.fetches.lock().unwrap(), before + 1);
+        // The successful fetch revives the placeholder with real payload.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        let card = app.pending.card("r1").unwrap();
+        assert_eq!(card.phase, crate::pending::Phase::Awaiting);
+        match &card.request {
+            manifest_domain::PendingRequest::Approval { approval, .. } => {
+                assert_eq!(approval.tool, "bash");
+                assert_eq!(approval.subject_line, "ls");
+            }
+            other => panic!("expected revived approval payload, got {other:?}"),
+        }
+        assert!(app.transcript.has_pending("r1"));
+        assert!(!app.composer.send_enabled, "revived awaiting card gates");
+        // Hint was cleared by the load: a later global fetch failure
+        // must not fail the now-loaded awaiting card.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert_eq!(
+            app.pending.card("r1").unwrap().phase,
+            crate::pending::Phase::Awaiting
+        );
+    }
+
+    #[test]
+    fn settled_hint_fetch_failure_creates_no_placeholder() {
+        let (mut app, _fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-1"),
+                    turn: None,
+                    request_id: String::from("r1"),
+                    kind: manifest_domain::PendingKind::Approval,
+                    phase: manifest_domain::PendingPhase::Settled,
+                },
+            )),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert!(app.pending.card("r1").is_none());
+        assert!(!app.transcript.has_pending("r1"));
+    }
+
+    #[test]
+    fn hinted_fetch_failure_parks_placeholder_for_background_session() {
+        let (mut app, _fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-2"),
+                    turn: None,
+                    request_id: String::from("r9"),
+                    kind: manifest_domain::PendingKind::UserInput,
+                    phase: manifest_domain::PendingPhase::Requested,
+                },
+            )),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert!(matches!(
+            app.pending.card("r9").unwrap().phase,
+            crate::pending::Phase::Failed(_)
+        ));
+        assert!(!app.transcript.has_pending("r9"), "visible is s-1");
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-2"),
+        )));
+        assert!(
+            app.transcript.has_pending("r9"),
+            "parked placeholder entry shows on switch"
+        );
     }
 
     #[test]
