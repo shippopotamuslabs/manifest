@@ -1,9 +1,10 @@
 //! Composer: the draft input cluster at the foot of the main column.
 //!
-//! The composer cluster is fixture geography only in this slice: the
-//! input grows as the user types, the attach and send buttons sit
+//! The input grows as the user types, the attach and send buttons sit
 //! inside the bar, and the sub-bar shows static fixture labels. There
-//! is no attach flow and no send behavior here.
+//! is no attach flow. Send is wired at the App level: the view gates
+//! the button on [`State::send_enabled`], and `App` intercepts
+//! `SendPressed`; [`State::update`] still treats it as a no-op.
 
 use iced::widget::text_editor;
 use iced::{Element, Length};
@@ -40,21 +41,38 @@ pub struct State {
     pub visible_lines: usize,
     /// Whether the content holds any text; gates the send button.
     pub has_text: bool,
+    /// Whether the send button is live. Owned by the App, which
+    /// rewrites it as connection, selection, and in-flight state
+    /// change; defaults to true so the button works before the App
+    /// runs its first gate refresh.
+    pub send_enabled: bool,
 }
 
 impl State {
-    /// Builds composer state with empty content and one visible line.
+    /// Builds composer state with empty content, one visible line,
+    /// and the send button enabled.
     pub fn new() -> Self {
         State {
             content: text_editor::Content::new(),
             visible_lines: 1,
             has_text: false,
+            send_enabled: true,
         }
+    }
+
+    /// Clears the draft after a send, restoring the [`State::new`]
+    /// shape while preserving the App-owned [`send_enabled`](State::send_enabled)
+    /// gate.
+    pub fn clear(&mut self) {
+        self.content = text_editor::Content::new();
+        self.visible_lines = 1;
+        self.has_text = false;
     }
 
     /// Folds a message into the composer state. Editing actions apply
     /// to the content, then the derived values are recomputed and
-    /// stored; the button presses are deliberate no-ops in this slice.
+    /// stored; the button presses are no-ops here because the App
+    /// intercepts `SendPressed` before it reaches this reducer.
     pub fn update(&mut self, message: Message) {
         match message {
             Message::Edit(action) => {
@@ -83,7 +101,7 @@ impl State {
             row = row.push(kit::icon_button(
                 "↑",
                 IconButtonKind::Accent,
-                Some(Message::SendPressed),
+                self.send_enabled.then_some(Message::SendPressed),
             ));
         }
         let sub = iced::widget::row![
@@ -131,8 +149,22 @@ mod tests {
         assert_eq!(got.visible_lines, want.visible_lines);
         assert_eq!(got.has_text, want.has_text);
         assert!(!got.has_text);
+        assert_eq!(got.send_enabled, want.send_enabled);
+        assert!(got.send_enabled);
         assert_eq!(got.content.text(), want.content.text());
         assert_eq!(got.content.text(), "");
+    }
+
+    #[test]
+    fn clear_resets_draft_but_preserves_send_enabled() {
+        let mut got = State::new();
+        type_text(&mut got, "draft\ntext");
+        got.send_enabled = false;
+        got.clear();
+        assert_eq!(got.content.text(), "");
+        assert!(!got.has_text);
+        assert_eq!(got.visible_lines, 1);
+        assert!(!got.send_enabled);
     }
 
     #[test]

@@ -5,8 +5,10 @@
 //! Child features own their state; this module holds the child states,
 //! routes messages down, and maps child messages up (UI contract §7).
 
+use std::collections::{HashMap, HashSet};
+
 use iced::{Element, Length, Task};
-use manifest_domain::{Connection, Fixture, TodoItem};
+use manifest_domain::{Connection, EngineEvent, Fixture, SessionId, StreamEvent, TodoItem};
 
 use crate::engine;
 use crate::kit;
@@ -109,12 +111,29 @@ impl From<composer::Message> for Message {
 }
 
 /// Root state: the child states plus the drawer.
-#[derive(Debug, Clone)]
+///
+/// `transcript::State` holds incrementally parsed markdown, which is not
+/// `Clone`, so neither is the app: switch sessions by moving states.
+#[derive(Debug)]
 pub struct App {
     /// Left-panel session list; owns the selection.
     pub sessions: sessions::State,
-    /// Selected-session transcript; only scroll state changes in M1.
+    /// Visible-session transcript; inactive sessions rest in
+    /// [`transcripts`](App::transcripts).
     pub transcript: transcript::State,
+    /// Inactive sessions' transcripts, keyed by session.
+    pub transcripts: HashMap<SessionId, transcript::State>,
+    /// Which session [`transcript`](App::transcript) belongs to; `None`
+    /// in fixture mode and while the selection names no listed session.
+    pub visible_session: Option<SessionId>,
+    /// Sessions with a turn in flight.
+    pub running: HashSet<SessionId>,
+    /// A spawned session awaiting its first list load to select it.
+    pub select_on_load: Option<SessionId>,
+    /// A spawn command is in flight and the visible transcript holds
+    /// its optimistic prompt; cleared on `SessionSpawned` (which
+    /// adopts the transcript) or `CommandFailed`.
+    pub awaiting_spawn: bool,
     /// Draft input cluster.
     pub composer: composer::State,
     /// Checklist shown in the drawer, from the fixture.
@@ -160,9 +179,14 @@ impl App {
             .iter()
             .find(|todo| !todo.done)
             .map(|todo| todo.label.clone());
-        App {
+        let mut app = App {
             sessions: sessions::State::from_projects(fixture.projects, fixture.sessions),
             transcript: transcript::State::from_items(fixture.transcript),
+            transcripts: HashMap::new(),
+            visible_session: None,
+            running: HashSet::new(),
+            select_on_load: None,
+            awaiting_spawn: false,
             composer: composer::State::new(),
             todos: fixture.todos,
             todo_drawer: TodoDrawer::Peek,
@@ -175,18 +199,25 @@ impl App {
             connection_attempt: 0,
             engine: None,
             engine_config: None,
-        }
+        };
+        app.refresh_send_gate();
+        app
     }
 
-    /// Production boot: connects to the real server. Starts from the
-    /// fixture (transcript and todos stay fixture until later slices own
-    /// them) with an empty session list, then connects on the first
-    /// subscription tick; sessions arrive through the engine stream.
+    /// Production boot: connects to the real server. Starts empty (no
+    /// sessions, no transcript entries, no todos) with the connection
+    /// at `Connecting`, then connects on the first subscription tick;
+    /// sessions arrive through the engine stream.
     pub fn live(config: manifest_mcp::ServerConfig) -> Self {
         let mut app = Self::from_fixture(manifest_domain::fixture());
         app.sessions = sessions::State::from_projects(Vec::new(), Vec::new());
+        app.transcript = transcript::State::default();
+        app.todos = Vec::new();
+        app.todo_summary = String::from("0 of 0 done");
+        app.current_todo = None;
         app.connection = Connection::Connecting;
         app.engine_config = Some(config);
+        app.refresh_send_gate();
         app
     }
 
@@ -200,20 +231,231 @@ impl App {
     /// to [`Task::none()`] while it is unknown. Panel-drag moves only
     /// fold while a drag is in flight; anything else is a no-op.
     /// [`App::subscription`] feeds those moves while dragging.
+    /// Keeps the visible transcript on the selected session in live
+    /// mode: parks the current state under its owner and loads the new
+    /// selection's stored state (or a default). A selection naming no
+    /// listed session parks the visible state and shows an empty
+    /// transcript. Fixture mode shows the boot transcript and never syncs.
+    fn sync_visible_transcript(&mut self) {
+        if self.engine_config.is_none() {
+            return;
+        }
+        let selected = self.sessions.selected.clone();
+        if !self.session_is_listed(&selected) {
+            // Park the visible state under its owner when one is showing;
+            // before the first load there is no owner and the boot
+            // transcript stays until a listed selection arrives.
+            if let Some(owner) = self.visible_session.take() {
+                self.transcripts
+                    .insert(owner, std::mem::take(&mut self.transcript));
+                self.transcript = transcript::State::default();
+            }
+            self.visible_session = None;
+            return;
+        }
+        if self.visible_session.as_ref() == Some(&selected) {
+            return;
+        }
+        if let Some(owner) = self.visible_session.replace(selected.clone()) {
+            self.transcripts
+                .insert(owner, std::mem::take(&mut self.transcript));
+        }
+        self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
+    }
+
+    /// Whether the id names a session in the current list.
+    fn session_is_listed(&self, id: &SessionId) -> bool {
+        self.sessions
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .chain(self.sessions.unprojected.iter())
+            .any(|summary| summary.id == *id)
+    }
+
+    /// Whether the session owns the visible transcript.
+    fn is_visible(&self, session: &SessionId) -> bool {
+        self.visible_session.as_ref() == Some(session)
+    }
+
+    /// The stored transcript for a background session, defaulting one.
+    fn stored_transcript(&mut self, session: &SessionId) -> &mut transcript::State {
+        self.transcripts.entry(session.clone()).or_default()
+    }
+
+    /// Recomputes whether the composer send button is live. The
+    /// single writer of [`composer::State::send_enabled`] outside
+    /// [`composer::State::new`]: send needs a server config, a live
+    /// connection with a handle, no spawn in flight, and no turn in
+    /// flight on the listed selection (when one is listed).
+    fn refresh_send_gate(&mut self) {
+        let selected_running = self
+            .sessions
+            .selected_summary()
+            .is_some_and(|summary| self.running.contains(&summary.id));
+        self.composer.send_enabled = self.engine_config.is_some()
+            && self.connection == Connection::Connected
+            && self.engine.is_some()
+            && !self.awaiting_spawn
+            && !selected_running;
+    }
+
+    /// Routes the composer send button press. In order: fixture mode
+    /// is a no-op with the draft untouched; a blank draft sends
+    /// nothing; while not connected the visible transcript gains a
+    /// friendly note and the draft stays; a listed selection sends a
+    /// follow-up turn unless one is already in flight; otherwise the
+    /// draft spawns a session in the process working directory
+    /// (spawning into a chosen project folder is a later slice).
+    /// Sends echo the prompt optimistically, clear the draft, and
+    /// snap the transcript to the end.
+    fn send_from_composer(&mut self) -> Task<Message> {
+        if self.engine_config.is_none() {
+            return Task::none();
+        }
+        let text = self.composer.content.text();
+        if text.trim().is_empty() {
+            return Task::none();
+        }
+        if self.connection != Connection::Connected || self.engine.is_none() {
+            let appended = self.transcript.push_error(not_connected_message());
+            return scroll_transcript_to_end(appended);
+        }
+        if let Some(summary) = self.sessions.selected_summary() {
+            let session = summary.id.clone();
+            if self.running.contains(&session) {
+                return Task::none();
+            }
+            if let Some(engine) = self.engine.clone() {
+                engine.send_turn(session.clone(), text.clone());
+            }
+            self.transcript.push_user(text);
+            self.running.insert(session);
+            self.composer.clear();
+            return transcript::scroll_to_end().map(Message::Transcript);
+        }
+        let workspace = match std::env::current_dir() {
+            Ok(path) => path.display().to_string(),
+            Err(_) => {
+                let appended = self.transcript.push_error(String::from(
+                    "Could not determine the folder to start the session in.",
+                ));
+                return scroll_transcript_to_end(appended);
+            }
+        };
+        if let Some(engine) = self.engine.clone() {
+            engine.spawn_session(workspace, text.clone());
+        }
+        self.awaiting_spawn = true;
+        self.transcript.push_user(text);
+        self.composer.clear();
+        transcript::scroll_to_end().map(Message::Transcript)
+    }
+
+    /// Folds one stream event into the owning session's transcript:
+    /// the visible state when the event names it, else the stored one.
+    /// Returns whether the visible transcript gained an entry, so the
+    /// scroll can snap to the end. Deltas never scroll.
+    fn apply_stream_event(&mut self, event: StreamEvent) -> bool {
+        match event {
+            StreamEvent::TurnStarted { session, .. } => {
+                self.running.insert(session);
+                false
+            }
+            StreamEvent::ItemStarted { session, item, .. } => {
+                if self.is_visible(&session) {
+                    self.transcript.item_started(item);
+                    true
+                } else {
+                    self.stored_transcript(&session).item_started(item);
+                    false
+                }
+            }
+            StreamEvent::ItemDelta {
+                session,
+                item_id,
+                field,
+                delta,
+                ..
+            } => {
+                if self.is_visible(&session) {
+                    self.transcript.item_delta(&item_id, &field, &delta);
+                } else {
+                    self.stored_transcript(&session)
+                        .item_delta(&item_id, &field, &delta);
+                }
+                false
+            }
+            StreamEvent::ItemCompleted { session, item, .. } => {
+                if self.is_visible(&session) {
+                    self.transcript.item_completed(item);
+                    true
+                } else {
+                    self.stored_transcript(&session).item_completed(item);
+                    false
+                }
+            }
+            StreamEvent::TurnCompleted {
+                session,
+                dropped_deltas,
+                ..
+            } => {
+                self.running.remove(&session);
+                let mut appended = false;
+                if dropped_deltas > 0 {
+                    let message = dropped_deltas_message(dropped_deltas);
+                    if self.is_visible(&session) {
+                        appended = self.transcript.push_error(message);
+                    } else {
+                        appended = self.stored_transcript(&session).push_error(message);
+                    }
+                }
+                if self.connection == Connection::Connected
+                    && let Some(engine) = &self.engine
+                {
+                    engine.list_sessions();
+                }
+                appended
+            }
+            // Usage reports stay out of the transcript in this slice.
+            StreamEvent::Usage { .. } => false,
+            StreamEvent::Pending { .. } => {
+                if self.connection == Connection::Connected
+                    && let Some(engine) = &self.engine
+                {
+                    engine.list_sessions();
+                }
+                false
+            }
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Sessions(child) => {
                 self.sessions.update(child);
+                self.sync_visible_transcript();
+                self.refresh_send_gate();
                 Task::none()
+            }
+            Message::Composer(composer::Message::SendPressed) => {
+                let task = self.send_from_composer();
+                self.refresh_send_gate();
+                task
             }
             Message::Composer(child) => {
                 self.composer.update(child);
+                self.refresh_send_gate();
                 Task::none()
             }
-            Message::Transcript(child) => {
-                self.transcript.update(child);
-                Task::none()
-            }
+            Message::Transcript(child) => match child {
+                // Clipboard writes are tasks, which state cannot produce.
+                transcript::Message::Copy(text) => iced::clipboard::write(text),
+                other => {
+                    self.transcript.update(other);
+                    Task::none()
+                }
+            },
             Message::ToggleTodoDrawer => {
                 self.todo_drawer = match self.todo_drawer {
                     TodoDrawer::Peek => TodoDrawer::Open,
@@ -266,13 +508,80 @@ impl App {
                 if attempt != self.connection_attempt || self.engine_config.is_none() {
                     return Task::none();
                 }
-                let appended = engine::apply(
-                    &mut self.connection,
-                    &mut self.engine,
-                    &mut self.sessions,
-                    &mut self.transcript,
-                    input,
-                );
+                let mut appended = false;
+                match input {
+                    engine::Input::Ready(handle) => {
+                        self.engine = Some(handle);
+                    }
+                    // The event rides boxed so the hot message enum stays
+                    // small; unwrap it before matching.
+                    engine::Input::Event(event) => match *event {
+                        EngineEvent::ConnectionChanged(next) => {
+                            if let Connection::Failed(message) = &next {
+                                appended = self.transcript.push_error(message.clone());
+                            }
+                            self.connection = next;
+                            if self.connection == Connection::Connected {
+                                if let Some(engine) = &self.engine {
+                                    engine.list_sessions();
+                                }
+                            } else if matches!(self.connection, Connection::Failed(_)) {
+                                self.engine = None;
+                                self.running.clear();
+                            }
+                        }
+                        EngineEvent::SessionsLoaded { projects, sessions } => {
+                            self.sessions.replace(projects, sessions);
+                            if let Some(spawned) = self.select_on_load.clone()
+                                && self.session_is_listed(&spawned)
+                            {
+                                self.sessions.update(sessions::Message::Select(spawned));
+                                self.select_on_load = None;
+                            }
+                            self.sync_visible_transcript();
+                        }
+                        EngineEvent::SessionsLoadFailed(message) => {
+                            appended = self.transcript.push_error(message);
+                        }
+                        EngineEvent::CommandFailed(message) => {
+                            appended = self.transcript.push_error(message);
+                            if let Some(visible) = self.visible_session.clone() {
+                                self.running.remove(&visible);
+                            }
+                            self.awaiting_spawn = false;
+                        }
+                        EngineEvent::SessionSpawned { session, .. } => {
+                            self.running.insert(session.clone());
+                            self.select_on_load = Some(session.clone());
+                            if self.awaiting_spawn {
+                                // The visible transcript holds this
+                                // spawn's optimistic prompt: adopt it for
+                                // the spawned session so the prompt and
+                                // its stream share one state. The pending
+                                // selection aligns on the next list load;
+                                // skipping the sync here keeps it from
+                                // parking the echo away first.
+                                self.visible_session = Some(session);
+                                self.awaiting_spawn = false;
+                            } else {
+                                self.sync_visible_transcript();
+                            }
+                            if let Some(engine) = &self.engine {
+                                engine.list_sessions();
+                            }
+                        }
+                        EngineEvent::TurnAccepted { session, .. } => {
+                            self.running.insert(session);
+                        }
+                        EngineEvent::Diagnostic(message) => {
+                            appended = self.transcript.push_error(message);
+                        }
+                        EngineEvent::Stream(event) => {
+                            appended = self.apply_stream_event(event);
+                        }
+                    },
+                }
+                self.refresh_send_gate();
                 if appended {
                     transcript::scroll_to_end().map(Message::Transcript)
                 } else {
@@ -287,6 +596,7 @@ impl App {
                     self.connection = Connection::Connecting;
                     self.connection_attempt += 1;
                 }
+                self.refresh_send_gate();
                 Task::none()
             }
         }
@@ -455,6 +765,33 @@ fn resize_corner<'a>(
     .align_x(horizontal)
     .align_y(vertical)
     .into()
+}
+
+/// User-facing note when send is pressed while the engine is not
+/// connected yet. Matches the worker's wording for the same refusal.
+fn not_connected_message() -> String {
+    String::from("The Muse MCP server isn't connected yet. Try again once it connects.")
+}
+
+/// Snaps the transcript to the end when an entry was appended, else
+/// yields no task. Mirrors the engine-event appended pattern.
+fn scroll_transcript_to_end(appended: bool) -> Task<Message> {
+    if appended {
+        transcript::scroll_to_end().map(Message::Transcript)
+    } else {
+        Task::none()
+    }
+}
+
+/// Names a mid-turn delta loss for the transcript: the count that was
+/// dropped, plus the reassurance that the final message is complete.
+/// Precomputed here so the view formats nothing (UI contract §2).
+fn dropped_deltas_message(dropped: u64) -> String {
+    if dropped == 1 {
+        String::from("The stream dropped 1 update; the final message is complete.")
+    } else {
+        format!("The stream dropped {dropped} updates; the final message is complete.")
+    }
 }
 
 /// The title bar: the app title in the fixed panel share, then the
@@ -793,16 +1130,27 @@ mod tests {
     }
 
     /// Test engine: counts `list_sessions` calls like the real worker
-    /// would serve them, without spawning anything. The counter is
-    /// shared, so clones observe the same call count.
+    /// would serve them, and records spawn/send arguments, without
+    /// spawning anything. The counters are shared, so clones observe
+    /// the same calls.
     #[derive(Clone)]
     struct FakeEngine {
         calls: std::sync::Arc<std::sync::Mutex<usize>>,
+        spawns: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        turns: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
     }
 
     impl manifest_domain::SessionEngine for FakeEngine {
         fn list_sessions(&self) {
             *self.calls.lock().unwrap() += 1;
+        }
+
+        fn spawn_session(&self, workspace: String, prompt: String) {
+            self.spawns.lock().unwrap().push((workspace, prompt));
+        }
+
+        fn send_turn(&self, session: manifest_domain::SessionId, prompt: String) {
+            self.turns.lock().unwrap().push((session, prompt));
         }
     }
 
@@ -811,6 +1159,8 @@ mod tests {
     fn live_app() -> (App, FakeEngine) {
         let fake = FakeEngine {
             calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let mut app = App::live(manifest_mcp::ServerConfig::new("fake"));
         let attempt = app.connection_attempt;
@@ -832,7 +1182,7 @@ mod tests {
     fn deliver_connected(app: &mut App) {
         deliver(
             app,
-            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
                 manifest_domain::Connection::Connected,
             )),
         );
@@ -870,7 +1220,7 @@ mod tests {
         deliver_connected(&mut app);
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoaded {
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
                 projects: vec![live_project()],
                 sessions: vec![live_session("s-1"), live_session("s-2")],
             }),
@@ -889,7 +1239,7 @@ mod tests {
         assert!(app.engine.is_some());
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
                 manifest_domain::Connection::Failed(String::from("boom")),
             )),
         );
@@ -898,9 +1248,9 @@ mod tests {
             manifest_domain::Connection::Failed(String::from("boom"))
         );
         assert!(app.engine.is_none());
-        assert!(app.transcript.items.iter().any(|item| matches!(
-            item,
-            manifest_domain::TranscriptItem::ErrorNote { text } if text == "boom"
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            &entry.kind,
+            crate::transcript::EntryKind::Error { text } if text == "boom"
         )));
     }
 
@@ -909,13 +1259,13 @@ mod tests {
         let (mut app, _) = live_app();
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
                 manifest_domain::Connection::Failed(String::from("boom")),
             )),
         );
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoadFailed(
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoadFailed(
                 String::from("load broke"),
             )),
         );
@@ -933,7 +1283,7 @@ mod tests {
         let _ = app.update(Message::Reconnect);
         let _ = app.update(Message::Engine {
             attempt: stale,
-            input: engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+            input: engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
                 manifest_domain::Connection::Connected,
             )),
         });
@@ -948,7 +1298,7 @@ mod tests {
         assert_eq!(*fake.calls.lock().unwrap(), 1);
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::Stream(
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
                 manifest_domain::StreamEvent::Pending {
                     session: manifest_domain::SessionId::new("s-1"),
                     turn: None,
@@ -966,43 +1316,43 @@ mod tests {
         let (mut app, _) = live_app();
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::SessionsLoadFailed(
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoadFailed(
                 String::from("x"),
             )),
         );
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::Diagnostic(String::from("y"))),
+            engine::Input::event(manifest_domain::EngineEvent::Diagnostic(String::from("y"))),
         );
         let tail: Vec<&str> = app
             .transcript
-            .items
+            .entries
             .iter()
             .rev()
             .take(2)
             .rev()
-            .filter_map(|item| match item {
-                manifest_domain::TranscriptItem::ErrorNote { text } => Some(text.as_str()),
+            .filter_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::Error { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
         // Both events append; the tail holds exactly the two texts.
-        assert!(app.transcript.items.len() >= 2);
+        assert!(app.transcript.entries.len() >= 2);
         assert_eq!(tail, vec!["x", "y"]);
     }
 
     #[test]
     fn connected_and_connecting_append_no_error_notes() {
         let (mut app, _) = live_app();
-        let before = app.transcript.items.len();
+        let before = app.transcript.entries.len();
         deliver(
             &mut app,
-            engine::Input::Event(manifest_domain::EngineEvent::ConnectionChanged(
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
                 manifest_domain::Connection::Connecting,
             )),
         );
         deliver_connected(&mut app);
-        assert_eq!(app.transcript.items.len(), before);
+        assert_eq!(app.transcript.entries.len(), before);
     }
 
     #[test]
@@ -1011,6 +1361,233 @@ mod tests {
         assert_eq!(app.connection, manifest_domain::Connection::Disconnected);
         assert!(app.engine_config.is_none());
         assert!(app.engine.is_none());
+    }
+
+    /// Loads a live session list with the given ids.
+    fn loaded(app: &mut App, ids: &[&str]) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                projects: vec![live_project()],
+                sessions: ids.iter().map(|id| live_session(id)).collect(),
+            }),
+        );
+    }
+
+    /// Delivers one stream event to the app.
+    fn stream(app: &mut App, event: manifest_domain::StreamEvent) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(event)),
+        );
+    }
+
+    /// A completed assistant item event for the given session.
+    fn agent_completed(session: &str, item: &str, text: &str) -> manifest_domain::StreamEvent {
+        manifest_domain::StreamEvent::ItemCompleted {
+            session: manifest_domain::SessionId::new(session),
+            turn: None,
+            view_cursor: None,
+            item: manifest_domain::StreamItem::AgentMessage {
+                item_id: String::from(item),
+                text: String::from(text),
+                phase: None,
+            },
+        }
+    }
+
+    /// Entries in a background session's stored transcript.
+    fn stored_len(app: &App, session: &str) -> usize {
+        app.transcripts
+            .get(&manifest_domain::SessionId::new(session))
+            .map(|state| state.entries.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    #[test]
+    fn background_stream_leaves_visible_transcript_untouched() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(app.visible_session, Some(SessionId::new("s-1")));
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: manifest_domain::SessionId::new("s-2"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        assert!(app.running.contains(&SessionId::new("s-2")));
+        stream(&mut app, agent_completed("s-2", "a-1", "background reply"));
+        assert!(app.transcript.entries.is_empty());
+        assert_eq!(stored_len(&app, "s-2"), 1);
+    }
+
+    #[test]
+    fn switching_selection_parks_and_restores_transcripts() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        stream(&mut app, agent_completed("s-1", "a-1", "one"));
+        assert_eq!(app.transcript.entries.len(), 1);
+        let second = SessionId::new("s-2");
+        let _ = app.update(Message::Sessions(sessions::Message::Select(second.clone())));
+        // The s-1 transcript parks; s-2 shows empty.
+        assert_eq!(app.visible_session, Some(second));
+        assert!(app.transcript.entries.is_empty());
+        assert_eq!(stored_len(&app, "s-1"), 1);
+        stream(&mut app, agent_completed("s-2", "a-2", "two"));
+        assert_eq!(app.transcript.entries.len(), 1);
+        // Switching back restores s-1 without loss.
+        let first = SessionId::new("s-1");
+        let _ = app.update(Message::Sessions(sessions::Message::Select(first.clone())));
+        assert_eq!(app.visible_session, Some(first));
+        assert_eq!(app.transcript.entries.len(), 1);
+        assert!(matches!(
+            &app.transcript.entries[0].kind,
+            crate::transcript::EntryKind::Assistant { text, .. } if text == "one"
+        ));
+        assert_eq!(stored_len(&app, "s-2"), 1);
+    }
+
+    #[test]
+    fn turn_completed_with_dropped_deltas_adds_error_and_clears_running() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        let before = *fake.calls.lock().unwrap();
+        let first = SessionId::new("s-1");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: first.clone(),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        assert!(app.running.contains(&first));
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: first.clone(),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 2,
+            },
+        );
+        assert!(!app.running.contains(&first));
+        assert!(matches!(
+            app.transcript.entries.last(),
+            Some(entry) if matches!(
+                &entry.kind,
+                crate::transcript::EntryKind::Error { text }
+                    if text == "The stream dropped 2 updates; the final message is complete."
+            )
+        ));
+        // A completed turn refreshes the session list while connected.
+        assert_eq!(*fake.calls.lock().unwrap(), before + 1);
+        // The singular names one update on a background session.
+        let second = SessionId::new("s-2");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: second.clone(),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 1,
+            },
+        );
+        assert!(matches!(
+            app.transcripts.get(&second).and_then(|state| state.entries.last()),
+            Some(entry) if matches!(
+                &entry.kind,
+                crate::transcript::EntryKind::Error { text }
+                    if text == "The stream dropped 1 update; the final message is complete."
+            )
+        ));
+    }
+
+    #[test]
+    fn spawned_session_selects_on_load() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let before = *fake.calls.lock().unwrap();
+        let spawned = SessionId::new("s-9");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionSpawned {
+                session: spawned.clone(),
+                turn: None,
+            }),
+        );
+        assert!(app.running.contains(&spawned));
+        assert_eq!(app.select_on_load, Some(spawned.clone()));
+        assert_eq!(*fake.calls.lock().unwrap(), before + 1);
+        loaded(&mut app, &["s-1", "s-9"]);
+        assert_eq!(app.sessions.selected, spawned);
+        assert_eq!(app.select_on_load, None);
+        assert_eq!(app.visible_session, Some(spawned));
+    }
+
+    #[test]
+    fn command_failed_clears_visible_running() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let first = SessionId::new("s-1");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: first.clone(),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        assert!(app.running.contains(&first));
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
+                "nope",
+            ))),
+        );
+        assert!(!app.running.contains(&first));
+        assert!(matches!(
+            app.transcript.entries.last(),
+            Some(entry) if matches!(
+                &entry.kind,
+                crate::transcript::EntryKind::Error { text } if text == "nope"
+            )
+        ));
+    }
+
+    #[test]
+    fn failed_connection_clears_running() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let first = SessionId::new("s-1");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: first.clone(),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        assert!(app.running.contains(&first));
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Failed(String::from("down")),
+            )),
+        );
+        assert!(app.running.is_empty());
     }
 
     #[test]
@@ -1028,5 +1605,173 @@ mod tests {
         let _ = got.update(Message::PanelDragMoved(iced::Point::new(200.0, 0.0)));
         assert_eq!(got.panel_width, 320.0);
         assert_eq!(got.panel_drag, PanelDrag::Idle);
+    }
+
+    /// Presses the composer send button through the root reducer, as
+    /// the view's send button would.
+    fn send_pressed(app: &mut App) {
+        let _ = app.update(Message::Composer(composer::Message::SendPressed));
+    }
+
+    /// A completed userMessage event, for the echo-claim path.
+    fn user_completed(session: &str, item: &str, text: &str) -> manifest_domain::StreamEvent {
+        manifest_domain::StreamEvent::ItemCompleted {
+            session: manifest_domain::SessionId::new(session),
+            turn: None,
+            view_cursor: None,
+            item: manifest_domain::StreamItem::UserMessage {
+                item_id: String::from(item),
+                text: String::from(text),
+            },
+        }
+    }
+
+    /// Prompt texts of the user entries in the visible transcript.
+    fn user_entries(app: &App) -> Vec<&str> {
+        app.transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_boot_is_empty_and_connecting() {
+        let app = App::live(manifest_mcp::ServerConfig::new("fake"));
+        assert!(app.transcript.entries.is_empty());
+        assert!(app.todos.is_empty());
+        assert!(app.sessions.groups.is_empty());
+        assert!(app.sessions.unprojected.is_empty());
+        assert_eq!(app.connection, manifest_domain::Connection::Connecting);
+        assert!(!app.composer.send_enabled);
+    }
+
+    #[test]
+    fn send_to_selected_session_sends_turn_and_clears_draft() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.composer.send_enabled);
+        type_composer_text(&mut app, "hello");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.turns.lock().unwrap(),
+            vec![(SessionId::new("s-1"), String::from("hello"))]
+        );
+        assert!(fake.spawns.lock().unwrap().is_empty());
+        assert_eq!(user_entries(&app), vec!["hello"]);
+        assert_eq!(app.composer.content.text(), "");
+        assert!(!app.composer.has_text);
+        assert!(app.running.contains(&SessionId::new("s-1")));
+        assert!(!app.composer.send_enabled);
+    }
+
+    #[test]
+    fn second_send_while_running_records_nothing() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        type_composer_text(&mut app, "first");
+        send_pressed(&mut app);
+        assert_eq!(fake.turns.lock().unwrap().len(), 1);
+        type_composer_text(&mut app, "second");
+        send_pressed(&mut app);
+        assert_eq!(fake.turns.lock().unwrap().len(), 1);
+        assert_eq!(user_entries(&app), vec!["first"]);
+    }
+
+    #[test]
+    fn send_while_disconnected_notes_error_and_keeps_draft() {
+        let (mut app, fake) = live_app();
+        type_composer_text(&mut app, "draft");
+        send_pressed(&mut app);
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert!(fake.spawns.lock().unwrap().is_empty());
+        assert!(matches!(
+            app.transcript.entries.last(),
+            Some(entry) if matches!(
+                &entry.kind,
+                crate::transcript::EntryKind::Error { text }
+                    if text == "The Muse MCP server isn't connected yet. Try again once it connects."
+            )
+        ));
+        assert_eq!(app.composer.content.text(), "draft");
+        assert!(!app.composer.send_enabled);
+    }
+
+    #[test]
+    fn spawn_path_records_workspace_and_adopts_on_spawned() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        assert!(app.sessions.selected_summary().is_none());
+        type_composer_text(&mut app, "start me");
+        send_pressed(&mut app);
+        let workspace = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(workspace, String::from("start me"))]
+        );
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert!(app.awaiting_spawn);
+        assert_eq!(user_entries(&app), vec!["start me"]);
+        assert_eq!(app.composer.content.text(), "");
+        let spawned = SessionId::new("s-9");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionSpawned {
+                session: spawned.clone(),
+                turn: None,
+            }),
+        );
+        assert!(!app.awaiting_spawn);
+        assert_eq!(app.visible_session, Some(spawned.clone()));
+        assert_eq!(user_entries(&app), vec!["start me"]);
+        stream(&mut app, user_completed("s-9", "item-1", "start me"));
+        assert_eq!(user_entries(&app), vec!["start me"]);
+        assert!(app.transcript.entries[0].completed);
+        loaded(&mut app, &["s-1", "s-9"]);
+        assert_eq!(app.sessions.selected, spawned);
+        assert_eq!(app.visible_session, Some(spawned));
+        assert_eq!(user_entries(&app), vec!["start me"]);
+    }
+
+    #[test]
+    fn whitespace_only_draft_sends_nothing() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        type_composer_text(&mut app, "   ");
+        send_pressed(&mut app);
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert!(fake.spawns.lock().unwrap().is_empty());
+        assert!(app.transcript.entries.is_empty());
+        assert_eq!(app.composer.content.text(), "   ");
+    }
+
+    #[test]
+    fn fixture_mode_send_is_noop_keeping_draft() {
+        let mut app = App::boot();
+        let entries = app.transcript.entries.len();
+        type_composer_text(&mut app, "hi");
+        send_pressed(&mut app);
+        assert_eq!(app.transcript.entries.len(), entries);
+        assert_eq!(app.composer.content.text(), "hi");
+        assert!(!app.composer.send_enabled);
+    }
+
+    #[test]
+    fn send_gate_false_in_fixture_true_when_live_connected_idle() {
+        let fixture = App::boot();
+        assert!(!fixture.composer.send_enabled);
+        let (mut app, _) = live_app();
+        assert!(!app.composer.send_enabled);
+        deliver_connected(&mut app);
+        // No listed session yet, but the spawn path is available.
+        assert!(app.composer.send_enabled);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.composer.send_enabled);
     }
 }

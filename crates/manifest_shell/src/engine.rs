@@ -8,10 +8,9 @@
 //! unbounded async channel the subscription stream reads from.
 //!
 //! The root [`App`](crate::app::App) stays thin: it guards on the
-//! connection attempt, then delegates the engine reduction
-//! ([`apply`]), the subscription gating ([`subscription_for`]), and
-//! the connection view helpers ([`connection_label`],
-//! [`connection_cluster`]) here.
+//! connection attempt, then uses the subscription gating
+//! ([`subscription_for`]) and the connection view helpers
+//! ([`connection_label`], [`connection_cluster`]) here.
 
 use std::sync::Arc;
 
@@ -106,67 +105,6 @@ impl Input {
     pub fn event(event: EngineEvent) -> Self {
         Self::Event(Box::new(event))
     }
-}
-
-/// Folds one engine input into the held engine/connection state.
-///
-/// Returns whether an error note was appended (the caller maps that to
-/// a scroll-to-end task). `Ready` stores the handle;
-/// `ConnectionChanged(Failed)` pushes an error note then sets the
-/// connection; `Connected` triggers `list_sessions` on the held handle;
-/// `Failed` clears the handle; `SessionsLoaded` replaces the session
-/// list; `SessionsLoadFailed`/`Diagnostic` push error notes;
-/// `Stream(Pending)` refreshes the list only while connected with a
-/// handle.
-pub fn apply(
-    connection: &mut Connection,
-    engine: &mut Option<EngineHandle>,
-    sessions: &mut crate::sessions::State,
-    transcript: &mut crate::transcript::State,
-    input: Input,
-) -> bool {
-    let mut appended = false;
-    match input {
-        Input::Ready(handle) => {
-            *engine = Some(handle);
-        }
-        Input::Event(EngineEvent::ConnectionChanged(next)) => {
-            if let Connection::Failed(message) = &next {
-                appended = transcript.push_error(message.clone());
-            }
-            *connection = next;
-            if *connection == Connection::Connected {
-                if let Some(engine) = &*engine {
-                    engine.list_sessions();
-                }
-            } else if matches!(*connection, Connection::Failed(_)) {
-                *engine = None;
-            }
-        }
-        Input::Event(EngineEvent::SessionsLoaded {
-            projects,
-            sessions: loaded,
-        }) => {
-            sessions.replace(projects, loaded);
-        }
-        Input::Event(EngineEvent::SessionsLoadFailed(message)) => {
-            appended = transcript.push_error(message);
-        }
-        Input::Event(EngineEvent::Diagnostic(message)) => {
-            appended = transcript.push_error(message);
-        }
-        Input::Event(EngineEvent::Stream(manifest_domain::StreamEvent::Pending { .. })) => {
-            if *connection == Connection::Connected
-                && let Some(engine) = &*engine
-            {
-                engine.list_sessions();
-            }
-        }
-        // M2 owns no transcript: other stream events are
-        // consumed as no-ops until M3 renders them.
-        Input::Event(EngineEvent::Stream(_)) => {}
-    }
-    appended
 }
 
 /// Gates the engine stream: it runs only while connecting or connected
