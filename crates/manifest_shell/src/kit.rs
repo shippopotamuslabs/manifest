@@ -1000,14 +1000,14 @@ pub(crate) type ComposerKeys<'a, Message> =
 /// caller holds the height fixed and the editor scrolls internally,
 /// so later slices inherit the growth contract from this constructor.
 /// The draft's first `/selector` token highlights through
-/// [`crate::composer::SlashHighlighter`] (no-op while
-/// `highlight_selectors` names nothing); `key_binding` intercepts
-/// keys before the editor consumes them, when the caller installs one.
+/// [`crate::composer::SlashHighlighter`] (no-op while the settings
+/// name no valid token); `key_binding` intercepts keys before the
+/// editor consumes them, when the caller installs one.
 pub(crate) fn composer_input<'a, Message: Clone + 'a>(
     content: &'a text_editor::Content,
     visible_lines: usize,
     on_action: impl Fn(text_editor::Action) -> Message + 'a,
-    highlight_selectors: &[String],
+    highlight: &crate::composer::SlashHighlightSettings,
     key_binding: Option<ComposerKeys<'a, Message>>,
 ) -> Element<'a, Message> {
     // Concrete widget generics: pinning the renderer lets the
@@ -1029,7 +1029,7 @@ pub(crate) fn composer_input<'a, Message: Clone + 'a>(
             visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
         ))
         .highlight_with::<crate::composer::SlashHighlighter>(
-            highlight_selectors.to_vec(),
+            highlight.clone(),
             // The highlight `Format` type is not nameable through the
             // `iced` facade (its `core` module is hidden), so the
             // closure below fills it by inference: `Default` plus field

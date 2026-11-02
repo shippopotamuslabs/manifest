@@ -256,8 +256,9 @@ pub struct State {
     pub slash_rows: Vec<SlashRow>,
     /// Selectors the input highlights as a leading `/selector` token:
     /// builtins plus the ready catalog's selectors, refreshed with
-    /// the catalog. The view passes these to the editor as highlight
-    /// settings, so the editor re-highlights only when they change.
+    /// the catalog. The view derives the editor's highlight settings
+    /// from these plus the draft's live token validity, so the editor
+    /// re-highlights when either changes.
     pub highlight_selectors: Vec<String>,
     /// Path refs attached to the draft, in pick order.
     pub attachments: Vec<String>,
@@ -543,13 +544,26 @@ impl State {
     /// Accepts one slash row: the draft becomes `/selector ` with the
     /// caret after it, and the menu closes. Accepting the model
     /// builtin also opens the model menu, matching what sending
-    /// `/model` does.
+    /// `/model` does. The replacement folds through the editor as an
+    /// edit (select all, paste the `/selector ` text): the edit
+    /// notifies the editor's highlighter, so the token styles on the
+    /// next draw with no extra keystroke — even when the draft was
+    /// already a valid token and validity alone would not flip. The
+    /// trailing move lands the caret after the inserted text (and
+    /// clears the select-all range) instead of leaving it at the
+    /// buffer start, which a fresh value would do.
     fn accept_slash_pick(&mut self, pick: &SlashPick) {
         let selector = match pick {
             SlashPick::Builtin(builtin) => builtin.selector(),
             SlashPick::Skill(selector) => selector.as_str(),
         };
-        self.content = text_editor::Content::with_text(&format!("/{selector} "));
+        self.content.perform(text_editor::Action::SelectAll);
+        self.content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(format!("/{selector} ")),
+            )));
+        self.content
+            .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
         self.has_text = true;
         self.visible_lines = self.content.line_count().clamp(1, COMPOSER_MAX_LINES);
         self.close_slash();
@@ -667,6 +681,12 @@ impl State {
             Box::new(move |press: text_editor::KeyPress| slash_key_binding(press, has_rows))
                 as kit::ComposerKeys<'_, Message>
         });
+        // The highlight settings carry the draft's live token
+        // validity, so the editor re-arms exactly when the first token
+        // becomes (or stops being) an exact selector — typed, pasted,
+        // or accepted — with no extra keystroke.
+        let highlight =
+            SlashHighlightSettings::for_draft(&self.highlight_selectors, &self.content.text());
         let mut row = iced::widget::row![
             kit::composer_icon_slot(kit::icon_button(
                 lucide_icons::Icon::Plus,
@@ -677,7 +697,7 @@ impl State {
                 &self.content,
                 self.visible_lines,
                 Message::Edit,
-                &self.highlight_selectors,
+                &highlight,
                 keys,
             ))
             .width(Length::Fill),
@@ -1191,32 +1211,84 @@ fn slash_key_binding(
 }
 
 /// The editor style for a matched slash token: the theme's strong
-/// primary in bold, so the token reads distinct from body text under
-/// any theme the app runs. Plain data (no editor highlight types: the
-/// `iced` facade hides the highlight `Format` path, so `kit` fills it
-/// by inference from this pair).
+/// primary, regular weight, so the token reads distinct from body
+/// text under any theme the app runs. Plain data (no editor highlight
+/// types: the `iced` facade hides the highlight `Format` path, so
+/// `kit` fills it by inference from this pair).
+///
+/// Weight is deliberately regular: a mid-line font change desyncs the
+/// caret x from the shaped text in this Iced line (0.14), rendering
+/// the caret a character-width off in opposite directions as styling
+/// toggles. Color never affects advances, shaping, or caret geometry
+/// on any backend, so color-only styling removes the desync by
+/// construction. See `SlashHighlighter` for the protocol notes.
 pub(crate) fn slash_token_style(theme: &iced::Theme) -> (iced::Color, iced::Font) {
     (
         theme.extended_palette().primary.strong.color,
-        iced::Font {
-            weight: iced::font::Weight::Bold,
-            ..iced::Font::DEFAULT
-        },
+        iced::Font::DEFAULT,
     )
 }
 
 /// The editor highlight value for a matched slash token: a unit
-/// marker, since the token style is fixed in [`slash_format`].
+/// marker, since the token style is fixed in [`slash_token_style`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SlashHighlight;
+
+/// Settings for [`SlashHighlighter`]: the known selectors plus
+/// whether the draft's first line currently opens with an exact
+/// `/selector` token.
+///
+/// The token bit exists so the editor re-arms the highlighter through
+/// its own settings path exactly when validity flips — typed, pasted,
+/// or accepted — instead of relying solely on per-edit `change_line`
+/// notifications. The widget compares settings by value on every
+/// layout (`iced_widget` 0.14.2 `text_editor.rs`): a flip reaches
+/// `Highlighter::update`, which resets to line 0 so the next draw
+/// feeds the first line again. Selector catalog changes re-arm the
+/// same way, as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlashHighlightSettings {
+    /// Known selectors: builtins plus the ready catalog's.
+    selectors: Vec<String>,
+    /// Whether the draft's first line opens with an exact token.
+    token: bool,
+}
+
+impl SlashHighlightSettings {
+    /// Settings for one draft snapshot: the selectors plus the live
+    /// validity of the draft's first line. The view derives this per
+    /// rebuild, so any edit that flips validity changes the settings
+    /// value the widget compares.
+    pub(crate) fn for_draft(selectors: &[String], draft: &str) -> Self {
+        let first = draft.lines().next().unwrap_or("");
+        let token = slash_token_range(first, selectors).is_some();
+        Self {
+            selectors: selectors.to_vec(),
+            token,
+        }
+    }
+
+    /// Whether the draft's first line opens with an exact token.
+    /// Test-only observability for the validity bit the widget
+    /// compares opaquely; production reads it through `PartialEq`.
+    #[cfg(test)]
+    pub(crate) fn token_valid(&self) -> bool {
+        self.token
+    }
+}
 
 /// Highlights the draft's leading `/selector` token.
 ///
 /// The editor feeds lines in order from the last `change_line`
-/// notification, so this tracks its position: only position 0 (the
+/// notification (`iced_graphics` 0.14.0 `text/editor.rs`
+/// `update`/`highlight`: every edit reports its topmost changed line,
+/// and each draw feeds `highlight_line` for lines
+/// `current_line..=last_visible` unless the highlighter is already
+/// past them), so this tracks its position: only position 0 (the
 /// draft's first line) can highlight, and each fed line advances the
-/// position by one. Selector changes arrive through `update`, which
-/// re-arms from line 0 so the next draw re-highlights.
+/// position by one. Selector and token-validity changes arrive
+/// through `update`, which re-arms from line 0 so the next draw
+/// re-highlights.
 pub(crate) struct SlashHighlighter {
     /// Known selectors: builtins plus the ready catalog's.
     selectors: Vec<String>,
@@ -1225,19 +1297,19 @@ pub(crate) struct SlashHighlighter {
 }
 
 impl iced::widget::text::Highlighter for SlashHighlighter {
-    type Settings = Vec<String>;
+    type Settings = SlashHighlightSettings;
     type Highlight = SlashHighlight;
     type Iterator<'a> = std::option::IntoIter<(Range<usize>, SlashHighlight)>;
 
-    fn new(settings: &Vec<String>) -> Self {
+    fn new(settings: &SlashHighlightSettings) -> Self {
         Self {
-            selectors: settings.clone(),
+            selectors: settings.selectors.clone(),
             line: 0,
         }
     }
 
-    fn update(&mut self, new_settings: &Vec<String>) {
-        self.selectors = new_settings.clone();
+    fn update(&mut self, new_settings: &SlashHighlightSettings) {
+        self.selectors = new_settings.selectors.clone();
         self.line = 0;
     }
 
@@ -2115,7 +2187,10 @@ mod tests {
     fn slash_highlighter_marks_first_line_only() {
         use iced::widget::text::Highlighter;
         let selectors = vec![String::from("review")];
-        let mut got = SlashHighlighter::new(&selectors);
+        let mut got = SlashHighlighter::new(&SlashHighlightSettings::for_draft(
+            &selectors,
+            "/review fix",
+        ));
         let first: Vec<_> = got.highlight_line("/review fix").collect();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 0..7);
@@ -2126,8 +2201,12 @@ mod tests {
         got.change_line(0);
         let again: Vec<_> = got.highlight_line("/review").collect();
         assert_eq!(again.len(), 1);
-        // New selectors re-arm from line 0 through update.
-        got.update(&vec![String::from("tests")]);
+        // New settings re-arm from line 0 through update, whether
+        // the selectors changed or only the token validity flipped.
+        got.update(&SlashHighlightSettings::for_draft(
+            &[String::from("tests")],
+            "/review",
+        ));
         assert_eq!(got.current_line(), 0);
         let switched: Vec<_> = got.highlight_line("/review").collect();
         assert!(switched.is_empty());
@@ -2194,7 +2273,10 @@ mod tests {
     }
 
     #[test]
-    fn slash_token_style_reads_bold_primary_from_the_theme() {
+    fn slash_token_style_reads_regular_primary_from_the_theme() {
+        // Color-only by contract: a mid-line weight change desyncs the
+        // caret from the shaped text, while color cannot affect caret
+        // geometry on any backend.
         let (color, font) = slash_token_style(&crate::theme::manifest_theme());
         let expected = crate::theme::manifest_theme()
             .extended_palette()
@@ -2202,6 +2284,150 @@ mod tests {
             .strong
             .color;
         assert_eq!(color, expected);
-        assert_eq!(font.weight, iced::font::Weight::Bold);
+        assert_eq!(font, iced::Font::DEFAULT);
+    }
+
+    #[test]
+    fn slash_fresh_content_starts_caret_at_buffer_start() {
+        // Premise the accept path works around: a fresh value starts
+        // its caret at 0,0, so replacing the draft outright would park
+        // the caret at the start of the inserted command.
+        let fresh = text_editor::Content::<iced::Renderer>::with_text("/review ");
+        assert_eq!(fresh.cursor().position.line, 0);
+        assert_eq!(fresh.cursor().position.column, 0);
+    }
+
+    #[test]
+    fn slash_accept_lands_caret_after_inserted_token() {
+        let mut got = skill_state();
+        type_text(&mut got, "/rev");
+        got.update(Message::SlashAccept);
+        assert_eq!(got.content.text(), "/review ");
+        let cursor = got.content.cursor();
+        assert_eq!(cursor.position.line, 0);
+        assert_eq!(
+            cursor.position.column,
+            "/review ".len(),
+            "caret lands directly after the inserted `/selector `"
+        );
+        assert_eq!(cursor.selection, None, "accept leaves no selection");
+    }
+
+    #[test]
+    fn slash_click_accept_lands_caret_after_inserted_token() {
+        let mut got = skill_state();
+        type_text(&mut got, "/");
+        got.update(Message::SlashSelected(SlashPick::Skill(String::from(
+            "tests",
+        ))));
+        assert_eq!(got.content.text(), "/tests ");
+        let cursor = got.content.cursor();
+        assert_eq!(cursor.position.line, 0);
+        assert_eq!(
+            cursor.position.column,
+            "/tests ".len(),
+            "mouse accept lands the caret like keyboard accept"
+        );
+        assert_eq!(cursor.selection, None, "accept leaves no selection");
+    }
+
+    #[test]
+    fn slash_highlight_settings_flip_with_token_validity() {
+        let mut got = skill_state();
+        let settings_for = |state: &State| {
+            crate::composer::SlashHighlightSettings::for_draft(
+                &state.highlight_selectors,
+                &state.content.text(),
+            )
+        };
+        // A partial token is not valid: no re-arm.
+        type_text(&mut got, "/revie");
+        let partial = settings_for(&got);
+        assert!(!partial.token_valid());
+        // Completing the exact selector flips validity, so the next
+        // layout re-arms the highlighter with no extra keystroke.
+        type_text(&mut got, "w");
+        let exact = settings_for(&got);
+        assert!(exact.token_valid());
+        assert_ne!(
+            partial, exact,
+            "validity flip must change settings or the widget never re-highlights"
+        );
+        // Deleting back to a prefix flips validity off again, so the
+        // span clears on the next draw.
+        got.update(Message::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Backspace,
+        )));
+        let reverted = settings_for(&got);
+        assert!(!reverted.token_valid());
+        assert_ne!(exact, reverted);
+        // Typing the trailing space keeps the token valid: the token
+        // itself still matches, so the style must survive the space.
+        type_text(&mut got, "w ");
+        assert!(settings_for(&got).token_valid());
+    }
+
+    /// Mirror of the vendored editor protocol the widget runs
+    /// (iced_widget 0.14.2 `text_editor.rs` layout/draw with
+    /// iced_graphics 0.14.0 `text/editor.rs` update/highlight): each
+    /// edit notifies `change_line` with the topmost changed line, and
+    /// each draw feeds `highlight_line` for lines
+    /// `current_line..=last_visible` unless the highlighter is already
+    /// past the visible lines.
+    struct ProtocolEditor {
+        highlighter: SlashHighlighter,
+        line: String,
+    }
+
+    impl ProtocolEditor {
+        fn new(settings: &SlashHighlightSettings) -> Self {
+            use iced::widget::text::Highlighter;
+            Self {
+                highlighter: SlashHighlighter::new(settings),
+                line: String::new(),
+            }
+        }
+
+        /// One keystroke: the buffer changes, then layout consumes the
+        /// edit notification exactly once.
+        fn edit(&mut self, line: &str) {
+            use iced::widget::text::Highlighter;
+            self.line = line.to_string();
+            self.highlighter.change_line(0);
+        }
+
+        /// One draw over a single visible line.
+        fn draw(&mut self) -> Vec<(Range<usize>, SlashHighlight)> {
+            use iced::widget::text::Highlighter;
+            if self.highlighter.current_line() > 0 {
+                return Vec::new();
+            }
+            self.highlighter.highlight_line(&self.line).collect()
+        }
+    }
+
+    #[test]
+    fn slash_highlighter_styles_exact_token_under_editor_protocol() {
+        let selectors = vec![String::from("compact")];
+        let mut editor = ProtocolEditor::new(&SlashHighlightSettings::for_draft(&selectors, ""));
+        // Typing a prefix never styles, draw after draw.
+        for prefix in ["/", "/c", "/compa"] {
+            editor.edit(prefix);
+            assert!(editor.draw().is_empty(), "prefix {prefix} must not style");
+        }
+        // Typing the final character styles on that draw: no trailing
+        // space required. The edit notification alone re-arms the
+        // highlighter; the settings flip in the widget covers the same
+        // transition through its own update path.
+        editor.edit("/compact");
+        let styled = editor.draw();
+        assert_eq!(styled.len(), 1, "exact token styles immediately");
+        assert_eq!(styled[0].0, 0..8);
+        // Deleting one character reverts on the next draw.
+        editor.edit("/compac");
+        assert!(
+            editor.draw().is_empty(),
+            "deleting out of the exact token clears the span"
+        );
     }
 }
