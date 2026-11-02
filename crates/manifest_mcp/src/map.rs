@@ -9,8 +9,9 @@
 
 use crate::error::Error;
 use manifest_domain::{
-    EngineEvent, ItemStatus, ModelInfo, PendingKind, PendingPhase, SessionId, SessionStatus,
-    SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
+    ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
+    PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
+    SessionStatus, SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -407,6 +408,223 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
     events
 }
 
+/// Non-empty string field of an object, when present.
+fn field_str<'a>(object: &'a Value, key: &str) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// Map one approval payload into an [`ApprovalRequest`].
+///
+/// Reads the server's `ApprovalSubjectView` fields (`toolName`,
+/// `subject`, `availableChoices`); unknown fields are ignored. The
+/// subject line joins the subject parts the way the server's
+/// `canonicalSubject` does, so the card shows what is gated.
+fn map_approval_payload(payload: &Value) -> Option<ApprovalRequest> {
+    let choices_value = payload.get("availableChoices")?.as_array()?;
+    let mut choices = Vec::new();
+    for choice in choices_value {
+        let decision = field_str(choice, "decision")?;
+        choices.push(ApprovalChoiceSummary {
+            label: choice
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            decision: decision.to_string(),
+            scope: choice
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            accepts_feedback: choice
+                .get("acceptsFeedback")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    let subject = payload.get("subject");
+    let subject_part = |key: &str| {
+        subject
+            .and_then(|subject| field_str(subject, key))
+            .map(String::from)
+    };
+    let tool = field_str(payload, "toolName")
+        .map(String::from)
+        .or_else(|| subject_part("toolName"))
+        .unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    for part in [
+        field_str(payload, "toolName").map(String::from),
+        subject_part("kind"),
+        subject_part("command"),
+        subject_part("host"),
+        subject_part("path"),
+        subject_part("toolName"),
+        field_str(payload, "rawArgs").map(String::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !parts.contains(&part) {
+            parts.push(part);
+        }
+    }
+    let subject_line = if parts.is_empty() {
+        tool.clone()
+    } else {
+        parts.join(" ")
+    };
+    Some(ApprovalRequest {
+        tool,
+        subject_line,
+        choices,
+    })
+}
+
+/// Map one question payload into a [`QuestionRequest`].
+///
+/// Reads the raw `userInput/request` params the broker holds
+/// verbatim: `questions[].{id,question,options[].{label,description},
+/// selection.mode}`. `header` stands in when `question` is absent.
+/// Questions without a usable id or prompt are skipped; `None` when
+/// no question survives.
+fn map_question_payload(payload: &Value) -> Option<QuestionRequest> {
+    let rows = payload.get("questions")?.as_array()?;
+    let mut questions = Vec::new();
+    for row in rows {
+        let Some(id) = field_str(row, "id") else {
+            continue;
+        };
+        let prompt = field_str(row, "question")
+            .or_else(|| field_str(row, "header"))
+            .unwrap_or_default();
+        if prompt.is_empty() {
+            continue;
+        }
+        let options = row
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        let label = field_str(option, "label")?;
+                        Some(QuestionOption {
+                            label: label.to_string(),
+                            description: option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(String::from),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let multi = row
+            .get("selection")
+            .and_then(|selection| selection.get("mode"))
+            .and_then(Value::as_str)
+            == Some("multiple");
+        questions.push(Question {
+            id: id.to_string(),
+            prompt: prompt.to_string(),
+            options,
+            multi,
+        });
+    }
+    if questions.is_empty() {
+        None
+    } else {
+        Some(QuestionRequest { questions })
+    }
+}
+
+/// Map raw `muse_pending` rows into pending requests and diagnostics.
+///
+/// Each row is `{requestId, sessionId, kind, payload, ..}`. Unknown
+/// fields are ignored, and an unknown `kind` is ignored (forward
+/// compatibility, mirroring the stream hint). A malformed row yields
+/// one diagnostic and never drops the rest of the list.
+pub(crate) fn map_pending_rows(rows: &[Value]) -> (Vec<PendingRequest>, Vec<String>) {
+    let mut requests = Vec::new();
+    let mut diagnostics = Vec::new();
+    for row in rows {
+        let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if kind != "approval" && kind != "userInput" {
+            continue;
+        }
+        let request_id = field_str(row, "requestId").map(String::from).or_else(|| {
+            row.get("payload")
+                .and_then(|payload| {
+                    field_str(payload, "approvalId").or_else(|| field_str(payload, "userInputId"))
+                })
+                .map(String::from)
+        });
+        let session_id = field_str(row, "sessionId").map(String::from).or_else(|| {
+            row.get("payload")
+                .and_then(|payload| field_str(payload, "sessionId"))
+                .map(String::from)
+        });
+        let (Some(request_id), Some(session_id)) = (request_id, session_id) else {
+            diagnostics.push(String::from(
+                "A pending request from the server couldn't be read and was skipped.",
+            ));
+            continue;
+        };
+        let session = SessionId::new(session_id);
+        let payload = row.get("payload").cloned().unwrap_or(Value::Null);
+        let mapped = if kind == "approval" {
+            map_approval_payload(&payload).map(|approval| PendingRequest::Approval {
+                session: session.clone(),
+                request_id: request_id.clone(),
+                approval,
+            })
+        } else {
+            map_question_payload(&payload).map(|question| PendingRequest::Question {
+                session: session.clone(),
+                request_id: request_id.clone(),
+                question,
+            })
+        };
+        match mapped {
+            Some(request) => requests.push(request),
+            None => diagnostics.push(String::from(
+                "A pending request from the server couldn't be read and was skipped.",
+            )),
+        }
+    }
+    (requests, diagnostics)
+}
+
+/// Fold one `muse_pending` result value into requests and diagnostics.
+///
+/// The content text parses as the broker's JSON array. A
+/// server-authored `isError` body passes through as the failure text;
+/// anything else that does not parse fails with the friendly generic
+/// message, mirroring [`map_models_result`].
+pub(crate) fn map_pending_result(
+    result: &Value,
+) -> Result<(Vec<PendingRequest>, Vec<String>), String> {
+    let generic = "Couldn't load pending requests from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let rows: Vec<Value> = match serde_json::from_str(&text) {
+        Ok(rows) => rows,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    Ok(map_pending_rows(&rows))
+}
+
 /// Session and turn ids from a `muse_spawn` or `muse_turn` result body.
 #[derive(Debug, Deserialize)]
 struct CommandIds {
@@ -793,6 +1011,170 @@ mod tests {
         let mut missing_kind = base.clone();
         missing_kind["phase"] = json!("requested");
         assert_eq!(map_stream_event(&missing_kind).expect("ok"), None);
+    }
+
+    fn approval_row() -> Value {
+        json!({
+            "requestId": "req-a1",
+            "sessionId": "sess-1",
+            "kind": "approval",
+            "receivedAt": 1700000000000_u64,
+            "ageSec": 3,
+            "futureField": true,
+            "payload": {
+                "approvalId": "req-a1",
+                "sessionId": "sess-1",
+                "toolName": "bash",
+                "rawArgs": "{\"command\":\"ls\"}",
+                "subject": {"kind": "command", "command": "ls -la /tmp/ws", "toolName": "bash"},
+                "availableChoices": [
+                    {"choiceId": "allow_once", "decision": "approved", "scope": "once", "label": "Allow once", "acceptsFeedback": false},
+                    {"choiceId": "abort", "decision": "abort", "scope": "once", "label": "Reject", "acceptsFeedback": true},
+                ],
+                "extra": "ignored",
+            },
+        })
+    }
+
+    fn question_row() -> Value {
+        json!({
+            "requestId": "req-q1",
+            "sessionId": "sess-1",
+            "kind": "userInput",
+            "payload": {
+                "userInputId": "req-q1",
+                "sessionId": "sess-1",
+                "questions": [
+                    {
+                        "id": "color", "header": "Color", "question": "Pick a color",
+                        "selection": {"mode": "single"},
+                        "options": [
+                            {"label": "Red", "description": "Warm"},
+                            {"label": "None"},
+                        ],
+                    },
+                    {
+                        "id": "extras", "header": "Extras", "question": "Pick extras",
+                        "selection": {"mode": "multiple"},
+                        "options": [
+                            {"label": "A", "description": "First"},
+                            {"label": "B"},
+                        ],
+                    },
+                ],
+            },
+        })
+    }
+
+    #[test]
+    fn pending_approval_maps_tool_subject_and_choices() {
+        let (requests, diagnostics) = map_pending_rows(&[approval_row()]);
+        assert!(diagnostics.is_empty(), "saw {diagnostics:?}");
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            PendingRequest::Approval {
+                session,
+                request_id,
+                approval,
+            } => {
+                assert_eq!(session, &SessionId::new("sess-1"));
+                assert_eq!(request_id, "req-a1");
+                assert_eq!(approval.tool, "bash");
+                assert!(
+                    approval.subject_line.contains("ls -la /tmp/ws"),
+                    "subject line names the command, saw {:?}",
+                    approval.subject_line
+                );
+                assert_eq!(approval.choice_labels(), vec!["Allow once", "Reject"]);
+                assert!(!approval.choices[0].accepts_feedback);
+                assert!(approval.choices[1].accepts_feedback);
+            }
+            other => panic!("wrong request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_question_maps_single_multi_and_descriptions() {
+        let (requests, diagnostics) = map_pending_rows(&[question_row()]);
+        assert!(diagnostics.is_empty(), "saw {diagnostics:?}");
+        match &requests[0] {
+            PendingRequest::Question { question, .. } => {
+                assert_eq!(question.questions.len(), 2);
+                let (first, second) = (&question.questions[0], &question.questions[1]);
+                assert!(!first.multi);
+                assert_eq!(first.prompt, "Pick a color");
+                assert_eq!(first.option_labels(), vec!["Red", "None"]);
+                assert_eq!(first.options[0].description.as_deref(), Some("Warm"),);
+                assert_eq!(first.options[1].description, None);
+                assert!(second.multi, "multiple mode maps to multi");
+                assert_eq!(second.options[0].description.as_deref(), Some("First"));
+            }
+            other => panic!("wrong request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_malformed_row_is_diagnostic_and_rest_survives() {
+        let rows = vec![
+            json!({"kind": "approval", "payload": {}}),
+            approval_row(),
+            json!({"requestId": "bad-q", "sessionId": "s", "kind": "userInput", "payload": {"questions": []}}),
+        ];
+        let (requests, diagnostics) = map_pending_rows(&rows);
+        assert_eq!(requests.len(), 1, "good row survives malformed neighbours");
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|text| text.contains("couldn't be read")),
+            "saw {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn pending_unknown_kind_is_ignored() {
+        let rows = vec![
+            json!({"requestId": "x", "sessionId": "s", "kind": "telepathy", "payload": {}}),
+            json!({"requestId": "y", "sessionId": "s", "payload": {}}),
+        ];
+        let (requests, diagnostics) = map_pending_rows(&rows);
+        assert!(requests.is_empty());
+        assert!(
+            diagnostics.is_empty(),
+            "unknown kinds stay silent, saw {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn pending_result_parses_array_and_carries_errors() {
+        let text =
+            serde_json::to_string(&vec![approval_row(), question_row()]).expect("rows are JSON");
+        let result = json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": false,
+        });
+        let (requests, diagnostics) = map_pending_result(&result).expect("ok");
+        assert_eq!(requests.len(), 2);
+        assert!(diagnostics.is_empty());
+
+        let failed = json!({
+            "content": [{"type": "text", "text": "pending blew up"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_pending_result(&failed),
+            Err(String::from("pending blew up"))
+        );
+        let garbled = json!({
+            "content": [{"type": "text", "text": "not json"}],
+            "isError": false,
+        });
+        assert_eq!(
+            map_pending_result(&garbled),
+            Err(String::from(
+                "Couldn't load pending requests from the Muse MCP server."
+            ))
+        );
     }
 
     #[test]

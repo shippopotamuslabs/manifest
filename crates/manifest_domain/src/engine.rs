@@ -166,6 +166,396 @@ pub enum PendingPhase {
     Settled,
 }
 
+/// Host cap on free-text answers, in characters.
+///
+/// Mirrors `buildUserInputAnswers` in the server's `answers.ts`:
+/// free text is sliced to 500 before it reaches the host.
+pub const FREE_TEXT_LIMIT: usize = 500;
+
+/// Truncate free text to the host cap.
+///
+/// Counts characters, not bytes, so multi-byte text is never split.
+pub fn truncate_free_text(text: &str) -> String {
+    text.chars().take(FREE_TEXT_LIMIT).collect()
+}
+
+/// One offered approval choice, summarised for rendering.
+///
+/// The full wire choice stays at the data boundary; the shell only
+/// needs the label and whether a deny may carry feedback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalChoiceSummary {
+    /// Human label for the choice; may be empty on older hosts.
+    pub label: String,
+    /// Wire decision this choice settles, e.g. `approved` or `denied`.
+    pub decision: String,
+    /// Wire scope, e.g. `once`.
+    pub scope: String,
+    /// Whether this choice accepts a free-text reason.
+    pub accepts_feedback: bool,
+}
+
+impl ApprovalChoiceSummary {
+    /// Human name for pickers: the label, or the decision when blank.
+    pub fn display_label(&self) -> &str {
+        if self.label.trim().is_empty() {
+            &self.decision
+        } else {
+            &self.label
+        }
+    }
+}
+
+/// An approval the engine asks the user to settle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// Tool the approval gates; empty when the wire sent none.
+    pub tool: String,
+    /// One-line account of what is being approved.
+    pub subject_line: String,
+    /// Offered choices, summarised.
+    pub choices: Vec<ApprovalChoiceSummary>,
+}
+
+impl ApprovalRequest {
+    /// Labels of the offered choices, in order.
+    pub fn choice_labels(&self) -> Vec<&str> {
+        self.choices
+            .iter()
+            .map(ApprovalChoiceSummary::display_label)
+            .collect()
+    }
+}
+
+/// One answer option for a question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    /// Option label; also the answer key when selected.
+    pub label: String,
+    /// Longer account of the option, when the host sent one.
+    pub description: Option<String>,
+}
+
+impl QuestionOption {
+    /// Whether this option carries a non-empty description.
+    pub fn has_description(&self) -> bool {
+        self.description
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    }
+}
+
+/// One question in a user-input request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// Question handle; answers key on this id.
+    pub id: String,
+    /// Full question text.
+    pub prompt: String,
+    /// Offered options; the synthetic Other choice is shell-added
+    /// and never appears here.
+    pub options: Vec<QuestionOption>,
+    /// Whether several options may be picked.
+    pub multi: bool,
+}
+
+impl Question {
+    /// Labels of the offered options, in order.
+    pub fn option_labels(&self) -> Vec<&str> {
+        self.options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect()
+    }
+
+    /// Whether `label` is one of the offered option labels.
+    pub fn has_option(&self, label: &str) -> bool {
+        self.options.iter().any(|option| option.label == label)
+    }
+
+    /// Classify raw user text the way the server's
+    /// `buildUserInputAnswers` does.
+    ///
+    /// Multiple-choice text is split on commas and only parts that
+    /// exactly match an option label are kept; a single exact label
+    /// match selects that label; anything else is free text capped
+    /// at [`FREE_TEXT_LIMIT`].
+    pub fn classify_text(&self, text: &str) -> AnswerValue {
+        if self.multi {
+            let picked: Vec<String> = text
+                .split(',')
+                .map(str::trim)
+                .filter(|part| self.has_option(part))
+                .map(String::from)
+                .collect();
+            if !picked.is_empty() {
+                return AnswerValue::Labels(picked);
+            }
+        }
+        if self.has_option(text) {
+            return AnswerValue::Label(String::from(text));
+        }
+        AnswerValue::free_text(text)
+    }
+}
+
+/// A user-input request: one or more questions asked together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionRequest {
+    /// Questions in pager order.
+    pub questions: Vec<Question>,
+}
+
+impl QuestionRequest {
+    /// Find a question by id.
+    pub fn question(&self, id: &str) -> Option<&Question> {
+        self.questions.iter().find(|question| question.id == id)
+    }
+}
+
+/// One pending approval or question, fetched as source of truth.
+///
+/// Split by kind so the shell renders an approval card or a
+/// question card without re-classifying a raw payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingRequest {
+    /// An approval awaiting a decision.
+    Approval {
+        /// Session the request belongs to.
+        session: SessionId,
+        /// Opaque request handle for decide calls.
+        request_id: String,
+        /// The approval to render.
+        approval: ApprovalRequest,
+    },
+    /// A question set awaiting answers.
+    Question {
+        /// Session the request belongs to.
+        session: SessionId,
+        /// Opaque request handle for answer calls.
+        request_id: String,
+        /// The questions to render.
+        question: QuestionRequest,
+    },
+}
+
+impl PendingRequest {
+    /// Session the request belongs to, whatever the kind.
+    pub fn session(&self) -> &SessionId {
+        match self {
+            Self::Approval { session, .. } | Self::Question { session, .. } => session,
+        }
+    }
+
+    /// Opaque request handle, whatever the kind.
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Approval { request_id, .. } | Self::Question { request_id, .. } => request_id,
+        }
+    }
+
+    /// Which kind of request this is.
+    pub fn kind(&self) -> PendingKind {
+        match self {
+            Self::Approval { .. } => PendingKind::Approval,
+            Self::Question { .. } => PendingKind::UserInput,
+        }
+    }
+
+    /// Questions to render, when this is a question request.
+    pub fn questions(&self) -> Option<&[Question]> {
+        match self {
+            Self::Question { question, .. } => Some(&question.questions),
+            Self::Approval { .. } => None,
+        }
+    }
+}
+
+/// How a pending request settled.
+///
+/// `Expired` is an approval that timed out and was denied by the
+/// server; `Cancelled` is a question the server cancelled on
+/// timeout. Both are named terminal states, never a spinner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingResolution {
+    /// The user approved the request.
+    Approved,
+    /// The user denied the request, with an optional reason.
+    Denied(Option<String>),
+    /// The user answered, summarised in one line.
+    Answered(String),
+    /// The request expired (approvals deny on expiry).
+    Expired,
+    /// The request was cancelled before an answer.
+    Cancelled,
+}
+
+impl PendingResolution {
+    /// Short human name for the settled one-line record.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Approved => "Approved",
+            Self::Denied(_) => "Denied",
+            Self::Answered(_) => "Answered",
+            Self::Expired => "Expired",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Carried detail: the deny reason or the answer summary.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Denied(reason) => reason.as_deref(),
+            Self::Answered(summary) => Some(summary),
+            _ => None,
+        }
+    }
+}
+
+/// The user's decision on an approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Approve the gated action.
+    Approve,
+    /// Deny the gated action.
+    Deny,
+}
+
+/// Alias matching the pending-request vocabulary.
+pub type PendingDecision = ApprovalDecision;
+
+impl ApprovalDecision {
+    /// Wire value for `muse_decide`'s `decision`.
+    pub fn wire_value(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Short human name.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::Deny => "Deny",
+        }
+    }
+}
+
+/// Which wire field an [`AnswerValue`] maps to.
+///
+/// Mirrors the host's exactly-one-of rule: `selectedLabel`,
+/// `selectedLabels`, or `freeText`. `Skipped` carries none of
+/// them; how a skip is encoded on the wire is the data layer's
+/// call, and no skipped value exists in the server's answer map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireAnswerKind {
+    /// Maps to `selectedLabel`.
+    SelectedLabel,
+    /// Maps to `selectedLabels`.
+    SelectedLabels,
+    /// Maps to `freeText`.
+    FreeText,
+    /// No wire field; the question was skipped.
+    Skipped,
+}
+
+/// One question's answer, as a domain value.
+///
+/// The data layer maps each variant to the wire shape the server's
+/// `buildUserInputAnswers` produces: a label that matches an
+/// offered option, a label list for multiple choice, or free text
+/// capped at [`FREE_TEXT_LIMIT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerValue {
+    /// A single offered option, by label.
+    Label(String),
+    /// Several offered options, by label (multiple choice).
+    Labels(Vec<String>),
+    /// Free text (the synthetic Other choice lands here).
+    FreeText(String),
+    /// The user skipped this question.
+    Skipped,
+}
+
+impl AnswerValue {
+    /// Build a free-text answer, capped at [`FREE_TEXT_LIMIT`].
+    pub fn free_text(text: &str) -> Self {
+        Self::FreeText(truncate_free_text(text))
+    }
+
+    /// Which wire field this answer maps to.
+    pub fn wire_kind(&self) -> WireAnswerKind {
+        match self {
+            Self::Label(_) => WireAnswerKind::SelectedLabel,
+            Self::Labels(_) => WireAnswerKind::SelectedLabels,
+            Self::FreeText(_) => WireAnswerKind::FreeText,
+            Self::Skipped => WireAnswerKind::Skipped,
+        }
+    }
+
+    /// Whether this answer is a skip.
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+
+    /// One-line summary for the settled record.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Label(label) => label.clone(),
+            Self::Labels(labels) => labels.join(", "),
+            Self::FreeText(text) => text.clone(),
+            Self::Skipped => String::from("Skipped"),
+        }
+    }
+}
+
+/// All answers for one user-input request, keyed by question id.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingAnswer {
+    /// Per-question answers, in question order.
+    pub answers: Vec<(String, AnswerValue)>,
+}
+
+impl PendingAnswer {
+    /// Build from per-question answers.
+    pub fn new(answers: Vec<(String, AnswerValue)>) -> Self {
+        Self { answers }
+    }
+
+    /// Build a single-question answer.
+    pub fn single(question_id: impl Into<String>, value: AnswerValue) -> Self {
+        Self {
+            answers: vec![(question_id.into(), value)],
+        }
+    }
+
+    /// The answer for one question, when present.
+    pub fn get(&self, question_id: &str) -> Option<&AnswerValue> {
+        self.answers
+            .iter()
+            .find(|(id, _)| id == question_id)
+            .map(|(_, value)| value)
+    }
+
+    /// Whether every question in `request` has an answer entry.
+    pub fn is_complete_for(&self, request: &QuestionRequest) -> bool {
+        request
+            .questions
+            .iter()
+            .all(|question| self.get(&question.id).is_some())
+    }
+
+    /// One-line summary of all answers for the settled record.
+    pub fn summary(&self) -> String {
+        self.answers
+            .iter()
+            .map(|(_, value)| value.summary())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 /// One server stream event, translated to domain values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -672,6 +1062,15 @@ pub enum FailedCommand {
     Cancel(SessionId),
     /// Listing the model catalog failed.
     Models,
+    /// Fetching pending approvals/questions failed.
+    ///
+    /// The fetch is global (`muse_pending` takes no session), so
+    /// no session rides along.
+    PendingFetch,
+    /// Deciding this session's pending approval failed.
+    Decide(SessionId, String),
+    /// Answering this session's pending question failed.
+    Answer(SessionId, String),
 }
 
 /// Everything an engine reports to the presentation layer.
@@ -728,6 +1127,21 @@ pub enum EngineEvent {
         command: FailedCommand,
         /// The friendly failure message.
         message: String,
+    },
+    /// A pending fetch succeeded; this is the source of truth for
+    /// approval/question cards, replacing any hint-only state.
+    PendingLoaded {
+        /// All pending requests across sessions, in server order.
+        requests: Vec<PendingRequest>,
+    },
+    /// One pending request settled.
+    PendingSettled {
+        /// Session the request belonged to.
+        session: SessionId,
+        /// Opaque request handle that settled.
+        request_id: String,
+        /// How it settled.
+        resolution: PendingResolution,
     },
     /// One stream event arrived.
     Stream(StreamEvent),
@@ -792,6 +1206,37 @@ pub trait SessionEngine: Send + Sync {
     /// from, so the caller passes a workspace, a session id, or both;
     /// a bare request fails while no host is live.
     fn list_models(&self, _workspace: Option<String>, _session: Option<SessionId>) {}
+    /// Fetch pending approvals/questions; results arrive as
+    /// [`EngineEvent::PendingLoaded`], failures as
+    /// [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::PendingFetch`]. Engines without pending
+    /// support keep the default, which drops the call.
+    fn fetch_pending(&self) {}
+    /// Decide `request_id` on `session` (approve or deny, with an
+    /// optional reason sent only when the choice accepts feedback
+    /// at the data boundary; the caller passes `actor: "user"` on
+    /// the wire there). Settlement arrives as
+    /// [`EngineEvent::PendingSettled`], failure as
+    /// [`EngineEvent::CommandFailed`] with [`FailedCommand::Decide`].
+    /// Engines without approvals keep the default, which drops it.
+    fn decide(
+        &self,
+        session: SessionId,
+        request_id: String,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    ) {
+        let _ = (session, request_id, decision, reason);
+    }
+    /// Answer `request_id` on `session` with `answer` (the caller
+    /// passes `actor: "user"` on the wire at the data boundary).
+    /// Settlement arrives as [`EngineEvent::PendingSettled`],
+    /// failure as [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Answer`]. Engines without questions keep
+    /// the default, which drops the call.
+    fn answer(&self, session: SessionId, request_id: String, answer: PendingAnswer) {
+        let _ = (session, request_id, answer);
+    }
 }
 
 #[cfg(test)]
@@ -1075,5 +1520,250 @@ mod tests {
         engine.cancel_turn(SessionId::new("s"), None);
         engine.cancel_turn(SessionId::new("s"), Some(TurnId::new("t")));
         engine.list_models(None, None);
+        engine.fetch_pending();
+        engine.decide(
+            SessionId::new("s"),
+            String::from("r1"),
+            ApprovalDecision::Approve,
+            None,
+        );
+        engine.answer(
+            SessionId::new("s"),
+            String::from("r1"),
+            PendingAnswer::single("q1", AnswerValue::Skipped),
+        );
+    }
+
+    fn sample_question(multi: bool) -> Question {
+        Question {
+            id: String::from("q1"),
+            prompt: String::from("Pick one"),
+            options: vec![
+                QuestionOption {
+                    label: String::from("Red"),
+                    description: Some(String::from("Warm")),
+                },
+                QuestionOption {
+                    label: String::from("Blue"),
+                    description: None,
+                },
+                QuestionOption {
+                    label: String::from("None"),
+                    description: None,
+                },
+            ],
+            multi,
+        }
+    }
+
+    #[test]
+    fn classify_exact_label_is_selected_label() {
+        let question = sample_question(false);
+        assert_eq!(
+            question.classify_text("Red"),
+            AnswerValue::Label(String::from("Red"))
+        );
+        // A real option literally labelled None is a plain label:
+        // no free-text box is implied.
+        assert_eq!(
+            question.classify_text("None"),
+            AnswerValue::Label(String::from("None"))
+        );
+        assert_eq!(
+            AnswerValue::Label(String::from("Red")).wire_kind(),
+            WireAnswerKind::SelectedLabel
+        );
+    }
+
+    #[test]
+    fn classify_unknown_text_is_free_text() {
+        let question = sample_question(false);
+        assert_eq!(
+            question.classify_text("Purple, please"),
+            AnswerValue::FreeText(String::from("Purple, please"))
+        );
+        assert_eq!(
+            AnswerValue::free_text("hi").wire_kind(),
+            WireAnswerKind::FreeText
+        );
+    }
+
+    #[test]
+    fn classify_multi_splits_on_commas_and_drops_unknown() {
+        let question = sample_question(true);
+        assert_eq!(
+            question.classify_text("Red, Blue, Purple"),
+            AnswerValue::Labels(vec![String::from("Red"), String::from("Blue")])
+        );
+        assert_eq!(
+            question.classify_text("Red"),
+            AnswerValue::Labels(vec![String::from("Red")])
+        );
+        // No label survives the filter, so the whole text is free text.
+        assert_eq!(
+            question.classify_text("Purple"),
+            AnswerValue::FreeText(String::from("Purple"))
+        );
+    }
+
+    #[test]
+    fn free_text_is_capped_at_500_chars() {
+        let long = "x".repeat(600);
+        assert_eq!(truncate_free_text(&long).chars().count(), FREE_TEXT_LIMIT);
+        match AnswerValue::free_text(&long) {
+            AnswerValue::FreeText(text) => assert_eq!(text.chars().count(), 500),
+            other => panic!("expected FreeText, got {other:?}"),
+        }
+        // Multi-byte text truncates on a char boundary.
+        let wide = "é".repeat(600);
+        assert_eq!(truncate_free_text(&wide).chars().count(), 500);
+    }
+
+    #[test]
+    fn skipped_answer_has_no_wire_field() {
+        assert!(AnswerValue::Skipped.is_skipped());
+        assert_eq!(AnswerValue::Skipped.wire_kind(), WireAnswerKind::Skipped);
+        assert_eq!(AnswerValue::Skipped.summary(), "Skipped");
+    }
+
+    #[test]
+    fn question_label_helpers() {
+        let question = sample_question(false);
+        assert_eq!(question.option_labels(), vec!["Red", "Blue", "None"]);
+        assert!(question.has_option("Blue"));
+        assert!(!question.has_option("Purple"));
+        assert!(question.options[0].has_description());
+        assert!(!question.options[1].has_description());
+    }
+
+    #[test]
+    fn pending_answer_completeness_and_summary() {
+        let request = QuestionRequest {
+            questions: vec![
+                sample_question(false),
+                Question {
+                    id: String::from("q2"),
+                    ..sample_question(false)
+                },
+            ],
+        };
+        let partial = PendingAnswer::single("q1", AnswerValue::Label(String::from("Red")));
+        assert!(!partial.is_complete_for(&request));
+        let full = PendingAnswer::new(vec![
+            (String::from("q1"), AnswerValue::Label(String::from("Red"))),
+            (String::from("q2"), AnswerValue::Skipped),
+        ]);
+        assert!(full.is_complete_for(&request));
+        assert_eq!(full.summary(), "Red; Skipped");
+        assert_eq!(
+            full.get("q1"),
+            Some(&AnswerValue::Label(String::from("Red")))
+        );
+        assert_eq!(request.question("q2").map(|q| q.id.as_str()), Some("q2"));
+    }
+
+    #[test]
+    fn pending_request_accessors_cover_both_kinds() {
+        let approval = PendingRequest::Approval {
+            session: SessionId::new("s1"),
+            request_id: String::from("r1"),
+            approval: ApprovalRequest {
+                tool: String::from("Bash"),
+                subject_line: String::from("run ls"),
+                choices: vec![ApprovalChoiceSummary {
+                    label: String::new(),
+                    decision: String::from("approved"),
+                    scope: String::from("once"),
+                    accepts_feedback: false,
+                }],
+            },
+        };
+        assert_eq!(approval.session().as_str(), "s1");
+        assert_eq!(approval.request_id(), "r1");
+        assert_eq!(approval.kind(), PendingKind::Approval);
+        assert_eq!(approval.questions(), None);
+        let question = PendingRequest::Question {
+            session: SessionId::new("s2"),
+            request_id: String::from("r2"),
+            question: QuestionRequest {
+                questions: vec![sample_question(false)],
+            },
+        };
+        assert_eq!(question.kind(), PendingKind::UserInput);
+        assert_eq!(question.questions().map(<[Question]>::len), Some(1));
+    }
+
+    #[test]
+    fn approval_choice_display_label_falls_back_to_decision() {
+        let blank = ApprovalChoiceSummary {
+            label: String::from("  "),
+            decision: String::from("approved"),
+            scope: String::from("once"),
+            accepts_feedback: false,
+        };
+        assert_eq!(blank.display_label(), "approved");
+        let approval = ApprovalRequest {
+            tool: String::from("Bash"),
+            subject_line: String::from("run ls"),
+            choices: vec![blank],
+        };
+        assert_eq!(approval.choice_labels(), vec!["approved"]);
+    }
+
+    #[test]
+    fn resolution_labels_and_details() {
+        assert_eq!(PendingResolution::Approved.label(), "Approved");
+        assert_eq!(
+            PendingResolution::Denied(Some(String::from("no"))).detail(),
+            Some("no")
+        );
+        assert_eq!(PendingResolution::Denied(None).detail(), None);
+        assert_eq!(
+            PendingResolution::Answered(String::from("Red")).detail(),
+            Some("Red")
+        );
+        assert_eq!(PendingResolution::Expired.label(), "Expired");
+        assert_eq!(PendingResolution::Cancelled.label(), "Cancelled");
+        assert_eq!(ApprovalDecision::Approve.wire_value(), "approve");
+        assert_eq!(ApprovalDecision::Deny.wire_value(), "deny");
+    }
+
+    #[test]
+    fn pending_events_carry_requests_and_settlement() {
+        let loaded = EngineEvent::PendingLoaded {
+            requests: vec![PendingRequest::Approval {
+                session: SessionId::new("s1"),
+                request_id: String::from("r1"),
+                approval: ApprovalRequest {
+                    tool: String::from("Bash"),
+                    subject_line: String::from("run ls"),
+                    choices: Vec::new(),
+                },
+            }],
+        };
+        match loaded {
+            EngineEvent::PendingLoaded { requests } => assert_eq!(requests.len(), 1),
+            _ => panic!("expected PendingLoaded"),
+        }
+        let settled = EngineEvent::PendingSettled {
+            session: SessionId::new("s1"),
+            request_id: String::from("r1"),
+            resolution: PendingResolution::Expired,
+        };
+        match settled {
+            EngineEvent::PendingSettled { resolution, .. } => {
+                assert_eq!(resolution, PendingResolution::Expired)
+            }
+            _ => panic!("expected PendingSettled"),
+        }
+        // FailedCommand pending variants carry session + request where useful.
+        assert_eq!(
+            FailedCommand::Decide(SessionId::new("s1"), String::from("r1")),
+            FailedCommand::Decide(SessionId::new("s1"), String::from("r1"))
+        );
+        assert_ne!(
+            FailedCommand::Answer(SessionId::new("s1"), String::from("r1")),
+            FailedCommand::PendingFetch
+        );
     }
 }

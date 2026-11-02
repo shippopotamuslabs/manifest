@@ -8,6 +8,7 @@ mod app;
 mod composer;
 mod engine;
 mod kit;
+mod pending;
 mod sessions;
 mod theme;
 mod transcript;

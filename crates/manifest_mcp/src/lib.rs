@@ -5,7 +5,9 @@
 //! `initialize` declaring the `muse.stream` experimental capability,
 //! `tools/call` for `muse_status`, `muse_spawn` (workspace, prompt,
 //! worktree and model/effort/permission choices, `wait: false`),
-//! `muse_turn`, `muse_steer`, `muse_cancel`, and `muse_models`
+//! `muse_turn`, `muse_steer`, `muse_cancel`, `muse_pending`,
+//! `muse_decide`, `muse_answer` (both as `actor: "user"`), and
+//! `muse_models`
 //! (catalog listing, or session resume with the catalog discarded), and
 //! `notifications/muse/event` mapped into domain
 //! [`StreamEvent`](manifest_domain::StreamEvent) values. The client is
@@ -21,7 +23,9 @@ mod worker;
 
 use std::sync::mpsc::Sender;
 
-use manifest_domain::{EngineEvent, SessionEngine, SessionId, SpawnChoices, TurnId};
+use manifest_domain::{
+    ApprovalDecision, EngineEvent, PendingAnswer, SessionEngine, SessionId, SpawnChoices, TurnId,
+};
 
 use worker::{Command, WorkerMsg};
 
@@ -165,6 +169,39 @@ impl SessionEngine for MuseEngine {
         let _ = self
             .worker_tx
             .send(WorkerMsg::Command(Command::CancelTurn { session, turn }));
+    }
+
+    fn fetch_pending(&self) {
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::FetchPending));
+    }
+
+    fn decide(
+        &self,
+        session: SessionId,
+        request_id: String,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    ) {
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::DecidePending {
+                session,
+                request_id,
+                decision,
+                reason,
+            }));
+    }
+
+    fn answer(&self, session: SessionId, request_id: String, answer: PendingAnswer) {
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::AnswerPending {
+                session,
+                request_id,
+                answer,
+            }));
     }
 
     fn list_models(&self, workspace: Option<String>, session: Option<SessionId>) {

@@ -8,7 +8,10 @@
 //! with the catalog discarded), and server requests we never
 //! serve get `-32601` so none is left hanging.
 
-use manifest_domain::{PermissionMode, SpawnChoices, WorktreeChoice};
+use manifest_domain::{
+    AnswerValue, ApprovalDecision, PendingAnswer, PermissionMode, SpawnChoices, WorktreeChoice,
+    truncate_free_text,
+};
 use serde_json::{Value, json};
 
 /// Client version stamped into `clientInfo`; the crate version.
@@ -210,6 +213,107 @@ pub(crate) fn status_call(id: u64) -> String {
         "id": id,
         "method": "tools/call",
         "params": { "name": "muse_status", "arguments": {} },
+    })
+    .to_string()
+}
+
+/// A `tools/call` request invoking `muse_pending` with the given numeric id.
+///
+/// The tool takes no arguments; its result is the source of truth for
+/// approval/question cards.
+pub(crate) fn pending_call(id: u64) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": "muse_pending", "arguments": {} },
+    })
+    .to_string()
+}
+
+/// A `tools/call` request invoking `muse_decide` with the given numeric id.
+///
+/// `actor` is always `"user"`: the server otherwise defaults to
+/// `orchestrator`. `reason` rides only on a deny with a non-empty
+/// reason; the server forwards it as feedback only when the chosen
+/// choice accepts feedback.
+pub(crate) fn decide_call(
+    id: u64,
+    request_id: &str,
+    decision: ApprovalDecision,
+    reason: Option<&str>,
+) -> String {
+    let mut arguments = serde_json::Map::from_iter([
+        (String::from("request_id"), Value::from(request_id)),
+        (String::from("decision"), Value::from(decision.wire_value())),
+        (String::from("actor"), Value::from("user")),
+    ]);
+    if decision == ApprovalDecision::Deny
+        && let Some(reason) = reason
+        && !reason.trim().is_empty()
+    {
+        arguments.insert(String::from("reason"), Value::from(reason));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "muse_decide",
+            "arguments": Value::Object(arguments),
+        },
+    })
+    .to_string()
+}
+
+/// Encode one [`AnswerValue`] as a server `WireAnswer` object.
+///
+/// Mirrors `buildUserInputAnswers`' array path in the server's
+/// `answers.ts`: a label becomes `selectedLabel`, labels become
+/// `selectedLabels`, and free text becomes `freeText` capped at 500
+/// chars. A skipped question carries only its `questionId` (the
+/// `asWireAnswer` path accepts that shape); no skipped wire value
+/// exists, and `freeText: ""` would read as an empty answer.
+fn wire_answer(question_id: &str, value: &AnswerValue) -> Value {
+    match value {
+        AnswerValue::Label(label) => json!({
+            "questionId": question_id,
+            "selectedLabel": label,
+        }),
+        AnswerValue::Labels(labels) => json!({
+            "questionId": question_id,
+            "selectedLabels": labels,
+        }),
+        AnswerValue::FreeText(text) => json!({
+            "questionId": question_id,
+            "freeText": truncate_free_text(text),
+        }),
+        AnswerValue::Skipped => json!({ "questionId": question_id }),
+    }
+}
+
+/// A `tools/call` request invoking `muse_answer` with the given numeric id.
+///
+/// `actor` is always `"user"`. The answer rides as the array shape
+/// the server's `asWireAnswer` passes through, one entry per question.
+pub(crate) fn answer_call(id: u64, request_id: &str, answer: &PendingAnswer) -> String {
+    let answers: Vec<Value> = answer
+        .answers
+        .iter()
+        .map(|(question_id, value)| wire_answer(question_id, value))
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "muse_answer",
+            "arguments": {
+                "request_id": request_id,
+                "actor": "user",
+                "answer": answers,
+            },
+        },
     })
     .to_string()
 }
@@ -505,6 +609,126 @@ mod tests {
             .as_object()
             .expect("arguments is an object");
         assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn pending_call_names_muse_pending_with_no_args() {
+        let value: Value = serde_json::from_str(&pending_call(11)).expect("valid JSON");
+        assert_eq!(value.get("id"), Some(&json!(11)));
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_pending")));
+        assert_eq!(
+            value.pointer("/params/arguments"),
+            Some(&json!({})),
+            "muse_pending takes no arguments"
+        );
+    }
+
+    #[test]
+    fn decide_call_always_actors_user() {
+        let value: Value =
+            serde_json::from_str(&decide_call(12, "req-1", ApprovalDecision::Approve, None))
+                .expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_decide")));
+        assert_eq!(
+            value.pointer("/params/arguments/request_id"),
+            Some(&json!("req-1"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/decision"),
+            Some(&json!("approve"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/actor"),
+            Some(&json!("user"))
+        );
+        assert_eq!(value.pointer("/params/arguments/reason"), None);
+    }
+
+    #[test]
+    fn decide_deny_reason_only_when_some_non_empty() {
+        let with = serde_json::from_str::<Value>(&decide_call(
+            12,
+            "req-1",
+            ApprovalDecision::Deny,
+            Some("not safe"),
+        ))
+        .expect("valid JSON");
+        assert_eq!(
+            with.pointer("/params/arguments/reason"),
+            Some(&json!("not safe"))
+        );
+        for reason in [None, Some(""), Some("   ")] {
+            let value = serde_json::from_str::<Value>(&decide_call(
+                12,
+                "req-1",
+                ApprovalDecision::Deny,
+                reason,
+            ))
+            .expect("valid JSON");
+            assert_eq!(
+                value.pointer("/params/arguments/reason"),
+                None,
+                "reason {reason:?} must not ride"
+            );
+        }
+        // A reason on approve never rides either.
+        let approve = serde_json::from_str::<Value>(&decide_call(
+            12,
+            "req-1",
+            ApprovalDecision::Approve,
+            Some("looks fine"),
+        ))
+        .expect("valid JSON");
+        assert_eq!(approve.pointer("/params/arguments/reason"), None);
+    }
+
+    #[test]
+    fn answer_call_encodes_each_answer_kind() {
+        let answer = PendingAnswer::new(vec![
+            (String::from("q1"), AnswerValue::Label(String::from("Red"))),
+            (
+                String::from("q2"),
+                AnswerValue::Labels(vec![String::from("A"), String::from("B")]),
+            ),
+            (
+                String::from("q3"),
+                AnswerValue::FreeText(String::from("my own words")),
+            ),
+            (String::from("q4"), AnswerValue::Skipped),
+        ]);
+        let value: Value =
+            serde_json::from_str(&answer_call(13, "req-9", &answer)).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_answer")));
+        assert_eq!(
+            value.pointer("/params/arguments/request_id"),
+            Some(&json!("req-9"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/actor"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/answer"),
+            Some(&json!([
+                {"questionId": "q1", "selectedLabel": "Red"},
+                {"questionId": "q2", "selectedLabels": ["A", "B"]},
+                {"questionId": "q3", "freeText": "my own words"},
+                {"questionId": "q4"},
+            ])),
+            "skip carries only questionId, never freeText"
+        );
+    }
+
+    #[test]
+    fn answer_call_caps_free_text_at_500_chars() {
+        let answer = PendingAnswer::single("q1", AnswerValue::FreeText("x".repeat(600)));
+        let value: Value =
+            serde_json::from_str(&answer_call(13, "req-9", &answer)).expect("valid JSON");
+        let text = value
+            .pointer("/params/arguments/answer/0/freeText")
+            .and_then(Value::as_str)
+            .expect("freeText present");
+        assert_eq!(text.chars().count(), 500);
     }
 
     #[test]
