@@ -105,6 +105,35 @@ impl EngineHandle {
     pub fn resume_session(&self, session: SessionId) {
         self.inner.resume_session(session);
     }
+
+    /// Fetches pending approvals/questions; results arrive as
+    /// `PendingLoaded`, failures as `CommandFailed(PendingFetch)`.
+    pub fn fetch_pending(&self) {
+        self.inner.fetch_pending();
+    }
+
+    /// Decides a pending approval; settlement arrives as
+    /// `PendingSettled`, failure as `CommandFailed(Decide(..))`.
+    pub fn decide(
+        &self,
+        session: SessionId,
+        request_id: String,
+        decision: manifest_domain::ApprovalDecision,
+        reason: Option<String>,
+    ) {
+        self.inner.decide(session, request_id, decision, reason);
+    }
+
+    /// Answers a pending question set; settlement arrives as
+    /// `PendingSettled`, failure as `CommandFailed(Answer(..))`.
+    pub fn answer(
+        &self,
+        session: SessionId,
+        request_id: String,
+        answer: manifest_domain::PendingAnswer,
+    ) {
+        self.inner.answer(session, request_id, answer);
+    }
 }
 
 impl std::fmt::Debug for EngineHandle {

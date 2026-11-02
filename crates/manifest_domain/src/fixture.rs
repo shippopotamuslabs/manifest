@@ -1,5 +1,10 @@
 //! Session, transcript, and todo domain values plus the fixture shell renders.
 
+use crate::engine::{
+    ApprovalChoiceSummary, ApprovalRequest, PendingRequest, PendingResolution, Question,
+    QuestionOption, QuestionRequest,
+};
+
 /// Opaque handle for one agent session.
 ///
 /// The inner value is never inspected by callers; sessions compare and
@@ -129,6 +134,13 @@ pub struct Fixture {
     pub transcript: Vec<TranscriptItem>,
     /// Checklist for the open drawer.
     pub todos: Vec<TodoItem>,
+    /// Unsettled pending requests for the awaiting session, in card
+    /// order. Fixture mode seeds its pending store from these so the
+    /// cards render without an engine; live mode never reads them.
+    pub pending: Vec<PendingRequest>,
+    /// Already-settled pending requests with their resolutions, in
+    /// card order. Fixture mode collapses each to its one-line record.
+    pub settled_pending: Vec<(PendingRequest, PendingResolution)>,
 }
 
 /// Deterministic fixture the shell boots from.
@@ -291,6 +303,111 @@ pub fn fixture() -> Fixture {
                 done: false,
             },
         ],
+        pending: vec![
+            PendingRequest::Question {
+                session: SessionId::new("session-settings-copy"),
+                request_id: String::from("fixture-question-1"),
+                question: QuestionRequest {
+                    questions: vec![
+                        Question {
+                            id: String::from("q1"),
+                            prompt: String::from("Which token refresh should settings sync use?"),
+                            options: vec![
+                                QuestionOption {
+                                    label: String::from("Per-request refresh"),
+                                    description: Some(String::from(
+                                        "Refresh inside the request path and retry once on expiry.",
+                                    )),
+                                },
+                                QuestionOption {
+                                    label: String::from("Refresh on open"),
+                                    description: Some(String::from(
+                                        "Keep the current read-once behaviour when the screen opens.",
+                                    )),
+                                },
+                                // A real option literally named None: a
+                                // plain radio, never the synthetic Other.
+                                QuestionOption {
+                                    label: String::from("None"),
+                                    description: None,
+                                },
+                            ],
+                            multi: false,
+                        },
+                        Question {
+                            id: String::from("q2"),
+                            prompt: String::from("Which suites should cover expiry?"),
+                            options: vec![
+                                QuestionOption {
+                                    label: String::from("Checkout sync"),
+                                    description: Some(String::from(
+                                        "The suite that already caught the two failures.",
+                                    )),
+                                },
+                                QuestionOption {
+                                    label: String::from("Settings sync"),
+                                    description: None,
+                                },
+                            ],
+                            multi: true,
+                        },
+                        Question {
+                            id: String::from("q3"),
+                            prompt: String::from("How should the changelog group this?"),
+                            options: vec![
+                                QuestionOption {
+                                    label: String::from("Both sync fixes"),
+                                    description: Some(String::from(
+                                        "One entry covering checkout and settings sync.",
+                                    )),
+                                },
+                                QuestionOption {
+                                    label: String::from("Separate entries"),
+                                    description: None,
+                                },
+                            ],
+                            multi: false,
+                        },
+                    ],
+                },
+            },
+            PendingRequest::Approval {
+                session: SessionId::new("session-settings-copy"),
+                request_id: String::from("fixture-approval-1"),
+                approval: ApprovalRequest {
+                    tool: String::from("edit_file"),
+                    subject_line: String::from(
+                        "Apply per-request token refresh to settings sync (1 file)",
+                    ),
+                    choices: vec![
+                        ApprovalChoiceSummary {
+                            label: String::from("Approve"),
+                            decision: String::from("approved"),
+                            scope: String::from("once"),
+                            accepts_feedback: false,
+                        },
+                        ApprovalChoiceSummary {
+                            label: String::from("Deny"),
+                            decision: String::from("denied"),
+                            scope: String::from("once"),
+                            accepts_feedback: true,
+                        },
+                    ],
+                },
+            },
+        ],
+        settled_pending: vec![(
+            PendingRequest::Approval {
+                session: SessionId::new("session-settings-copy"),
+                request_id: String::from("fixture-settled-1"),
+                approval: ApprovalRequest {
+                    tool: String::from("bash"),
+                    subject_line: String::from("Run the checkout sync suite"),
+                    choices: Vec::new(),
+                },
+            },
+            PendingResolution::Approved,
+        )],
     }
 }
 
@@ -416,6 +533,30 @@ mod tests {
         for session in &got.sessions {
             assert!(!session.relative_time.is_empty());
         }
+    }
+
+    #[test]
+    fn fixture_pending_demonstrates_cards_for_the_awaiting_session() {
+        let got = fixture();
+        let awaiting = SessionId::new("session-settings-copy");
+        assert!(
+            got.sessions
+                .iter()
+                .any(|s| s.id == awaiting && s.status == SessionStatus::AwaitingApproval)
+        );
+        // Two unsettled cards: a 3-question card, then an approval card.
+        assert_eq!(got.pending.len(), 2);
+        assert!(got.pending.iter().all(|r| r.session() == &awaiting));
+        let questions = got.pending[0].questions().expect("question card first");
+        assert_eq!(questions.len(), 3);
+        assert!(!questions[0].multi && questions[1].multi && !questions[2].multi);
+        assert!(questions[0].options.iter().any(|o| o.label == "None"));
+        assert!(questions[0].options[0].has_description());
+        assert!(matches!(got.pending[1], PendingRequest::Approval { .. }));
+        // One settled record, approved by the user.
+        assert_eq!(got.settled_pending.len(), 1);
+        assert_eq!(got.settled_pending[0].0.session(), &awaiting);
+        assert_eq!(got.settled_pending[0].1, PendingResolution::Approved);
     }
 
     #[test]

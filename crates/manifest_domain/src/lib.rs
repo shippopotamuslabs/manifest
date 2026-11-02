@@ -11,9 +11,12 @@ mod engine;
 mod fixture;
 
 pub use engine::{
-    Connection, EffortChoice, EngineEvent, FailedCommand, ItemStatus, ModelChoice, ModelInfo,
-    MusePermission, PendingKind, PendingPhase, PermissionMode, SessionEngine, SpawnChoices,
-    StreamEvent, StreamItem, TurnId, UsageKind, UsageSnapshot, WorktreeChoice,
+    AnswerValue, ApprovalChoiceSummary, ApprovalDecision, ApprovalRequest, Connection,
+    EffortChoice, EngineEvent, FREE_TEXT_LIMIT, FailedCommand, ItemStatus, ModelChoice, ModelInfo,
+    MusePermission, PendingAnswer, PendingDecision, PendingKind, PendingPhase, PendingRequest,
+    PendingResolution, PermissionMode, Question, QuestionOption, QuestionRequest, SessionEngine,
+    SpawnChoices, StreamEvent, StreamItem, TurnId, UsageKind, UsageSnapshot, WireAnswerKind,
+    WorktreeChoice, truncate_free_text,
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,

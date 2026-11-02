@@ -12,13 +12,16 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcCommand, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
-use manifest_domain::{Connection, EngineEvent, FailedCommand, SessionId, SpawnChoices, TurnId};
+use manifest_domain::{
+    ApprovalDecision, Connection, EngineEvent, FailedCommand, PendingAnswer, PendingResolution,
+    SessionId, SpawnChoices, TurnId,
+};
 use serde_json::Value;
 
 use crate::error::Error;
 use crate::map::{
-    map_ack_result, map_models_result, map_resume_result, map_spawn_result, map_status_result,
-    map_stream_event, map_turn_result,
+    map_ack_result, map_models_result, map_pending_result, map_resume_result, map_spawn_result,
+    map_status_result, map_stream_event, map_turn_result,
 };
 use crate::{ServerConfig, wire};
 
@@ -60,6 +63,21 @@ pub(crate) enum Command {
         workspace: Option<String>,
         session: Option<SessionId>,
     },
+    /// Fetch pending approvals/questions: `muse_pending`.
+    FetchPending,
+    /// Decide a pending approval: `muse_decide` as `actor: "user"`.
+    DecidePending {
+        session: SessionId,
+        request_id: String,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    },
+    /// Answer a pending question set: `muse_answer` as `actor: "user"`.
+    AnswerPending {
+        session: SessionId,
+        request_id: String,
+        answer: PendingAnswer,
+    },
     /// Shut down: kill the child and exit without emitting.
     Shutdown,
 }
@@ -84,6 +102,18 @@ enum Pending {
     Steer(SessionId),
     Cancel(SessionId),
     Models,
+    Fetch,
+    Decide {
+        session: SessionId,
+        request_id: String,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    },
+    Answer {
+        session: SessionId,
+        request_id: String,
+        answer: PendingAnswer,
+    },
 }
 
 /// The [`FailedCommand`] tag for a pending request: the failure of
@@ -96,6 +126,17 @@ fn failed_command(pending: &Pending) -> Option<FailedCommand> {
         Pending::Steer(session) => Some(FailedCommand::Steer(session.clone())),
         Pending::Cancel(session) => Some(FailedCommand::Cancel(session.clone())),
         Pending::Models => Some(FailedCommand::Models),
+        Pending::Fetch => Some(FailedCommand::PendingFetch),
+        Pending::Decide {
+            session,
+            request_id,
+            ..
+        } => Some(FailedCommand::Decide(session.clone(), request_id.clone())),
+        Pending::Answer {
+            session,
+            request_id,
+            ..
+        } => Some(FailedCommand::Answer(session.clone(), request_id.clone())),
         Pending::Initialize | Pending::ListSessions => None,
     }
 }
@@ -218,6 +259,56 @@ impl Worker {
         ))
     }
 
+    /// Issue a `muse_pending` round trip with a fresh id.
+    fn send_pending_call(&mut self) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Fetch);
+        self.send_line(&wire::pending_call(id))
+    }
+
+    /// Issue a `muse_decide` round trip with a fresh id.
+    fn send_decide_call(
+        &mut self,
+        session: &SessionId,
+        request_id: &str,
+        decision: ApprovalDecision,
+        reason: Option<&str>,
+    ) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(
+            id,
+            Pending::Decide {
+                session: session.clone(),
+                request_id: request_id.to_string(),
+                decision,
+                reason: reason.map(String::from),
+            },
+        );
+        self.send_line(&wire::decide_call(id, request_id, decision, reason))
+    }
+
+    /// Issue a `muse_answer` round trip with a fresh id.
+    fn send_answer_call(
+        &mut self,
+        session: &SessionId,
+        request_id: &str,
+        answer: &PendingAnswer,
+    ) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(
+            id,
+            Pending::Answer {
+                session: session.clone(),
+                request_id: request_id.to_string(),
+                answer: answer.clone(),
+            },
+        );
+        self.send_line(&wire::answer_call(id, request_id, answer))
+    }
+
     /// Issue a `muse_models` catalog round trip with a fresh id.
     fn send_models_call(
         &mut self,
@@ -301,7 +392,10 @@ impl Worker {
             | Pending::Resume(_)
             | Pending::Steer(_)
             | Pending::Cancel(_)
-            | Pending::Models => self.handle_command_reply(&pending, message),
+            | Pending::Models
+            | Pending::Fetch
+            | Pending::Decide { .. }
+            | Pending::Answer { .. } => self.handle_command_reply(&pending, message),
         }
     }
 
@@ -395,6 +489,57 @@ impl Worker {
                 Ok(models) => EngineEvent::ModelsLoaded { models },
                 Err(message) => EngineEvent::CommandFailed { command, message },
             },
+            Pending::Fetch => match map_pending_result(&result) {
+                Ok((requests, diagnostics)) => {
+                    for diagnostic in diagnostics {
+                        if !self.emit(EngineEvent::Diagnostic(diagnostic)) {
+                            return false;
+                        }
+                    }
+                    EngineEvent::PendingLoaded { requests }
+                }
+                Err(message) => EngineEvent::CommandFailed { command, message },
+            },
+            Pending::Decide {
+                session,
+                request_id,
+                decision,
+                reason,
+            } => {
+                match map_ack_result(
+                    &result,
+                    "Couldn't decide that approval on the Muse MCP server.",
+                ) {
+                    Ok(()) => EngineEvent::PendingSettled {
+                        session: session.clone(),
+                        request_id: request_id.clone(),
+                        resolution: match decision {
+                            ApprovalDecision::Approve => PendingResolution::Approved,
+                            ApprovalDecision::Deny => PendingResolution::Denied(
+                                reason.clone().filter(|text| !text.trim().is_empty()),
+                            ),
+                        },
+                    },
+                    Err(message) => EngineEvent::CommandFailed { command, message },
+                }
+            }
+            Pending::Answer {
+                session,
+                request_id,
+                answer,
+            } => {
+                match map_ack_result(
+                    &result,
+                    "Couldn't answer that question on the Muse MCP server.",
+                ) {
+                    Ok(()) => EngineEvent::PendingSettled {
+                        session: session.clone(),
+                        request_id: request_id.clone(),
+                        resolution: PendingResolution::Answered(answer.summary()),
+                    },
+                    Err(message) => EngineEvent::CommandFailed { command, message },
+                }
+            }
             Pending::Initialize | Pending::ListSessions => return true,
         };
         self.emit(event)
@@ -593,6 +738,56 @@ pub(crate) fn run(
                         message: not_connected_message(),
                     })
                 } else if let Err(err) = worker.send_cancel_call(&session, turn.as_ref()) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::FetchPending) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::PendingFetch,
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_pending_call() {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::DecidePending {
+                session,
+                request_id,
+                decision,
+                reason,
+            }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Decide(session.clone(), request_id.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) =
+                    worker.send_decide_call(&session, &request_id, decision, reason.as_deref())
+                {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::AnswerPending {
+                session,
+                request_id,
+                answer,
+            }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Answer(session.clone(), request_id.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_answer_call(&session, &request_id, &answer) {
                     let _ = worker.fail(err);
                     false
                 } else {
