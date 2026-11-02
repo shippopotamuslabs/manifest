@@ -90,9 +90,9 @@ pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 pub const COMPOSER_MAX_LINES: usize = 5;
 pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
-// Composer input text padding: twice the bar's tight step, so the text
+// Composer input text padding: triple the bar's tight step, so the text
 // breathes inside the bar. Kit reads this token; call sites name no value.
-pub const COMPOSER_INPUT_PADDING: f32 = 8.0;
+pub const COMPOSER_INPUT_PADDING: f32 = 12.0;
 // Fixed width of the add-project popup.
 pub const POPUP_WIDTH: f32 = 480.0;
 // Fixed width of the floating permission popup. The widest row is the
