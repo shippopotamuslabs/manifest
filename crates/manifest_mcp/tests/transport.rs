@@ -153,7 +153,7 @@ fn connects_and_lists_sessions() {
     );
 
     let loaded = seen.iter().find_map(|event| match event {
-        EngineEvent::SessionsLoaded { sessions } => Some(sessions),
+        EngineEvent::SessionsLoaded { sessions, .. } => Some(sessions),
         _ => None,
     });
     let sessions = loaded.expect("SessionsLoaded seen above");

@@ -263,6 +263,18 @@ pub fn connection_label(connection: &Connection) -> &'static str {
     }
 }
 
+/// Pure color mapping behind the connection label: connected reads
+/// success green, connecting reads amber, and disconnected or failed
+/// reads danger red. Kept as data (not a widget) so the mapping is
+/// unit-testable without constructing widgets.
+pub fn connection_color(connection: &Connection) -> iced::Color {
+    match connection {
+        Connection::Connected => crate::theme::SUCCESS,
+        Connection::Connecting => crate::theme::WARNING,
+        Connection::Disconnected | Connection::Failed(_) => crate::theme::DANGER,
+    }
+}
+
 /// The live-mode connection cluster: the connection label plus a Retry
 /// button while failed. A plain helper on the connection state — no
 /// state of its own.
@@ -273,7 +285,7 @@ pub fn connection_cluster<'a, M: Clone + 'a>(
     let mut cluster = iced::widget::row![
         iced::widget::text(connection_label(connection))
             .size(crate::theme::FONT_SIZE_SMALL)
-            .color(crate::theme::TEXT_TERTIARY),
+            .color(connection_color(connection)),
     ];
     if matches!(connection, Connection::Failed(_)) {
         cluster = cluster.push(crate::kit::icon_pill_button(
@@ -372,6 +384,26 @@ mod tests {
         fn resume_session(&self, session: SessionId) {
             self.resumed.lock().unwrap().push(session);
         }
+    }
+
+    #[test]
+    fn connection_color_maps_every_variant() {
+        assert_eq!(
+            connection_color(&Connection::Connected),
+            crate::theme::SUCCESS
+        );
+        assert_eq!(
+            connection_color(&Connection::Connecting),
+            crate::theme::WARNING
+        );
+        assert_eq!(
+            connection_color(&Connection::Disconnected),
+            crate::theme::DANGER
+        );
+        assert_eq!(
+            connection_color(&Connection::Failed(String::from("boom"))),
+            crate::theme::DANGER
+        );
     }
 
     #[test]

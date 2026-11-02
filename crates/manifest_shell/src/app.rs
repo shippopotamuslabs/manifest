@@ -10,16 +10,16 @@ use std::collections::{HashMap, HashSet};
 use iced::{Element, Length, Task};
 use manifest_domain::{
     Connection, EffortChoice, EngineEvent, Fixture, ModelChoice, PermissionMode, ProjectId,
-    ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent, TodoItem,
-    TurnId, UsageSnapshot, WorktreeChoice,
+    ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
+    StreamItem, TodoItem, TurnId, UsageSnapshot, WorktreeChoice,
 };
 
 use crate::engine;
 use crate::kit;
 use crate::theme::{
     DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, MODEL_MENU_BOTTOM_OFFSET,
-    PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE, attach_menu_bottom_offset,
+    PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN, SPACE_M, SPACE_S, SPACE_XS,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE, attach_menu_bottom_offset,
 };
 use crate::{composer, pending, sessions, transcript};
 
@@ -130,6 +130,16 @@ pub enum Message {
     /// canonical directory and the trimmed name; `Err` carries the
     /// message shown under the form.
     AddProjectChecked(Result<(String, String), String>),
+    /// A git branch read for a workspace finished. Applied only when
+    /// the workspace still names the visible one; any I/O failure
+    /// arrives as `None`, an expected display state that never shows
+    /// a transcript error.
+    BranchLoaded {
+        /// Workspace the read ran for; the staleness guard.
+        workspace: String,
+        /// Display branch (`None` while unread or unreadable).
+        branch: Option<String>,
+    },
 }
 
 impl From<sessions::Message> for Message {
@@ -276,8 +286,15 @@ pub struct App {
     /// cleared on `ModelsLoaded` (or on the models-tagged
     /// `CommandFailed` that marks the catalog failed, or on disconnect).
     pub models_pending: bool,
-    /// Checklist shown in the drawer, from the fixture.
-    pub todos: Vec<TodoItem>,
+    /// Branch shown in the top bar for the visible workspace;
+    /// `None` while unread or unreadable. Display only: never used to
+    /// switch branches.
+    pub branch: Option<String>,
+    /// Workspace [`App::branch`] was read for; the staleness guard.
+    pub branch_workspace: Option<String>,
+    /// Todo list per session, replaced wholesale by each `write_todos`
+    /// stream item; the drawer renders the visible session's entry.
+    pub todo_lists: HashMap<SessionId, Vec<TodoItem>>,
     /// Whether the TODO drawer is a peek strip or open.
     pub todo_drawer: TodoDrawer,
     /// Current width of the side panel; the divider drag rewrites it.
@@ -288,6 +305,12 @@ pub struct App {
     pub todo_summary: String,
     /// Label of the first unfinished todo, for the drawer bar.
     pub current_todo: Option<String>,
+    /// Precomputed usage line for the top bar's right cluster:
+    /// `<used> / <window> · <%>` when the window is known, else
+    /// `<used> tokens`; `None` while the visible session has no
+    /// snapshot. Refreshed with the composer meter in
+    /// [`App::sync_composer_usage`], so the view reads it directly.
+    pub topbar_usage: Option<String>,
     /// The window id from boot, for the title-bar window controls.
     pub window_id: Option<iced::window::Id>,
     /// Whether the window is maximized; drives the maximize icon.
@@ -332,6 +355,7 @@ impl App {
         // the cards exist without an engine. Live boot clears it.
         let fixture_pending = fixture.pending.clone();
         let fixture_settled = fixture.settled_pending.clone();
+        let seed_fallback = fixture.sessions.first().map(|summary| summary.id.clone());
         let done = fixture.todos.iter().filter(|todo| todo.done).count();
         let total = fixture.todos.len();
         let todo_summary = format!("{done} of {total} done");
@@ -356,10 +380,13 @@ impl App {
             pending: pending::State::default(),
             composer: composer::State::new(),
             models_pending: false,
-            todos: fixture.todos,
+            branch: None,
+            branch_workspace: None,
+            todo_lists: HashMap::new(),
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
+            topbar_usage: None,
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: PanelDrag::Idle,
             window_id: None,
@@ -400,6 +427,14 @@ impl App {
                 );
             }
         }
+        // Fixture mode only: the fixture list belongs to the visible
+        // session (else the first listed one), so the drawer keeps its
+        // meaning; live boot below starts with no lists.
+        let seed_owner = app.visible_session.clone().or(seed_fallback);
+        if let Some(owner) = seed_owner {
+            app.todo_lists.insert(owner, fixture.todos);
+        }
+        app.sync_visible_todos();
         app.refresh_send_gate();
         app
     }
@@ -419,7 +454,7 @@ impl App {
         // Live starts with no cards: the fixture seed is fixture-only.
         app.pending = pending::State::default();
         app.visible_session = None;
-        app.todos = Vec::new();
+        app.todo_lists = HashMap::new();
         app.todo_summary = String::from("0 of 0 done");
         app.current_todo = None;
         app.connection = Connection::Connecting;
@@ -468,6 +503,7 @@ impl App {
             }
             self.visible_session = None;
             self.sync_composer_usage();
+            self.sync_visible_todos();
             return;
         }
         if self.visible_session.as_ref() == Some(&selected) {
@@ -479,6 +515,7 @@ impl App {
         }
         self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
         self.sync_composer_usage();
+        self.sync_visible_todos();
     }
 
     /// Enters new-session draft mode for the named project: parks the
@@ -714,16 +751,188 @@ impl App {
         }
     }
 
+    /// Workspace the top bar reports a branch for: the draft's in
+    /// new-session draft mode (the draft owns the surface then, as in
+    /// [`App::topbar_project_name`]), else the selected session's,
+    /// else none. Empty strings name no workspace.
+    fn visible_workspace(&self) -> Option<String> {
+        if let Some(draft) = &self.new_session
+            && !draft.workspace.is_empty()
+        {
+            return Some(draft.workspace.clone());
+        }
+        if let Some(workspace) = self
+            .sessions
+            .selected_summary()
+            .map(|summary| summary.workspace.as_str())
+            && !workspace.is_empty()
+        {
+            return Some(workspace.to_string());
+        }
+        None
+    }
+
+    /// Reads `<workspace>/.git` off the reducer: a directory reads
+    /// HEAD inside it, a `gitdir: <path>` pointer file (a worktree
+    /// checkout) resolves through the domain helpers first. Any
+    /// failure yields `None`: an expected display state, never an
+    /// error the transcript shows.
+    fn read_branch_blocking(workspace: &str) -> Option<String> {
+        let dot_git = format!("{workspace}/.git");
+        let git_dir = match std::fs::metadata(&dot_git) {
+            Ok(meta) if meta.is_dir() => dot_git,
+            Ok(_) => {
+                let content = std::fs::read_to_string(&dot_git).ok()?;
+                let pointer = manifest_domain::parse_gitdir_pointer(&content)?;
+                manifest_domain::resolve_git_dir(workspace, pointer)
+            }
+            Err(_) => return None,
+        };
+        let head = std::fs::read_to_string(format!("{git_dir}/HEAD")).ok()?;
+        manifest_domain::parse_head(&head)
+    }
+
+    /// Starts a branch read for one workspace, or no task for none.
+    /// The result returns as [`Message::BranchLoaded`] carrying its
+    /// workspace, so the reducer can drop stale reads.
+    fn branch_task_for(workspace: Option<String>) -> Task<Message> {
+        match workspace {
+            Some(workspace) => Task::perform(
+                async move {
+                    let branch = Self::read_branch_blocking(&workspace);
+                    Message::BranchLoaded { workspace, branch }
+                },
+                |message| message,
+            ),
+            None => Task::none(),
+        }
+    }
+
+    /// Starts a branch read for the visible workspace, or no task
+    /// when no workspace is visible.
+    fn branch_task_for_visible(&self) -> Task<Message> {
+        Self::branch_task_for(self.visible_workspace())
+    }
+
+    /// Folds a finished branch read into state. Applies only when the
+    /// carried workspace still names the visible one; a stale read
+    /// (the selection moved on while it ran) drops silently.
+    fn apply_branch_loaded(&mut self, workspace: String, branch: Option<String>) {
+        if self.visible_workspace().as_deref() == Some(workspace.as_str()) {
+            self.branch = branch;
+            self.branch_workspace = Some(workspace);
+        }
+    }
+
+    /// The visible session's todo list, empty when no session is
+    /// showing or the session has no list yet. The drawer renders from
+    /// this, never from another session's list.
+    fn visible_todos(&self) -> &[TodoItem] {
+        self.visible_session
+            .as_ref()
+            .and_then(|session| self.todo_lists.get(session))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Recomputes the drawer bar strings from the visible session's
+    /// list (UI contract §2: the view formats nothing). No visible
+    /// list shows "0 of 0 done" with no current todo, which hides the
+    /// drawer; a finished list leaves no current todo, which the view
+    /// renders as "All done".
+    fn sync_visible_todos(&mut self) {
+        let (done, total, current) = match self
+            .visible_session
+            .as_ref()
+            .and_then(|session| self.todo_lists.get(session))
+        {
+            Some(todos) => {
+                let done = todos.iter().filter(|todo| todo.done).count();
+                let current = todos
+                    .iter()
+                    .find(|todo| !todo.done)
+                    .map(|todo| todo.label.clone());
+                (done, todos.len(), current)
+            }
+            None => (0, 0, None),
+        };
+        self.todo_summary = format!("{done} of {total} done");
+        self.current_todo = current;
+    }
+
+    /// Folds a todo-carrying stream item into per-session state: a
+    /// `Some` list replaces the session's list wholesale (started may
+    /// set it earlier; completed is authoritative), and the visible
+    /// projection refreshes when the session is visible. Items without
+    /// todos leave every list untouched.
+    fn apply_todo_item(&mut self, session: &SessionId, item: &StreamItem) {
+        if let StreamItem::ToolCall {
+            todos: Some(todos), ..
+        } = item
+        {
+            self.todo_lists.insert(session.clone(), todos.clone());
+            if self.is_visible(session) {
+                self.sync_visible_todos();
+            }
+        }
+    }
+
     /// Points the composer's usage meter at the visible session's
-    /// snapshot. Called after usage events and transcript syncs; the
-    /// composer stores the strings, so the view formats nothing.
+    /// snapshot. Called after usage events, status reconciles, and
+    /// transcript syncs; the composer stores the strings, so the view
+    /// formats nothing. Refreshes the top bar usage line from the
+    /// same snapshot, in the same format as the composer's meter.
     fn sync_composer_usage(&mut self) {
         let snapshot = self
             .visible_session
             .as_ref()
             .and_then(|session| self.usage.get(session))
             .cloned();
+        self.topbar_usage = snapshot.as_ref().map(|snapshot| match snapshot.window {
+            Some(window) if window > 0 => {
+                let ratio = snapshot.used as f32 / window as f32;
+                format!(
+                    "{} / {} · {}%",
+                    snapshot.used,
+                    window,
+                    (ratio * 100.0).round() as u64
+                )
+            }
+            _ => format!("{} tokens", snapshot.used),
+        });
         self.composer.set_usage(snapshot);
+    }
+
+    /// Project name for the top bar's left cluster: the draft's
+    /// project while a draft is open (the group whose workspace
+    /// matches the draft's, else the draft workspace's short name),
+    /// else the selected session's project group name, else the
+    /// selected workspace's short name, else nothing. A lookup over
+    /// stored state, so the view reads without formatting.
+    fn topbar_project_name(&self) -> Option<String> {
+        if let Some(draft) = &self.new_session {
+            if let Some(group) =
+                self.sessions.groups.iter().find(|group| {
+                    group.project.workspace.as_deref() == Some(draft.workspace.as_str())
+                })
+            {
+                return Some(group.project.name.clone());
+            }
+            let name = manifest_domain::workspace_name(&draft.workspace);
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+        let summary = self.sessions.selected_summary()?;
+        if let Some(project) = summary.project.as_ref()
+            && let Some(group) = self
+                .sessions
+                .groups
+                .iter()
+                .find(|group| &group.project.id == project)
+        {
+            return Some(group.project.name.clone());
+        }
+        let name = manifest_domain::workspace_name(&summary.workspace);
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Sessions in display order: grouped rows then unprojected, cloned.
@@ -1100,6 +1309,7 @@ impl App {
                 false
             }
             StreamEvent::ItemStarted { session, item, .. } => {
+                self.apply_todo_item(&session, &item);
                 if self.is_visible(&session) {
                     self.transcript.item_started(item);
                     true
@@ -1124,6 +1334,7 @@ impl App {
                 false
             }
             StreamEvent::ItemCompleted { session, item, .. } => {
+                self.apply_todo_item(&session, &item);
                 if self.is_visible(&session) {
                     self.transcript.item_completed(item);
                     true
@@ -1247,7 +1458,11 @@ impl App {
                     }
                 }
                 self.refresh_send_gate();
-                Task::none()
+                if select {
+                    self.branch_task_for_visible()
+                } else {
+                    Task::none()
+                }
             }
             Message::DraftWorktreeModeSelected(mode) => {
                 if let Some(draft) = &mut self.new_session {
@@ -1287,6 +1502,10 @@ impl App {
                 Task::none()
             }
             Message::AddProjectChecked(checked) => self.apply_add_project_checked(checked),
+            Message::BranchLoaded { workspace, branch } => {
+                self.apply_branch_loaded(workspace, branch);
+                Task::none()
+            }
             Message::Composer(composer::Message::SendPressed) => {
                 let task = self.send_from_composer();
                 self.refresh_send_gate();
@@ -1468,7 +1687,7 @@ impl App {
                                 self.models_pending = false;
                             }
                         }
-                        EngineEvent::SessionsLoaded { sessions } => {
+                        EngineEvent::SessionsLoaded { sessions, usage } => {
                             if self.project_store.is_some() && self.projects_missing {
                                 let seeded = manifest_domain::seed_projects(&sessions);
                                 if !seeded.is_empty() {
@@ -1497,11 +1716,20 @@ impl App {
                                 self.select_on_load = None;
                             }
                             self.sync_visible_transcript();
-                            // Status reconciles: snapshots for unlisted
-                            // sessions drop with their rows.
+                            // Usage reconciles against the same
+                            // cumulative fold the stream carries: a
+                            // carried snapshot replaces the stored one
+                            // for its session, and sessions absent from
+                            // the carried vec keep theirs. Snapshots for
+                            // unlisted sessions still drop with their
+                            // rows.
+                            for (id, snapshot) in usage {
+                                self.usage.insert(id, snapshot);
+                            }
                             let listed: std::collections::HashSet<SessionId> =
                                 self.current_sessions().into_iter().map(|s| s.id).collect();
                             self.usage.retain(|id, _| listed.contains(id));
+                            self.sync_composer_usage();
                             // Cold start names no host until a session is
                             // listed: request the catalog now, with the
                             // selected session as its context.
@@ -1600,6 +1828,13 @@ impl App {
                                 self.running_turns.insert(session.clone(), turn);
                             }
                             self.select_on_load = Some(session.clone());
+                            // The spawn's workspace rides along for the
+                            // branch read: the list has not reloaded yet,
+                            // so the spawned session names no workspace.
+                            let spawned_workspace =
+                                self.pending_spawn.as_ref().and_then(|pending| {
+                                    pending.draft.as_ref().map(|draft| draft.workspace.clone())
+                                });
                             if self.awaiting_spawn {
                                 // The visible transcript holds this
                                 // spawn's optimistic prompt: adopt it for
@@ -1618,6 +1853,12 @@ impl App {
                             if let Some(engine) = &self.engine {
                                 engine.list_sessions();
                             }
+                            extra_task = Task::batch([
+                                extra_task,
+                                Self::branch_task_for(
+                                    spawned_workspace.or_else(|| self.visible_workspace()),
+                                ),
+                            ]);
                         }
                         EngineEvent::TurnAccepted { session, turn } => {
                             self.running.insert(session.clone());
@@ -1659,7 +1900,18 @@ impl App {
                             appended = self.transcript.push_error(message);
                         }
                         EngineEvent::Stream(event) => {
+                            // A completed visible turn may have switched
+                            // branches: re-read alongside the list sync.
+                            let refresh_branch = matches!(
+                                &event,
+                                manifest_domain::StreamEvent::TurnCompleted { session, .. }
+                                if self.is_visible(session)
+                            );
                             appended = self.apply_stream_event(event);
+                            if refresh_branch {
+                                extra_task =
+                                    Task::batch([extra_task, self.branch_task_for_visible()]);
+                            }
                         }
                     },
                 }
@@ -1728,13 +1980,14 @@ impl App {
         .spacing(SPACE_S)
         .width(Length::Fill)
         .height(Length::Fill);
-        if !self.todos.is_empty() {
+        let visible_todos: &[TodoItem] = self.visible_todos();
+        if !visible_todos.is_empty() {
             let current = self.current_todo.as_deref().unwrap_or("All done");
             let drawer: Element<'_, Message> = match self.todo_drawer {
                 TodoDrawer::Peek => {
                     kit::peek_strip(current, &self.todo_summary, Message::ToggleTodoDrawer)
                 }
-                TodoDrawer::Open => todo_drawer_view(&self.todos, current, &self.todo_summary),
+                TodoDrawer::Open => todo_drawer_view(visible_todos, current, &self.todo_summary),
             };
             main = main.push(drawer);
         }
@@ -2132,14 +2385,59 @@ fn topbar(state: &App) -> Element<'_, Message> {
             .map(|summary| summary.title.as_str())
             .unwrap_or("No session")
     };
+    // No session and no draft means no context segments: the flanks
+    // stay empty spacers around the centered title.
+    let has_context = state.new_session.is_some() || state.sessions.selected_summary().is_some();
     // The two Fill regions flanking the title share the leftover
     // width equally, so the title stays centered no matter how wide
-    // the window controls run.
-    let title_row = iced::widget::row![
+    // the window controls run. The left region names the project and
+    // branch from stored state; the view formats nothing here, only
+    // conditional text widgets (UI contract §2).
+    let left: Element<'_, Message> = if has_context {
+        let mut segments = iced::widget::row![]
+            .spacing(SPACE_S)
+            .align_y(iced::alignment::Vertical::Center);
+        if let Some(project) = state.topbar_project_name() {
+            segments = segments.push(
+                iced::widget::row![
+                    kit::icon(
+                        lucide_icons::Icon::FolderGit2,
+                        FONT_SIZE_SMALL,
+                        TEXT_SECONDARY,
+                    ),
+                    iced::widget::text(project)
+                        .size(FONT_SIZE_SMALL)
+                        .color(TEXT_SECONDARY),
+                ]
+                .spacing(SPACE_XS)
+                .align_y(iced::alignment::Vertical::Center),
+            );
+        }
+        if let Some(branch) = state.branch.as_deref() {
+            segments = segments.push(
+                iced::widget::row![
+                    kit::icon(
+                        lucide_icons::Icon::GitBranch,
+                        FONT_SIZE_SMALL,
+                        TEXT_TERTIARY,
+                    ),
+                    iced::widget::text(branch)
+                        .size(FONT_SIZE_SMALL)
+                        .color(TEXT_TERTIARY),
+                ]
+                .spacing(SPACE_XS)
+                .align_y(iced::alignment::Vertical::Center),
+            );
+        }
+        drag_region(iced::widget::container(segments).width(Length::Fill))
+    } else {
         drag_region(
             iced::widget::container(iced::widget::text("").size(FONT_SIZE_BODY))
                 .width(Length::Fill),
-        ),
+        )
+    };
+    let title_row = iced::widget::row![
+        left,
         drag_region(iced::widget::container(
             iced::widget::text(selected_title)
                 .size(FONT_SIZE_BODY)
@@ -2147,6 +2445,15 @@ fn topbar(state: &App) -> Element<'_, Message> {
         )),
         iced::widget::container({
             let mut controls = iced::widget::row![];
+            // The usage line reads the precomputed top bar string,
+            // then the connection cluster, then the window controls.
+            if has_context && let Some(usage) = state.topbar_usage.as_deref() {
+                controls = controls.push(
+                    iced::widget::text(usage)
+                        .size(FONT_SIZE_SMALL)
+                        .color(TEXT_SECONDARY),
+                );
+            }
             // Fixture mode shows no cluster; live mode names the
             // connection state and offers Retry while failed.
             if state.engine_config.is_some() {
@@ -2398,6 +2705,163 @@ mod tests {
             got.current_todo,
             Some(String::from("Move token refresh into the request path")),
         );
+    }
+
+    fn todo_entry(label: &str, done: bool) -> TodoItem {
+        TodoItem {
+            label: String::from(label),
+            done,
+        }
+    }
+
+    /// A completed `write_todos` item for `session`, as the mapper
+    /// classifies it.
+    fn todo_completed(session: &str, item_id: &str, todos: Vec<TodoItem>) -> StreamEvent {
+        StreamEvent::ItemCompleted {
+            session: SessionId::new(session),
+            turn: None,
+            view_cursor: None,
+            item: manifest_domain::StreamItem::ToolCall {
+                item_id: String::from(item_id),
+                tool: String::from("write_todos"),
+                headline: None,
+                args_json: String::new(),
+                todos: Some(todos),
+                status: manifest_domain::ItemStatus::Completed,
+                output: None,
+                failure: None,
+            },
+        }
+    }
+
+    /// A started `write_todos` item for `session`, as the mapper
+    /// classifies it.
+    fn todo_started(session: &str, item_id: &str, todos: Vec<TodoItem>) -> StreamEvent {
+        StreamEvent::ItemStarted {
+            session: SessionId::new(session),
+            turn: None,
+            view_cursor: None,
+            item: manifest_domain::StreamItem::ToolCall {
+                item_id: String::from(item_id),
+                tool: String::from("write_todos"),
+                headline: None,
+                args_json: String::new(),
+                todos: Some(todos),
+                status: manifest_domain::ItemStatus::InProgress,
+                output: None,
+                failure: None,
+            },
+        }
+    }
+
+    #[test]
+    fn todo_completed_replaces_visible_list_wholesale() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert_eq!(app.todo_summary, "0 of 0 done");
+        assert_eq!(app.current_todo, None);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![todo_entry("first", false), todo_entry("second", false)],
+        ));
+        assert_eq!(app.todo_summary, "0 of 2 done");
+        assert_eq!(app.current_todo.as_deref(), Some("first"));
+        // A second item replaces the first wholesale; no entry survives.
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-2",
+            vec![todo_entry("third", true)],
+        ));
+        assert_eq!(
+            app.todo_lists.get(&SessionId::new("s-1")),
+            Some(&vec![todo_entry("third", true)])
+        );
+        assert_eq!(app.todo_summary, "1 of 1 done");
+        assert_eq!(app.current_todo, None);
+    }
+
+    #[test]
+    fn todo_started_sets_list_before_completion_replaces_it() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_started(
+            "s-1",
+            "todo-1",
+            vec![todo_entry("first", false)],
+        ));
+        assert_eq!(app.todo_summary, "0 of 1 done");
+        assert_eq!(app.current_todo.as_deref(), Some("first"));
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![todo_entry("first", true), todo_entry("second", false)],
+        ));
+        assert_eq!(app.todo_summary, "1 of 2 done");
+        assert_eq!(app.current_todo.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn todo_update_in_background_session_waits_for_selection() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-2",
+            "todo-1",
+            vec![todo_entry("first", true), todo_entry("second", false)],
+        ));
+        // The background list stores without touching the visible drawer.
+        assert_eq!(
+            app.todo_lists.get(&SessionId::new("s-2")).map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(app.todo_summary, "0 of 0 done");
+        assert_eq!(app.current_todo, None);
+        assert!(app.visible_todos().is_empty());
+        // Selecting the session projects its stored list.
+        let _ = app.update(Message::Sessions(sessions::Message::Select(
+            SessionId::new("s-2"),
+        )));
+        assert_eq!(app.sessions.selected, SessionId::new("s-2"));
+        assert_eq!(app.todo_summary, "1 of 2 done");
+        assert_eq!(app.current_todo.as_deref(), Some("second"));
+        assert_eq!(app.visible_todos().len(), 2);
+    }
+
+    #[test]
+    fn todo_all_done_clears_current_todo() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![todo_entry("first", true), todo_entry("second", true)],
+        ));
+        assert_eq!(app.todo_summary, "2 of 2 done");
+        // No unfinished step: the view renders this as "All done".
+        assert_eq!(app.current_todo, None);
+        assert_eq!(app.visible_todos().len(), 2);
+    }
+
+    #[test]
+    fn todo_empty_list_hides_drawer_state() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![todo_entry("first", false)],
+        ));
+        assert!(!app.visible_todos().is_empty());
+        let _ = app.apply_stream_event(todo_completed("s-1", "todo-2", Vec::new()));
+        assert!(app.visible_todos().is_empty());
+        assert_eq!(app.todo_summary, "0 of 0 done");
+        assert_eq!(app.current_todo, None);
     }
 
     #[test]
@@ -2740,6 +3204,7 @@ mod tests {
             &mut app,
             engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
                 sessions: vec![live_session("s-1"), live_session("s-2")],
+                usage: Vec::new(),
             }),
         );
         assert_eq!(app.sessions.groups.len(), 1);
@@ -2885,6 +3350,7 @@ mod tests {
             &mut app,
             engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
                 sessions: vec![live_session("s-1"), live_session("s-2")],
+                usage: Vec::new(),
             }),
         );
         (app, fake)
@@ -3375,6 +3841,7 @@ mod tests {
             app,
             engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
                 sessions: ids.iter().map(|id| live_session(id)).collect(),
+                usage: Vec::new(),
             }),
         );
     }
@@ -3777,7 +4244,7 @@ mod tests {
     fn live_boot_is_empty_and_connecting() {
         let app = App::live(manifest_mcp::ServerConfig::new("fake"), None);
         assert!(app.transcript.entries.is_empty());
-        assert!(app.todos.is_empty());
+        assert!(app.todo_lists.is_empty());
         assert!(app.sessions.groups.is_empty());
         assert!(app.sessions.unprojected.is_empty());
         assert_eq!(app.connection, manifest_domain::Connection::Connecting);
@@ -4159,7 +4626,10 @@ mod tests {
     fn load_sessions(app: &mut App, sessions: Vec<manifest_domain::SessionSummary>) {
         deliver(
             app,
-            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded { sessions }),
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions,
+                usage: Vec::new(),
+            }),
         );
     }
 
@@ -4637,6 +5107,7 @@ mod tests {
                     status_session("sess-orphan", manifest_domain::SessionStatus::Orphaned),
                     live_session("s-idle"),
                 ],
+                usage: Vec::new(),
             }),
         );
     }
@@ -4701,6 +5172,7 @@ mod tests {
                     status_session("sess-orphan", manifest_domain::SessionStatus::Idle),
                     live_session("s-idle"),
                 ],
+                usage: Vec::new(),
             }),
         );
         assert!(app.composer.send_enabled);
@@ -5335,6 +5807,163 @@ mod tests {
         assert!(app.usage.is_empty());
     }
 
+    /// Loads two listed sessions with carried usage for the first.
+    fn loaded_with_carried_usage(app: &mut App) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![live_session("s-1"), live_session("s-2")],
+                usage: vec![(
+                    SessionId::new("s-1"),
+                    manifest_domain::UsageSnapshot::parse(r#"{"total": 42, "limit": 200}"#)
+                        .expect("carried usage parses"),
+                )],
+            }),
+        );
+    }
+
+    #[test]
+    fn sessions_loaded_usage_replaces_stored_snapshot() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        // Stream snapshots land first; the status reconcile replaces them.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 7}"#),
+            },
+        );
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-2"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 9}"#),
+            },
+        );
+        assert_eq!(app.usage[&SessionId::new("s-1")].used, 7);
+        loaded_with_carried_usage(&mut app);
+        // The carried snapshot replaces the stale stream value, and the
+        // visible meter follows through the existing sync path.
+        assert_eq!(app.usage[&SessionId::new("s-1")].used, 42);
+        assert_eq!(app.usage[&SessionId::new("s-1")].window, Some(200));
+        assert_eq!(app.composer.context_label, "42 / 200 · 21%");
+        assert_eq!(app.topbar_usage.as_deref(), Some("42 / 200 · 21%"));
+        // Sessions absent from the carried vec keep their snapshot.
+        assert_eq!(app.usage[&SessionId::new("s-2")].used, 9);
+    }
+
+    #[test]
+    fn sessions_loaded_without_usage_keeps_meter() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 7}"#),
+            },
+        );
+        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+        // A row without token_usage carries no entry, so the stored
+        // snapshot and both meters stay put.
+        loaded(&mut app, &["s-1"]);
+        assert_eq!(app.usage[&SessionId::new("s-1")].used, 7);
+        assert_eq!(app.composer.context_label, "7 tokens");
+        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+    }
+
+    #[test]
+    fn topbar_usage_label_formats_with_and_without_window() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert_eq!(app.topbar_usage, None);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 7}"#),
+            },
+        );
+        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 42, "limit": 200}"#),
+            },
+        );
+        assert_eq!(app.topbar_usage.as_deref(), Some("42 / 200 · 21%"));
+        assert_eq!(app.composer.context_label, "42 / 200 · 21%");
+        // A zero window is not a window: plain token count.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 5, "limit": 0}"#),
+            },
+        );
+        assert_eq!(app.topbar_usage.as_deref(), Some("5 tokens"));
+    }
+
+    #[test]
+    fn topbar_segments_follow_selection_draft_and_branch() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        // No listed session and no draft: no segments.
+        assert_eq!(app.topbar_project_name(), None);
+        assert_eq!(app.topbar_usage, None);
+        assert_eq!(app.branch, None);
+        loaded(&mut app, &["s-1", "s-2"]);
+        // The selected session's project group names the segment; the
+        // branch follows the finished read.
+        assert_eq!(app.topbar_project_name().as_deref(), Some("workspace"));
+        assert_eq!(app.branch, None);
+        let _ = app.update(Message::BranchLoaded {
+            workspace: String::from("/live/workspace"),
+            branch: Some(String::from("feature/login")),
+        });
+        assert_eq!(app.branch.as_deref(), Some("feature/login"));
+        // Draft mode names the draft's project instead.
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        assert_eq!(app.topbar_project_name().as_deref(), Some("workspace"));
+        // A selected session with an empty workspace names nothing.
+        let _ = app.update(Message::Sessions(sessions::Message::Select(
+            SessionId::new("s-1"),
+        )));
+        assert!(app.new_session.is_none());
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![workspace_session("s-9", "")],
+                usage: Vec::new(),
+            }),
+        );
+        assert_eq!(app.topbar_project_name(), None);
+    }
+
     #[test]
     fn draft_send_appends_attachment_refs_to_prompt() {
         let (mut app, fake) = live_app();
@@ -5452,5 +6081,179 @@ mod tests {
         assert_eq!(app.composer.attach_popup, composer::AttachPopup::Open);
         let _ = app.update(Message::Composer(composer::Message::AttachDismissed));
         assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
+    }
+
+    /// A scratch workspace dir under the system temp dir, unique per
+    /// test name. Removed first so reruns start clean.
+    fn temp_workspace(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manifest-branch-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch workspace");
+        dir
+    }
+
+    /// Writes `.git/HEAD` content for a plain (non-worktree) checkout.
+    fn write_head(workspace: &std::path::Path, content: &str) {
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(&git).expect("scratch .git");
+        std::fs::write(git.join("HEAD"), content).expect("scratch HEAD");
+    }
+
+    /// Loads two listed sessions in distinct workspaces; s-1 visible.
+    fn loaded_workspaces(app: &mut App, first: &str, second: &str) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![
+                    workspace_session("s-1", first),
+                    workspace_session("s-2", second),
+                ],
+                usage: Vec::new(),
+            }),
+        );
+    }
+
+    #[test]
+    fn branch_loaded_stores_for_current_workspace() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_workspaces(&mut app, "/live/first", "/live/second");
+        assert_eq!(app.visible_workspace().as_deref(), Some("/live/first"));
+        let _ = app.update(Message::BranchLoaded {
+            workspace: String::from("/live/first"),
+            branch: Some(String::from("feature/login")),
+        });
+        assert_eq!(app.branch.as_deref(), Some("feature/login"));
+        assert_eq!(app.branch_workspace.as_deref(), Some("/live/first"));
+    }
+
+    #[test]
+    fn branch_loaded_drops_stale_workspace() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_workspaces(&mut app, "/live/first", "/live/second");
+        let _ = app.update(Message::BranchLoaded {
+            workspace: String::from("/live/second"),
+            branch: Some(String::from("other")),
+        });
+        assert_eq!(app.branch, None);
+        assert_eq!(app.branch_workspace, None);
+        // A read failure for the current workspace stores `None`
+        // without touching the transcript.
+        let before = app.transcript.entries.len();
+        let _ = app.update(Message::BranchLoaded {
+            workspace: String::from("/live/first"),
+            branch: None,
+        });
+        assert_eq!(app.branch, None);
+        assert_eq!(app.branch_workspace.as_deref(), Some("/live/first"));
+        assert_eq!(app.transcript.entries.len(), before);
+    }
+
+    #[test]
+    fn select_moves_visible_workspace_and_branch_follows() {
+        let first = temp_workspace("select-first");
+        let second = temp_workspace("select-second");
+        write_head(&first, "ref: refs/heads/main\n");
+        write_head(&second, "ref: refs/heads/feature/x\n");
+        let first = first.display().to_string();
+        let second = second.display().to_string();
+
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded_workspaces(&mut app, &first, &second);
+        assert_eq!(app.visible_workspace().as_deref(), Some(first.as_str()));
+
+        // Selecting s-2 moves the visible workspace; the branch task
+        // the select fired runs `read_branch_blocking`, whose result
+        // the `BranchLoaded` arm then stores.
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-2"),
+        )));
+        assert_eq!(app.visible_workspace().as_deref(), Some(second.as_str()));
+        let branch = App::read_branch_blocking(&second);
+        assert_eq!(branch.as_deref(), Some("feature/x"));
+        let _ = app.update(Message::BranchLoaded {
+            workspace: second.clone(),
+            branch,
+        });
+        assert_eq!(app.branch.as_deref(), Some("feature/x"));
+        assert_eq!(app.branch_workspace.as_deref(), Some(second.as_str()));
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn read_branch_blocking_covers_git_layouts() {
+        // Normal branch checkout.
+        let plain = temp_workspace("read-plain");
+        write_head(&plain, "ref: refs/heads/main\n");
+        let plain = plain.display().to_string();
+        assert_eq!(App::read_branch_blocking(&plain).as_deref(), Some("main"));
+
+        // Detached HEAD shortens the hash.
+        let detached = temp_workspace("read-detached");
+        write_head(&detached, "9d3a1f2c4b5e6a7890abcdef1234567890abcdef1\n");
+        let detached = detached.display().to_string();
+        assert_eq!(
+            App::read_branch_blocking(&detached).as_deref(),
+            Some("9d3a1f2")
+        );
+
+        // Worktree checkout: `.git` is a pointer file, absolute target.
+        let target = temp_workspace("read-worktree-target");
+        write_head(&target, "ref: refs/heads/fix/retry\n");
+        let worktree = temp_workspace("read-worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}/.git\n", target.display()),
+        )
+        .expect("scratch gitdir file");
+        let worktree_str = worktree.display().to_string();
+        assert_eq!(
+            App::read_branch_blocking(&worktree_str).as_deref(),
+            Some("fix/retry")
+        );
+
+        // Worktree checkout with a target relative to the workspace.
+        let outer = temp_workspace("read-relative");
+        let real = outer.join("real");
+        std::fs::create_dir_all(real.join(".git")).expect("scratch real .git");
+        std::fs::write(real.join(".git").join("HEAD"), "ref: refs/heads/rel\n")
+            .expect("scratch HEAD");
+        let linked = outer.join("linked");
+        std::fs::create_dir_all(&linked).expect("scratch linked");
+        std::fs::write(linked.join(".git"), "gitdir: ../real/.git\n").expect("scratch gitdir file");
+        let linked_str = linked.display().to_string();
+        assert_eq!(
+            App::read_branch_blocking(&linked_str).as_deref(),
+            Some("rel")
+        );
+
+        // Missing `.git` and malformed HEAD both read as `None`.
+        let missing = temp_workspace("read-missing");
+        let missing = missing.display().to_string();
+        assert_eq!(App::read_branch_blocking(&missing), None);
+        let bad = temp_workspace("read-bad");
+        write_head(&bad, "definitely not a head\n");
+        let bad = bad.display().to_string();
+        assert_eq!(App::read_branch_blocking(&bad), None);
+
+        for dir in [
+            &plain,
+            &detached,
+            &worktree_str,
+            &linked_str,
+            &missing,
+            &bad,
+        ] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let _ = std::fs::remove_dir_all(outer.display().to_string());
+        let _ = std::fs::remove_dir_all(target.display().to_string());
     }
 }
