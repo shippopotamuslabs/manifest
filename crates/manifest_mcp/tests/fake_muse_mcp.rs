@@ -282,6 +282,36 @@ fn emit_spawn_stream(stdout: &mut std::io::StdoutLock<'_>, prompt: &str) {
     );
 }
 
+/// Echo text for a spawn or turn call: the `prompt` field, or the
+/// `/selector arguments` rendering of the first skill part when the
+/// call sent `parts` instead of `prompt`.
+fn echo_text(arguments: &serde_json::Value) -> String {
+    if let Some(prompt) = arguments.get("prompt").and_then(serde_json::Value::as_str)
+        && !prompt.is_empty()
+    {
+        return prompt.to_string();
+    }
+    let part = arguments
+        .get("parts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let selector = part
+        .get("selector")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let args = part
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if args.is_empty() {
+        format!("/{selector}")
+    } else {
+        format!("/{selector} {args}")
+    }
+}
+
 /// Short follow-up stream for `muse_turn`: prompt echo, one streaming
 /// agent message, and the turn close-out.
 fn emit_turn_stream(stdout: &mut std::io::StdoutLock<'_>, session: &str, prompt: &str) {
@@ -605,10 +635,7 @@ fn main() {
                         );
                         continue;
                     }
-                    let prompt = arguments
-                        .get("prompt")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
+                    let prompt = echo_text(&arguments);
                     tool_result(
                         &mut out,
                         &call_id,
@@ -620,7 +647,7 @@ fn main() {
                         .to_string(),
                         false,
                     );
-                    emit_spawn_stream(&mut out, prompt);
+                    emit_spawn_stream(&mut out, &prompt);
                     continue;
                 }
                 if tool == "muse_turn" {
@@ -628,10 +655,7 @@ fn main() {
                         .get("session_id")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("fake-session-1");
-                    let prompt = arguments
-                        .get("prompt")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
+                    let prompt = echo_text(&arguments);
                     tool_result(
                         &mut out,
                         &call_id,
@@ -643,7 +667,7 @@ fn main() {
                         .to_string(),
                         false,
                     );
-                    emit_turn_stream(&mut out, session, prompt);
+                    emit_turn_stream(&mut out, session, &prompt);
                     continue;
                 }
                 if tool == "muse_pending" {
@@ -732,6 +756,31 @@ fn main() {
                         &mut out,
                         &call_id,
                         &serde_json::json!({"outcome": "answered"}).to_string(),
+                        false,
+                    );
+                    continue;
+                }
+                if tool == "muse_skills" {
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({"skills": [
+                            {
+                                "selector": "review",
+                                "display_name": "Review",
+                                "description": "Reviews code",
+                                "source": "user",
+                                "plugin_id": "pr-tools",
+                                "argument_hint": "<pr>",
+                            },
+                            {
+                                "selector": "summarize",
+                                "display_name": "Summarize",
+                                "description": "Summarizes the thread",
+                                "source": "bundled",
+                            },
+                        ]})
+                        .to_string(),
                         false,
                     );
                     continue;

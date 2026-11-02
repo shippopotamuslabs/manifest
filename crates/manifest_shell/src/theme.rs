@@ -90,9 +90,9 @@ pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 pub const COMPOSER_MAX_LINES: usize = 5;
 pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
-// Composer input text padding: twice the bar's tight step, so the text
+// Composer input text padding: triple the bar's tight step, so the text
 // breathes inside the bar. Kit reads this token; call sites name no value.
-pub const COMPOSER_INPUT_PADDING: f32 = 8.0;
+pub const COMPOSER_INPUT_PADDING: f32 = 12.0;
 // Fixed width of the add-project popup.
 pub const POPUP_WIDTH: f32 = 480.0;
 // Fixed width of the floating permission popup. The widest row is the
@@ -141,6 +141,10 @@ pub fn attach_menu_bottom_offset(visible_lines: usize) -> f32 {
             + 2.0 * SPACE_XS)
         + SPACE_S
 }
+// Fixed width of the floating slash-menu card above the composer.
+// The card carries a source icon, the selector, and a one-line
+// description per row, so it runs wider than the model card.
+pub const SLASH_POPUP_WIDTH: f32 = 420.0;
 // Fixed max height of the scrollable catalog list inside the model
 // card, so a long catalog never grows the popup unbounded.
 pub const MODEL_LIST_MAX_HEIGHT: f32 = 240.0;

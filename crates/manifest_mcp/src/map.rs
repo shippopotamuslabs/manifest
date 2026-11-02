@@ -9,10 +9,10 @@
 
 use crate::error::Error;
 use manifest_domain::{
-    ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
-    PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
-    SessionStatus, SessionSummary, StreamEvent, StreamItem, TodoItem, TurnId, UsageKind,
-    UsageSnapshot,
+    ApprovalChoiceSummary, ApprovalRequest, EngineEvent, GoalInfo, GoalStatus, ItemStatus,
+    ModelInfo, PendingKind, PendingPhase, PendingRequest, Question, QuestionOption,
+    QuestionRequest, SessionId, SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem,
+    TodoItem, TodoStatus, TurnId, UsageKind, UsageSnapshot,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -177,12 +177,13 @@ fn is_todo_tool(tool: &str) -> bool {
 /// Parsed todo list from raw toolCall args JSON.
 ///
 /// Returns `Some` only for the todo tool carrying a `$.todos` array of
-/// `{text, status}` entries, with `done` from the snake_case entry
-/// status (`completed` is done; `pending`, `in_progress`, and the
-/// schema's `cancelled` are not). Anything else — another tool, empty
-/// or malformed JSON, a missing or non-array `todos`, an entry without
-/// string `text`/`status`, or an unrecognized status — is `None`:
-/// an expected shape the shell ignores, never a whole-item failure.
+/// `{text, status}` entries, with [`TodoStatus`] from the snake_case
+/// entry status (`completed` is done; `in_progress` is in progress;
+/// `pending` waits; `cancelled` is dropped). Anything else — another
+/// tool, empty or malformed JSON, a missing or non-array `todos`, an
+/// entry without string `text`/`status`, or an unrecognized status —
+/// is `None`: an expected shape the shell ignores, never a
+/// whole-item failure.
 fn parse_todo_list(tool: &str, args_json: &str) -> Option<Vec<TodoItem>> {
     if !is_todo_tool(tool) {
         return None;
@@ -195,14 +196,16 @@ fn parse_todo_list(tool: &str, args_json: &str) -> Option<Vec<TodoItem>> {
     let mut todos = Vec::with_capacity(entries.len());
     for entry in &entries {
         let label = entry.get("text")?.as_str()?;
-        let done = match entry.get("status")?.as_str()? {
-            "completed" => true,
-            "pending" | "in_progress" | "cancelled" => false,
+        let status = match entry.get("status")?.as_str()? {
+            "completed" => TodoStatus::Done,
+            "in_progress" => TodoStatus::InProgress,
+            "pending" => TodoStatus::Pending,
+            "cancelled" => TodoStatus::Cancelled,
             _ => return None,
         };
         todos.push(TodoItem {
             label: label.to_string(),
-            done,
+            status,
         });
     }
     Some(todos)
@@ -219,6 +222,36 @@ fn unwrap_output(raw: &str) -> String {
         return text.to_string();
     }
     raw.to_string()
+}
+
+/// Parse one host goal block into a [`GoalInfo`].
+///
+/// `objective` is required and non-empty (a malformed block, like the
+/// other required wire fields, fails the event); `percentComplete`
+/// must be a JSON number and rides verbatim, even past 100 (the
+/// renderer clamps). `status` parses leniently with
+/// [`GoalStatus::parse`], defaulting to an empty [`GoalStatus::Other`]
+/// when absent; `currentWork` and `nextWork` ride when present.
+fn parse_goal(block: &Value) -> Result<GoalInfo, String> {
+    let objective = match block.get("objective").and_then(Value::as_str) {
+        Some(objective) if !objective.is_empty() => objective.to_string(),
+        _ => return Err(String::from("stream event is missing goal objective")),
+    };
+    let percent_complete = match block.get("percentComplete").and_then(Value::as_f64) {
+        Some(percent) => percent,
+        None => return Err(String::from("stream event is missing goal percent")),
+    };
+    Ok(GoalInfo {
+        objective,
+        percent_complete,
+        status: block
+            .get("status")
+            .and_then(Value::as_str)
+            .map(GoalStatus::parse)
+            .unwrap_or(GoalStatus::Other(String::new())),
+        current_work: opt_string(block, "currentWork"),
+        next_work: opt_string(block, "nextWork"),
+    })
 }
 
 /// Wire status text into an [`ItemStatus`]; unknown or absent stays a value.
@@ -243,7 +276,10 @@ fn item_text(item: &Value, key: &str) -> String {
 /// Parse one wire item object into a [`StreamItem`].
 ///
 /// `itemId` is required; `kind` decides the variant. `reminderChild`
-/// classifies as system bookkeeping; any other unknown kind stays an
+/// classifies as system bookkeeping; `compaction` classifies as a
+/// [`StreamItem::Compaction`] whose terminal outcome and reason ride
+/// as values (failures after admission arrive as the item's terminal
+/// event, never as wire errors). Any other unknown kind stays an
 /// [`StreamItem::Unknown`] value, never a silent drop.
 fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
     let item_id = match item.get("itemId").and_then(Value::as_str) {
@@ -308,6 +344,13 @@ fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
         "reminderChild" => Ok(StreamItem::System {
             item_id,
             kind: kind.to_string(),
+        }),
+        "compaction" => Ok(StreamItem::Compaction {
+            item_id,
+            outcome: field_str(item, "outcome").map(String::from),
+            reason: field_str(item, "reason").map(String::from),
+            tokens_before: item.get("tokensBefore").and_then(Value::as_u64),
+            tokens_after: item.get("tokensAfter").and_then(Value::as_u64),
         }),
         _ => Ok(StreamItem::Unknown {
             item_id,
@@ -430,6 +473,20 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
                 kind,
                 phase,
             }))
+        }
+        "catalog-changed" => {
+            let session = SessionId::new(req_string(params, "sessionId")?);
+            Ok(Some(StreamEvent::CatalogChanged { session }))
+        }
+        "goal-changed" => {
+            let session = SessionId::new(req_string(params, "sessionId")?);
+            let goal = match params.get("goal") {
+                // An absent or explicit-null goal clears the session's
+                // goal, mirroring the host's nullable Goal block.
+                None | Some(Value::Null) => None,
+                Some(block) => Some(parse_goal(block)?),
+            };
+            Ok(Some(StreamEvent::GoalChanged { session, goal }))
         }
         _ => Ok(None),
     }
@@ -825,6 +882,76 @@ pub(crate) fn map_models_result(result: &Value) -> Result<Vec<ModelInfo>, String
         });
     }
     Ok(models)
+}
+
+/// Map a `muse_skills` catalog result into domain catalog values.
+///
+/// The content text parses as the catalog object: a `skills` array
+/// whose rows carry `selector`, `display_name`, `description`,
+/// `source`, `plugin_id`, and `argument_hint` (the server's
+/// snake_case names). Rows with a missing or empty `selector` cannot
+/// round-trip as a skill part, so they are skipped; an absent
+/// `display_name` falls back to the selector (see
+/// [`SkillInfo::label`); `description` and `source` default to empty
+/// and `plugin_id`/`argument_hint` default to absent. A
+/// server-authored `isError` body passes through as the failure text;
+/// anything else that does not parse fails with the friendly generic
+/// message.
+pub(crate) fn map_skills_result(result: &Value) -> Result<Vec<SkillInfo>, String> {
+    let generic = "Couldn't load the skill catalog from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let rows = match body.get("skills").and_then(Value::as_array) {
+        Some(rows) => rows,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let mut skills = Vec::new();
+    for row in rows {
+        let selector = match row.get("selector").and_then(Value::as_str) {
+            Some(selector) if !selector.is_empty() => selector.to_string(),
+            _ => continue,
+        };
+        let display_name = row
+            .get("display_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&selector)
+            .to_string();
+        skills.push(SkillInfo {
+            display_name,
+            description: row
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            source: row
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            plugin_id: row
+                .get("plugin_id")
+                .and_then(Value::as_str)
+                .map(String::from),
+            argument_hint: row
+                .get("argument_hint")
+                .and_then(Value::as_str)
+                .map(String::from),
+            selector,
+        });
+    }
+    Ok(skills)
 }
 
 /// Map a `muse_models` session-resume result into the resumed session.
@@ -1681,19 +1808,19 @@ mod tests {
                             label: String::from(
                                 "create the file task-one.txt containing the word alpha"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                         TodoItem {
                             label: String::from(
                                 "create the file task-two.txt containing the word beta"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                         TodoItem {
                             label: String::from(
                                 "create the file task-three.txt containing the word gamma"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                     ]),
                     status: ItemStatus::InProgress,
@@ -1706,7 +1833,7 @@ mod tests {
     }
 
     /// Mid-turn capture shape: `completed`/`in_progress`/`pending`
-    /// entry statuses map to done/not-done.
+    /// entry statuses map to `Done`/`InProgress`/`Pending`.
     #[test]
     fn stream_write_todos_completed_maps_snake_case_statuses() {
         let args = serde_json::to_string(&json!({"todos": [
@@ -1735,8 +1862,12 @@ mod tests {
                 StreamItem::ToolCall { todos, output, .. } => {
                     let todos = todos.expect("todo tool carries todos");
                     assert_eq!(
-                        todos.iter().map(|todo| todo.done).collect::<Vec<_>>(),
-                        vec![true, false, false]
+                        todos.iter().map(|todo| todo.status).collect::<Vec<_>>(),
+                        vec![
+                            TodoStatus::Done,
+                            TodoStatus::InProgress,
+                            TodoStatus::Pending
+                        ]
                     );
                     assert_eq!(
                         todos[0].label,
@@ -1779,7 +1910,7 @@ mod tests {
                     todos,
                     Some(vec![TodoItem {
                         label: String::from("a step"),
-                        done: true,
+                        status: TodoStatus::Done,
                     }])
                 ),
                 other => panic!("wrong item: {other:?}"),
@@ -1916,6 +2047,94 @@ mod tests {
                 StreamItem::Unknown {
                     item_id: String::from("x-2"),
                     kind: String::from("from-the-future"),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_completed_carries_outcome_and_tokens() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-1",
+                "kind": "compaction",
+                "status": "completed",
+                "outcome": "compacted",
+                "trigger": "manual",
+                "tokensBefore": 48210,
+                "tokensAfter": 3912,
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-1"),
+                    outcome: Some(String::from("compacted")),
+                    reason: None,
+                    tokens_before: Some(48210),
+                    tokens_after: Some(3912),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_failed_carries_outcome_and_reason() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-2",
+                "kind": "compaction",
+                "status": "failed",
+                "outcome": "failed",
+                "reason": "summarizer_failed",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-2"),
+                    outcome: Some(String::from("failed")),
+                    reason: Some(String::from("summarizer_failed")),
+                    tokens_before: None,
+                    tokens_after: None,
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_started_without_outcome_is_in_progress() {
+        let event = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {"itemId": "c-3", "kind": "compaction", "turnId": "t"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-3"),
+                    outcome: None,
+                    reason: None,
+                    tokens_before: None,
+                    tokens_after: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),
@@ -2149,5 +2368,205 @@ mod tests {
         assert_eq!(map_models_result(&no_models), Err(String::from(generic)));
         let empty = json!({"content": [], "isError": true});
         assert_eq!(map_models_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn skills_result_maps_catalog_rows_in_order() {
+        let body = serde_json::to_string(&json!({
+            "skills": [
+                {
+                    "selector": "review",
+                    "display_name": "Review",
+                    "description": "Reviews code",
+                    "source": "user",
+                    "plugin_id": "pr-tools",
+                    "argument_hint": "<pr>",
+                },
+                {"selector": "bare"},
+            ],
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let skills = map_skills_result(&result).expect("catalog parses");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].selector, "review");
+        assert_eq!(skills[0].label(), "Review");
+        assert_eq!(skills[0].description, "Reviews code");
+        assert_eq!(skills[0].source, "user");
+        assert_eq!(skills[0].plugin_id.as_deref(), Some("pr-tools"));
+        assert_eq!(skills[0].argument_hint.as_deref(), Some("<pr>"));
+        assert_eq!(skills[1].selector, "bare");
+        assert_eq!(skills[1].label(), "bare");
+        assert_eq!(skills[1].description, String::new());
+        assert_eq!(skills[1].source, String::new());
+        assert_eq!(skills[1].plugin_id, None);
+        assert_eq!(skills[1].argument_hint, None);
+    }
+
+    #[test]
+    fn skills_result_skips_rows_without_usable_selectors() {
+        let body = serde_json::to_string(&json!({
+            "skills": [
+                {"display_name": "No selector"},
+                {"selector": ""},
+                {"selector": 7},
+                {"selector": "kept", "display_name": "Kept", "source": "project"},
+            ],
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let skills = map_skills_result(&result).expect("catalog parses");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].selector, "kept");
+        assert_eq!(skills[0].source, "project");
+    }
+
+    #[test]
+    fn skills_result_failures_carry_server_or_generic_text() {
+        let generic = "Couldn't load the skill catalog from the Muse MCP server.";
+        let server = json!({
+            "content": [{"type": "text", "text": "skills requires session_id"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_skills_result(&server),
+            Err(String::from("skills requires session_id"))
+        );
+        let garbage = json!({"content": [{"type": "text", "text": "not json"}]});
+        assert_eq!(map_skills_result(&garbage), Err(String::from(generic)));
+        let no_skills =
+            json!({"content": [{"type": "text", "text": "{\"provider_id\":\"muse\"}"}]});
+        assert_eq!(map_skills_result(&no_skills), Err(String::from(generic)));
+        let empty = json!({"content": [], "isError": true});
+        assert_eq!(map_skills_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn stream_goal_changed_maps_full_block() {
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {
+                "objective": "Ship the slice",
+                "percentComplete": 42,
+                "status": "active",
+                "currentWork": "Wiring the mapper",
+                "nextWork": "Writing tests",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: Some(GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: GoalStatus::Active,
+                    current_work: Some(String::from("Wiring the mapper")),
+                    next_work: Some(String::from("Writing tests")),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn stream_goal_changed_null_clears() {
+        // An explicit-null goal clears the session's goal.
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": null,
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: None,
+            }
+        );
+        // An absent goal clears too.
+        let event = map_stream_event(&json!({"type": "goal-changed", "sessionId": "sess-1"}))
+            .expect("ok")
+            .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_goal_changed_carries_over_100_verbatim() {
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "Ship it", "percentComplete": 150, "status": "weird"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::GoalChanged {
+                goal: Some(goal), ..
+            } => {
+                assert_eq!(goal.percent_complete, 150.0);
+                assert_eq!(goal.clamped_percent(), 100.0);
+                assert_eq!(goal.status, GoalStatus::Other(String::from("weird")));
+                assert_eq!(goal.current_work, None);
+            }
+            other => panic!("expected a goal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_goal_changed_malformed_block_is_err() {
+        // Missing or empty objective fails, like the other required
+        // wire fields.
+        let missing_objective = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"percentComplete": 10, "status": "active"},
+        });
+        assert!(map_stream_event(&missing_objective).is_err());
+        let empty_objective = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "", "percentComplete": 10},
+        });
+        assert!(map_stream_event(&empty_objective).is_err());
+        let missing_percent = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "Ship it"},
+        });
+        assert!(map_stream_event(&missing_percent).is_err());
+        let missing_session = json!({
+            "type": "goal-changed",
+            "goal": {"objective": "Ship it", "percentComplete": 10},
+        });
+        assert!(map_stream_event(&missing_session).is_err());
+    }
+
+    #[test]
+    fn stream_catalog_changed_maps_to_session_event() {
+        let event = map_stream_event(&json!({
+            "type": "catalog-changed",
+            "sessionId": "sess-1",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::CatalogChanged {
+                session: SessionId::new("sess-1"),
+            }
+        );
+        let missing = map_stream_event(&json!({"type": "catalog-changed"}));
+        assert!(missing.is_err());
     }
 }

@@ -248,6 +248,37 @@ fn friendly_unknown(kind: &str) -> String {
     format!("Unhandled item kind: {kind}")
 }
 
+/// Friendly note text for a compaction item. The terminal outcome and
+/// reason ride as values (failures after admission arrive as this
+/// item's terminal event), so they render here, never as a drop. A
+/// missing outcome means the item is still in progress.
+fn friendly_compaction(
+    outcome: &Option<String>,
+    reason: &Option<String>,
+    tokens_before: &Option<u64>,
+    tokens_after: &Option<u64>,
+) -> String {
+    match outcome.as_deref() {
+        Some("compacted") => match (tokens_before, tokens_after) {
+            (Some(before), Some(after)) => {
+                format!("Context compacted · {before} → {after} tokens")
+            }
+            _ => String::from("Context compacted"),
+        },
+        Some("noop") => match reason {
+            Some(reason) => format!("Compaction not needed ({reason})"),
+            None => String::from("Compaction not needed"),
+        },
+        Some("failed") => match reason {
+            Some(reason) => format!("Compaction failed: {reason}"),
+            None => String::from("Compaction failed"),
+        },
+        Some("cancelled") => String::from("Compaction cancelled"),
+        Some(other) => format!("Compaction finished ({other})"),
+        None => String::from("Compacting context…"),
+    }
+}
+
 /// The summary sentences as one block for rendering and measuring.
 fn reasoning_text(summary: &[String]) -> String {
     summary.join("\n")
@@ -271,6 +302,7 @@ fn entry_matches(entry: &Entry, item: &StreamItem) -> bool {
             | (EntryKind::Assistant { .. }, StreamItem::AgentMessage { .. })
             | (EntryKind::Reasoning { .. }, StreamItem::Reasoning { .. })
             | (EntryKind::Tool { .. }, StreamItem::ToolCall { .. })
+            | (EntryKind::Note { .. }, StreamItem::Compaction { .. })
             | (EntryKind::Note { .. }, StreamItem::Unknown { .. })
     )
 }
@@ -304,6 +336,15 @@ fn entry_from_item(item: &StreamItem, completed: bool) -> Option<Entry> {
             failure: failure.clone(),
         },
         StreamItem::System { .. } => return None,
+        StreamItem::Compaction {
+            outcome,
+            reason,
+            tokens_before,
+            tokens_after,
+            ..
+        } => EntryKind::Note {
+            text: friendly_compaction(outcome, reason, tokens_before, tokens_after),
+        },
         StreamItem::Unknown { kind, .. } => EntryKind::Note {
             text: friendly_unknown(kind),
         },
@@ -631,6 +672,18 @@ impl State {
                     (EntryKind::Note { text }, StreamItem::Unknown { kind, .. }) => {
                         *text = friendly_unknown(kind);
                     }
+                    (
+                        EntryKind::Note { text },
+                        StreamItem::Compaction {
+                            outcome,
+                            reason,
+                            tokens_before,
+                            tokens_after,
+                            ..
+                        },
+                    ) => {
+                        *text = friendly_compaction(outcome, reason, tokens_before, tokens_after);
+                    }
                     _ => {
                         if let Some(fresh) = entry_from_item(&item, true) {
                             entry.kind = fresh.kind;
@@ -876,6 +929,18 @@ fn refresh_entry(entry: &mut Entry, item: &StreamItem) {
             if !next.is_empty() {
                 *summary = next.clone();
             }
+        }
+        (
+            EntryKind::Note { text },
+            StreamItem::Compaction {
+                outcome,
+                reason,
+                tokens_before,
+                tokens_after,
+                ..
+            },
+        ) => {
+            *text = friendly_compaction(outcome, reason, tokens_before, tokens_after);
         }
         (
             EntryKind::Tool {
@@ -1308,6 +1373,29 @@ mod tests {
         }
     }
 
+    fn compaction_item(
+        id: &str,
+        outcome: Option<&str>,
+        reason: Option<&str>,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+    ) -> StreamItem {
+        StreamItem::Compaction {
+            item_id: String::from(id),
+            outcome: outcome.map(String::from),
+            reason: reason.map(String::from),
+            tokens_before,
+            tokens_after,
+        }
+    }
+
+    fn note_text(state: &State) -> &str {
+        match &state.entries[0].kind {
+            EntryKind::Note { text } => text,
+            other => panic!("expected a note entry, got {other:?}"),
+        }
+    }
+
     #[test]
     fn short_text_stays_on_one_line() {
         assert_eq!(wrapped_lines("Hello", 600.0), 1);
@@ -1723,6 +1811,69 @@ mod tests {
         state.item_completed(unknown_item("x-1"));
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries[0].completed);
+    }
+
+    #[test]
+    fn compaction_compacted_renders_token_counts() {
+        let mut state = State::default();
+        state.item_started(compaction_item("c-1", None, None, None, None));
+        assert_eq!(note_text(&state), "Compacting context…");
+        assert!(!state.entries[0].completed);
+        state.item_completed(compaction_item(
+            "c-1",
+            Some("compacted"),
+            None,
+            Some(48210),
+            Some(3912),
+        ));
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(note_text(&state), "Context compacted · 48210 → 3912 tokens");
+        assert!(state.entries[0].completed);
+    }
+
+    #[test]
+    fn compaction_failed_renders_reason() {
+        let mut state = State::default();
+        state.item_completed(compaction_item(
+            "c-2",
+            Some("failed"),
+            Some("summarizer_failed"),
+            None,
+            None,
+        ));
+        assert_eq!(note_text(&state), "Compaction failed: summarizer_failed");
+        assert!(state.entries[0].completed);
+    }
+
+    #[test]
+    fn compaction_noop_cancelled_and_open_outcomes_render() {
+        for (id, item, want) in [
+            (
+                "c-3",
+                compaction_item(
+                    "c-3",
+                    Some("noop"),
+                    Some("no_compactable_history"),
+                    None,
+                    None,
+                ),
+                "Compaction not needed (no_compactable_history)",
+            ),
+            (
+                "c-4",
+                compaction_item("c-4", Some("cancelled"), None, None, None),
+                "Compaction cancelled",
+            ),
+            (
+                "c-5",
+                compaction_item("c-5", Some("pruned"), None, None, None),
+                "Compaction finished (pruned)",
+            ),
+        ] {
+            let mut state = State::default();
+            state.item_completed(item);
+            assert_eq!(note_text(&state), want, "outcome note for {id}");
+        }
     }
 
     #[test]

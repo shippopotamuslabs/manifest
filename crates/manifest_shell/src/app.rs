@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length, Task};
 use manifest_domain::{
-    Connection, EffortChoice, EngineEvent, Fixture, ModelChoice, PermissionMode, ProjectId,
-    ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
-    StreamItem, TodoItem, TurnId, UsageSnapshot, WorktreeChoice,
+    Connection, EffortChoice, EngineEvent, Fixture, GoalInfo, ModelChoice, PermissionMode,
+    ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
+    StreamItem, TodoItem, TodoStatus, TurnId, UsageSnapshot, WorktreeChoice,
 };
 
 use crate::engine;
@@ -286,6 +286,11 @@ pub struct App {
     /// cleared on `ModelsLoaded` (or on the models-tagged
     /// `CommandFailed` that marks the catalog failed, or on disconnect).
     pub models_pending: bool,
+    /// A skill-catalog request for the visible session is in flight.
+    /// Set on each request, cleared on the visible session's
+    /// `SkillsLoaded` (or on its skills-tagged `CommandFailed` that
+    /// marks the catalog failed, or on disconnect).
+    pub skills_pending: bool,
     /// Branch shown in the top bar for the visible workspace;
     /// `None` while unread or unreadable. Display only: never used to
     /// switch branches.
@@ -295,6 +300,10 @@ pub struct App {
     /// Todo list per session, replaced wholesale by each `write_todos`
     /// stream item; the drawer renders the visible session's entry.
     pub todo_lists: HashMap<SessionId, Vec<TodoItem>>,
+    /// Goal per session, replaced wholesale by each `goal-changed`
+    /// stream event (`None` when the host cleared it); the composer
+    /// strip renders the visible session's entry.
+    pub goals: HashMap<SessionId, Option<GoalInfo>>,
     /// Whether the TODO drawer is a peek strip or open.
     pub todo_drawer: TodoDrawer,
     /// Current width of the side panel; the divider drag rewrites it.
@@ -356,14 +365,14 @@ impl App {
         let fixture_pending = fixture.pending.clone();
         let fixture_settled = fixture.settled_pending.clone();
         let seed_fallback = fixture.sessions.first().map(|summary| summary.id.clone());
-        let done = fixture.todos.iter().filter(|todo| todo.done).count();
-        let total = fixture.todos.len();
-        let todo_summary = format!("{done} of {total} done");
-        let current_todo = fixture
+        let done = fixture
             .todos
             .iter()
-            .find(|todo| !todo.done)
-            .map(|todo| todo.label.clone());
+            .filter(|todo| todo.status.is_done())
+            .count();
+        let total = fixture.todos.len();
+        let todo_summary = format!("{done} of {total} done");
+        let current_todo = current_todo_label(&fixture.todos);
         let mut app = App {
             sessions: sessions::State::from_projects(fixture.projects, fixture.sessions),
             transcript: transcript::State::from_items(fixture.transcript),
@@ -380,9 +389,11 @@ impl App {
             pending: pending::State::default(),
             composer: composer::State::new(),
             models_pending: false,
+            skills_pending: false,
             branch: None,
             branch_workspace: None,
             todo_lists: HashMap::new(),
+            goals: HashMap::new(),
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
@@ -455,6 +466,7 @@ impl App {
         app.pending = pending::State::default();
         app.visible_session = None;
         app.todo_lists = HashMap::new();
+        app.goals = HashMap::new();
         app.todo_summary = String::from("0 of 0 done");
         app.current_todo = None;
         app.connection = Connection::Connecting;
@@ -503,6 +515,7 @@ impl App {
             }
             self.visible_session = None;
             self.sync_composer_usage();
+            self.sync_composer_goal();
             self.sync_visible_todos();
             return;
         }
@@ -515,6 +528,7 @@ impl App {
         }
         self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
         self.sync_composer_usage();
+        self.sync_composer_goal();
         self.sync_visible_todos();
     }
 
@@ -728,6 +742,22 @@ impl App {
         }
     }
 
+    /// Requests the skill catalog for the visible session when no
+    /// request is in flight. Called on session-list loads and session
+    /// selects, alongside the model-catalog request: the catalog
+    /// belongs to the visible session, and re-selecting re-lists it.
+    /// The single writer of [`App::skills_pending`] beside the event
+    /// arms and the catalog-changed hint.
+    fn request_skills_for_visible(&mut self) {
+        if self.skills_pending || self.connection != Connection::Connected {
+            return;
+        }
+        if let (Some(session), Some(engine)) = (self.visible_session.clone(), &self.engine) {
+            engine.list_skills(session);
+            self.skills_pending = true;
+        }
+    }
+
     /// Requests the model catalog for the selected session when the
     /// catalog is still loading and no request is in flight. Called on
     /// session-list loads: cold start has no host until a session (or a
@@ -847,11 +877,8 @@ impl App {
             .and_then(|session| self.todo_lists.get(session))
         {
             Some(todos) => {
-                let done = todos.iter().filter(|todo| todo.done).count();
-                let current = todos
-                    .iter()
-                    .find(|todo| !todo.done)
-                    .map(|todo| todo.label.clone());
+                let done = todos.iter().filter(|todo| todo.status.is_done()).count();
+                let current = current_todo_label(todos);
                 (done, todos.len(), current)
             }
             None => (0, 0, None),
@@ -875,6 +902,24 @@ impl App {
                 self.sync_visible_todos();
             }
         }
+    }
+
+    /// The visible session's goal, when the store holds one. A
+    /// missing entry and a stored clear both read as no goal.
+    fn visible_goal(&self) -> Option<&GoalInfo> {
+        self.visible_session
+            .as_ref()
+            .and_then(|session| self.goals.get(session))
+            .and_then(|goal| goal.as_ref())
+    }
+
+    /// Points the composer's goal strip at the visible session's
+    /// stored goal. Called after goal events and transcript syncs;
+    /// the composer precomputes the strip strings, so the view reads
+    /// without formatting.
+    fn sync_composer_goal(&mut self) {
+        let goal = self.visible_goal().cloned();
+        self.composer.set_goal(goal.as_ref());
     }
 
     /// Points the composer's usage meter at the visible session's
@@ -1161,9 +1206,9 @@ impl App {
         self.save_projects_task()
     }
 
-    /// Spawns a session in the given workspace with the draft prompt:
+    /// Spawns a session in the given workspace with the draft input:
     /// the shared tail of the draft spawn and the no-selection cwd
-    /// fallback. Echoes the prompt optimistically, clears the draft,
+    /// fallback. Echoes the input optimistically, clears the draft,
     /// and marks the spawn in flight until `SessionSpawned` adopts it.
     /// Keeps the taken draft (when the spawn came from one) and the
     /// prompt so a failure can restore them for retry.
@@ -1171,12 +1216,13 @@ impl App {
         &mut self,
         draft: Option<NewSessionDraft>,
         workspace: String,
-        prompt: String,
+        input: manifest_domain::TurnInput,
         choices: SpawnChoices,
     ) -> Task<Message> {
         if let Some(engine) = self.engine.clone() {
-            engine.spawn_session(workspace, prompt.clone(), choices);
+            engine.spawn_session(workspace, input.clone(), choices);
         }
+        let prompt = input.display_text();
         self.pending_spawn = Some(PendingSpawn {
             draft,
             prompt: prompt.clone(),
@@ -1190,13 +1236,17 @@ impl App {
     /// Routes the composer send button press. In order: fixture mode
     /// is a no-op with the draft untouched; a blank draft sends
     /// nothing; while not connected the visible transcript gains a
-    /// friendly note and the draft stays; a new-session draft spawns
-    /// into its project workspace; a listed selection sends a
-    /// follow-up turn unless one is already in flight (steering the
-    /// running turn there instead); otherwise the draft spawns a
-    /// session in the process working directory with the shown picker
-    /// state. Every send carries the composed prompt: the draft text
-    /// with attached path refs appended as ref lines.
+    /// friendly note and the draft stays; a slash draft folds through
+    /// [`manifest_domain::parse_slash_draft`] first (builtins open the
+    /// model menu, compact the session, or set its goal instead of
+    /// sending; a ready catalog skill sends as a skill turn); a
+    /// new-session draft spawns into its project workspace; a listed
+    /// selection sends a follow-up turn unless one is already in
+    /// flight (steering the running turn there instead, always as
+    /// plain text); otherwise the draft spawns a session in the
+    /// process working directory with the shown picker state. Every
+    /// send carries the composed prompt: the draft text with attached
+    /// path refs appended as ref lines.
     /// Sends echo the prompt optimistically, clear the draft, and
     /// snap the transcript to the end.
     fn send_from_composer(&mut self) -> Task<Message> {
@@ -1206,11 +1256,52 @@ impl App {
         if self.composer.content.text().trim().is_empty() {
             return Task::none();
         }
-        let prompt = self.composer.composed_prompt();
         if self.connection != Connection::Connected || self.engine.is_none() {
             let appended = self.transcript.push_error(not_connected_message());
             return scroll_transcript_to_end(appended);
         }
+        // Slash behavior resolves before spawn/turn/steer routing.
+        let draft = self.composer.content.text();
+        let skills: Vec<manifest_domain::SkillInfo> = match &self.composer.skill_catalog {
+            composer::SkillCatalog::Ready(skills) => skills.clone(),
+            composer::SkillCatalog::Loading | composer::SkillCatalog::Failed(_) => Vec::new(),
+        };
+        match manifest_domain::parse_slash_draft(&draft, &skills) {
+            manifest_domain::DraftAction::Text => {}
+            manifest_domain::DraftAction::Skill(invocation) => {
+                return self.send_turn_input(skill_input_with_refs(
+                    invocation,
+                    &self.composer.attachments,
+                ));
+            }
+            manifest_domain::DraftAction::OpenModelMenu => {
+                self.composer.model_menu = composer::ModelMenu::Open;
+                return Task::none();
+            }
+            manifest_domain::DraftAction::Compact => {
+                return self.dispatch_compact();
+            }
+            manifest_domain::DraftAction::SetGoal(objective) => {
+                return self.dispatch_goal(objective);
+            }
+            manifest_domain::DraftAction::KeepDraft => {
+                // `/goal` with no objective: send nothing, keep the
+                // draft so the objective can be typed.
+                return Task::none();
+            }
+        }
+        let prompt = self.composer.composed_prompt();
+        self.send_turn_input(manifest_domain::TurnInput::Text(prompt))
+    }
+
+    /// Sends one resolved turn input through the spawn/turn/steer
+    /// routing: a new-session draft spawns into its project workspace;
+    /// a listed selection sends a follow-up turn unless one is already
+    /// in flight (steering the running turn there instead, always as
+    /// the composed plain-text prompt); otherwise the input spawns a
+    /// session in the process working directory with the shown picker
+    /// state.
+    fn send_turn_input(&mut self, input: manifest_domain::TurnInput) -> Task<Message> {
         if self.new_session.is_some() {
             let choices = self
                 .new_session
@@ -1225,13 +1316,15 @@ impl App {
             }
             let draft = self.new_session.take().expect("draft checked above");
             let workspace = draft.workspace.clone();
-            return self.spawn_session(Some(draft), workspace, prompt, choices);
+            return self.spawn_session(Some(draft), workspace, input, choices);
         }
         if let Some(summary) = self.sessions.selected_summary() {
             let session = summary.id.clone();
             if self.running.contains(&session) {
                 // Steer: the visible session is mid-turn, so the draft
-                // joins it instead of starting a new one.
+                // joins it instead of starting a new one. Steers stay
+                // plain text, even for slash drafts.
+                let prompt = self.composer.composed_prompt();
                 let Some(turn) = self.running_turns.get(&session).cloned() else {
                     let appended = self.transcript.push_error(no_running_turn_message());
                     return scroll_transcript_to_end(appended);
@@ -1244,9 +1337,9 @@ impl App {
                 return transcript::scroll_to_end().map(Message::Transcript);
             }
             if let Some(engine) = self.engine.clone() {
-                engine.send_turn(session.clone(), prompt.clone());
+                engine.send_turn(session.clone(), input.clone());
             }
-            self.transcript.push_user(prompt);
+            self.transcript.push_user(input.display_text());
             self.running.insert(session);
             self.composer.clear();
             return transcript::scroll_to_end().map(Message::Transcript);
@@ -1268,7 +1361,45 @@ impl App {
             effort: self.composer.effort,
             permission: self.composer.permission,
         };
-        self.spawn_session(None, workspace, prompt, choices)
+        self.spawn_session(None, workspace, input, choices)
+    }
+
+    /// Compacts the visible session (`/compact` follow-through).
+    /// Without a visible session the draft is kept and the transcript
+    /// explains; otherwise the engine compacts and the draft clears
+    /// like a send. Failures arrive as `CommandFailed(Compact)` on the
+    /// transcript channel every command failure already uses.
+    fn dispatch_compact(&mut self) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self
+                .transcript
+                .push_error(String::from("There is no visible session to compact yet."));
+            return scroll_transcript_to_end(appended);
+        };
+        if let Some(engine) = self.engine.clone() {
+            engine.compact_session(session);
+        }
+        self.composer.clear();
+        Task::none()
+    }
+
+    /// Sets the visible session's goal (`/goal` follow-through).
+    /// Without a visible session the draft is kept and the transcript
+    /// explains; otherwise the engine sets the goal and the draft
+    /// clears like a send. Failures arrive as `CommandFailed(Goal)` on
+    /// the transcript channel every command failure already uses.
+    fn dispatch_goal(&mut self, objective: String) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self.transcript.push_error(String::from(
+                "There is no visible session to set a goal for yet.",
+            ));
+            return scroll_transcript_to_end(appended);
+        };
+        if let Some(engine) = self.engine.clone() {
+            engine.set_goal(session, objective);
+        }
+        self.composer.clear();
+        Task::none()
     }
 
     /// Stops the running turn of the selected session: cancels it on
@@ -1404,6 +1535,32 @@ impl App {
                 }
                 false
             }
+            StreamEvent::CatalogChanged { session } => {
+                // Hint only: the list is the source of truth. Re-list
+                // the visible session's catalog when it reports a
+                // change; other sessions' hints are ignored, and a
+                // request already in flight is never doubled.
+                if self.is_visible(&session)
+                    && !self.skills_pending
+                    && self.connection == Connection::Connected
+                    && let Some(engine) = &self.engine
+                {
+                    engine.list_skills(session);
+                    self.skills_pending = true;
+                }
+                false
+            }
+            StreamEvent::GoalChanged { session, goal } => {
+                // Source of truth, not a hint: replaces the session's
+                // stored goal wholesale (`None` clears it). Only the
+                // visible session's strip refreshes; background
+                // sessions' goals wait for their select sync.
+                self.goals.insert(session.clone(), goal);
+                if self.is_visible(&session) {
+                    self.sync_composer_goal();
+                }
+                false
+            }
         }
     }
 
@@ -1456,6 +1613,11 @@ impl App {
                         engine.resume_session(id.clone());
                         self.resuming.insert(id);
                     }
+                }
+                if select {
+                    // The sync above moved the visible transcript: the
+                    // composer's catalog belongs to the new session.
+                    self.request_skills_for_visible();
                 }
                 self.refresh_send_gate();
                 if select {
@@ -1685,6 +1847,7 @@ impl App {
                                 // the connection; the next list load
                                 // re-requests it with fresh context.
                                 self.models_pending = false;
+                                self.skills_pending = false;
                             }
                         }
                         EngineEvent::SessionsLoaded { sessions, usage } => {
@@ -1714,6 +1877,11 @@ impl App {
                             {
                                 self.sessions.update(sessions::Message::Select(spawned));
                                 self.select_on_load = None;
+                                // The direct update above bypasses the
+                                // select arm, so the fresh selection's
+                                // catalog is listed here (usually a
+                                // no-op: the adoption already asked).
+                                self.request_skills_for_visible();
                             }
                             self.sync_visible_transcript();
                             // Usage reconciles against the same
@@ -1734,6 +1902,18 @@ impl App {
                             // listed: request the catalog now, with the
                             // selected session as its context.
                             self.request_models_for_selection();
+                            // The skill catalog follows the visible
+                            // session, which the sync above just set.
+                            // Only while it never loaded: routine list
+                            // refreshes must not re-list a ready
+                            // catalog, and navigation re-lists through
+                            // the select arm below.
+                            if matches!(
+                                self.composer.skill_catalog,
+                                composer::SkillCatalog::Loading
+                            ) {
+                                self.request_skills_for_visible();
+                            }
                         }
                         EngineEvent::SessionsLoadFailed(message) => {
                             appended = self.transcript.push_error(message);
@@ -1742,6 +1922,19 @@ impl App {
                             self.models_pending = false;
                             self.composer
                                 .set_catalog(composer::ModelCatalog::Ready(models));
+                        }
+                        EngineEvent::SkillsLoaded { session, skills } => {
+                            // The catalog belongs to the session it was
+                            // listed for: only the visible session's
+                            // load lands in the composer. A background
+                            // session's load is ignored (re-listed on
+                            // select), so it never clobbers the
+                            // visible rows.
+                            if self.is_visible(&session) {
+                                self.skills_pending = false;
+                                self.composer
+                                    .set_skill_catalog(composer::SkillCatalog::Ready(skills));
+                            }
                         }
                         EngineEvent::CommandFailed { command, message } => {
                             // Every failure shows in the transcript;
@@ -1779,10 +1972,25 @@ impl App {
                                     self.running_turns.remove(&session);
                                 }
                                 manifest_domain::FailedCommand::Steer(_)
-                                | manifest_domain::FailedCommand::Cancel(_) => {
-                                    // The turn is still running; its
-                                    // stream (TurnCompleted) is what
-                                    // clears running.
+                                | manifest_domain::FailedCommand::Cancel(_)
+                                | manifest_domain::FailedCommand::Compact(_)
+                                | manifest_domain::FailedCommand::Goal(_) => {
+                                    // The turn is still running (or no
+                                    // turn state was taken); its stream
+                                    // (TurnCompleted) is what clears
+                                    // running. The transcript line above
+                                    // carries the failure.
+                                }
+                                manifest_domain::FailedCommand::Skills(session) => {
+                                    // Only the visible session owns the
+                                    // composer's catalog: a background
+                                    // session's failure never marks it.
+                                    if self.is_visible(&session) && self.skills_pending {
+                                        self.skills_pending = false;
+                                        self.composer.set_skill_catalog(
+                                            composer::SkillCatalog::Failed(message),
+                                        );
+                                    }
                                 }
                                 manifest_domain::FailedCommand::PendingFetch => {
                                     // No loaded card owns a global fetch
@@ -1847,6 +2055,14 @@ impl App {
                                 self.awaiting_spawn = false;
                                 self.pending_spawn = None;
                                 self.sync_composer_usage();
+                                self.sync_composer_goal();
+                                // The fresh session owns a catalog: list
+                                // it now that the visible session names
+                                // a host. Any in-flight load belongs to
+                                // the previous session and lands
+                                // ignored, so its gate resets here.
+                                self.skills_pending = false;
+                                self.request_skills_for_visible();
                             } else {
                                 self.sync_visible_transcript();
                             }
@@ -1933,6 +2149,7 @@ impl App {
                     self.connection = Connection::Connecting;
                     self.connection_attempt += 1;
                     self.models_pending = false;
+                    self.skills_pending = false;
                 }
                 self.refresh_send_gate();
                 Task::none()
@@ -2066,6 +2283,13 @@ impl App {
         }
         if let Some(popup) = self.composer.context_popover_overlay() {
             stack = stack.push(context_popover_overlay_layer(popup.map(Message::Composer)));
+        }
+        if let Some(menu) = self.composer.slash_menu_overlay() {
+            stack = stack.push(slash_menu_overlay_layer(
+                menu.map(Message::Composer),
+                self.panel_width,
+                self.composer.visible_lines,
+            ));
         }
         if let Some(popup) = self.sessions.add_project_view() {
             stack = stack.push(kit::scrim(popup.map(Message::Sessions)));
@@ -2252,6 +2476,27 @@ fn attach_menu_overlay_layer<'a>(
         .into()
 }
 
+/// A skill invocation carrying the composer's attachment refs: refs
+/// append as `[ref: path]` lines after the parsed arguments, mirroring
+/// how [`composer::State::composed_prompt`] appends them to plain
+/// text. Without attachments the invocation rides unchanged.
+fn skill_input_with_refs(
+    mut invocation: manifest_domain::SkillInvocation,
+    attachments: &[String],
+) -> manifest_domain::TurnInput {
+    let mut arguments = invocation.arguments;
+    for path in attachments {
+        if !arguments.is_empty() {
+            arguments.push('\n');
+        }
+        arguments.push_str("[ref: ");
+        arguments.push_str(path);
+        arguments.push(']');
+    }
+    invocation.arguments = arguments;
+    manifest_domain::TurnInput::Skill(invocation)
+}
+
 /// The floating context popup layer: a transparent click-away
 /// catcher covering the window behind the card, and the card itself
 /// anchored bottom-right. The card's right edge lines up with the
@@ -2281,6 +2526,52 @@ fn context_popover_overlay_layer<'a>(popup: Element<'a, Message>) -> Element<'a,
         .width(Length::Fill)
         .height(Length::Fill),
         iced::widget::Space::new().width(Length::Fixed(SPACE_M)),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The floating slash-menu layer: a transparent click-away catcher
+/// covering the window behind the card, and the card itself anchored
+/// bottom-left. The card's left edge lines up with the main column's
+/// left edge: the side panel, the divider hit width, and the main
+/// container's padding. Its bottom edge floats just above the composer
+/// input bar — the slash trigger's bar, which sits above the sub-bar —
+/// via [`attach_menu_bottom_offset`] for the composer's visible line
+/// count, the same anchor the attach menu uses. The catcher carries no
+/// fill, so nothing beneath the card dims, and a press anywhere
+/// outside the card dismisses the menu without reflowing anything
+/// beneath it.
+fn slash_menu_overlay_layer<'a>(
+    menu: Element<'a, Message>,
+    panel_width: f32,
+    visible_lines: usize,
+) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::SlashDismiss));
+    let card = iced::widget::row![
+        iced::widget::Space::new().width(Length::Fixed(panel_width + DIVIDER_HIT_WIDTH + SPACE_M)),
+        iced::widget::column![
+            iced::widget::container(menu)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Left)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new()
+                .height(Length::Fixed(attach_menu_bottom_offset(visible_lines))),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -2565,9 +2856,25 @@ fn worktree_bar_view(draft: &NewSessionDraft) -> Element<'_, Message> {
     bar.into()
 }
 
+/// The drawer's current step: the first in-progress entry, else
+/// the first pending one. Cancelled and done entries are never
+/// current; a list with neither in-progress nor pending entries has
+/// no current step, which the view renders as "All done".
+fn current_todo_label(todos: &[TodoItem]) -> Option<String> {
+    todos
+        .iter()
+        .find(|todo| todo.status == TodoStatus::InProgress)
+        .or_else(|| todos.iter().find(|todo| todo.status == TodoStatus::Pending))
+        .map(|todo| todo.label.clone())
+}
+
 /// The open TODO drawer: a panel whose first row is the shared bar
-/// header, followed by one line per todo with finished steps in the
-/// tertiary tone. Plain text lines — no extra widget kinds.
+/// header, followed by one line per todo: a leading status icon
+/// (check-in-circle for finished steps, play-in-circle while in
+/// progress, empty circle for pending or cancelled ones) beside the
+/// label in full width. Finished and cancelled rows read in the
+/// tertiary tone; pending and in-progress rows read in the primary
+/// tone.
 fn todo_drawer_view<'a>(
     todos: &'a [TodoItem],
     current: &'a str,
@@ -2581,24 +2888,23 @@ fn todo_drawer_view<'a>(
     .spacing(SPACE_S)
     .width(Length::Fill);
     for todo in todos {
-        // No string building in the view (UI contract §2): the done
-        // marker is a static label beside the borrowed todo text.
-        let (marker, color) = if todo.done {
-            ("Done", TEXT_TERTIARY)
-        } else {
-            ("Todo", TEXT_PRIMARY)
+        // No string building in the view (UI contract §2): the status
+        // icon is a static mapping beside the borrowed todo text.
+        let color = match todo.status {
+            TodoStatus::Done | TodoStatus::Cancelled => TEXT_TERTIARY,
+            TodoStatus::Pending | TodoStatus::InProgress => TEXT_PRIMARY,
         };
         list = list.push(
             iced::widget::container(
                 iced::widget::row![
-                    iced::widget::text(marker)
-                        .size(FONT_SIZE_SMALL)
-                        .color(color),
+                    kit::icon(kit::todo_status_icon(todo.status), FONT_SIZE_SMALL, color),
                     iced::widget::text(todo.label.as_str())
                         .size(FONT_SIZE_SMALL)
-                        .color(color),
+                        .color(color)
+                        .width(Length::Fill),
                 ]
-                .spacing(SPACE_S),
+                .spacing(SPACE_S)
+                .align_y(iced::alignment::Vertical::Center),
             )
             .width(Length::Fill),
         );
@@ -2707,10 +3013,10 @@ mod tests {
         );
     }
 
-    fn todo_entry(label: &str, done: bool) -> TodoItem {
+    fn todo_entry(label: &str, status: TodoStatus) -> TodoItem {
         TodoItem {
             label: String::from(label),
-            done,
+            status,
         }
     }
 
@@ -2764,7 +3070,10 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Pending),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         assert_eq!(app.todo_summary, "0 of 2 done");
         assert_eq!(app.current_todo.as_deref(), Some("first"));
@@ -2772,11 +3081,11 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-2",
-            vec![todo_entry("third", true)],
+            vec![todo_entry("third", TodoStatus::Done)],
         ));
         assert_eq!(
             app.todo_lists.get(&SessionId::new("s-1")),
-            Some(&vec![todo_entry("third", true)])
+            Some(&vec![todo_entry("third", TodoStatus::Done)])
         );
         assert_eq!(app.todo_summary, "1 of 1 done");
         assert_eq!(app.current_todo, None);
@@ -2790,14 +3099,17 @@ mod tests {
         let _ = app.apply_stream_event(todo_started(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false)],
+            vec![todo_entry("first", TodoStatus::Pending)],
         ));
         assert_eq!(app.todo_summary, "0 of 1 done");
         assert_eq!(app.current_todo.as_deref(), Some("first"));
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         assert_eq!(app.todo_summary, "1 of 2 done");
         assert_eq!(app.current_todo.as_deref(), Some("second"));
@@ -2811,7 +3123,10 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-2",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         // The background list stores without touching the visible drawer.
         assert_eq!(
@@ -2839,12 +3154,51 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", true)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Done),
+            ],
         ));
         assert_eq!(app.todo_summary, "2 of 2 done");
         // No unfinished step: the view renders this as "All done".
         assert_eq!(app.current_todo, None);
         assert_eq!(app.visible_todos().len(), 2);
+    }
+
+    #[test]
+    fn todo_in_progress_is_current_ahead_of_pending() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![
+                todo_entry("waiting", TodoStatus::Pending),
+                todo_entry("working", TodoStatus::InProgress),
+                todo_entry("dropped", TodoStatus::Cancelled),
+            ],
+        ));
+        assert_eq!(app.todo_summary, "0 of 3 done");
+        assert_eq!(app.current_todo.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn todo_cancelled_never_becomes_current() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![
+                todo_entry("finished", TodoStatus::Done),
+                todo_entry("dropped", TodoStatus::Cancelled),
+            ],
+        ));
+        assert_eq!(app.todo_summary, "1 of 2 done");
+        // No in-progress or pending step: the view renders "All done".
+        assert_eq!(app.current_todo, None);
     }
 
     #[test]
@@ -2855,7 +3209,7 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false)],
+            vec![todo_entry("first", TodoStatus::Pending)],
         ));
         assert!(!app.visible_todos().is_empty());
         let _ = app.apply_stream_event(todo_completed("s-1", "todo-2", Vec::new()));
@@ -3030,13 +3384,25 @@ mod tests {
     #[derive(Clone)]
     struct FakeEngine {
         calls: std::sync::Arc<std::sync::Mutex<usize>>,
-        spawns:
-            std::sync::Arc<std::sync::Mutex<Vec<(String, String, manifest_domain::SpawnChoices)>>>,
-        turns: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
+        spawns: std::sync::Arc<
+            std::sync::Mutex<
+                Vec<(
+                    String,
+                    manifest_domain::TurnInput,
+                    manifest_domain::SpawnChoices,
+                )>,
+            >,
+        >,
+        turns: std::sync::Arc<
+            std::sync::Mutex<Vec<(manifest_domain::SessionId, manifest_domain::TurnInput)>>,
+        >,
         resumes: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         steers: std::sync::Arc<std::sync::Mutex<Vec<SteerCall>>>,
         cancels: std::sync::Arc<std::sync::Mutex<Vec<CancelCall>>>,
         models: std::sync::Arc<std::sync::Mutex<Vec<ModelsCall>>>,
+        skills: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        compacts: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        goals: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
         fetches: std::sync::Arc<std::sync::Mutex<usize>>,
         decides: std::sync::Arc<std::sync::Mutex<Vec<DecideCall>>>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<AnswerCall>>>,
@@ -3050,17 +3416,21 @@ mod tests {
         fn spawn_session(
             &self,
             workspace: String,
-            prompt: String,
+            input: manifest_domain::TurnInput,
             choices: manifest_domain::SpawnChoices,
         ) {
             self.spawns
                 .lock()
                 .unwrap()
-                .push((workspace, prompt, choices));
+                .push((workspace, input, choices));
         }
 
-        fn send_turn(&self, session: manifest_domain::SessionId, prompt: String) {
-            self.turns.lock().unwrap().push((session, prompt));
+        fn send_turn(
+            &self,
+            session: manifest_domain::SessionId,
+            input: manifest_domain::TurnInput,
+        ) {
+            self.turns.lock().unwrap().push((session, input));
         }
 
         fn resume_session(&self, session: manifest_domain::SessionId) {
@@ -3090,6 +3460,18 @@ mod tests {
             session: Option<manifest_domain::SessionId>,
         ) {
             self.models.lock().unwrap().push((workspace, session));
+        }
+
+        fn list_skills(&self, session: manifest_domain::SessionId) {
+            self.skills.lock().unwrap().push(session);
+        }
+
+        fn compact_session(&self, session: manifest_domain::SessionId) {
+            self.compacts.lock().unwrap().push(session);
+        }
+
+        fn set_goal(&self, session: manifest_domain::SessionId, objective: String) {
+            self.goals.lock().unwrap().push((session, objective));
         }
 
         fn fetch_pending(&self) {
@@ -3132,6 +3514,9 @@ mod tests {
             steers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             cancels: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            compacts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             fetches: std::sync::Arc::new(std::sync::Mutex::new(0)),
             decides: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             answers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4261,7 +4646,10 @@ mod tests {
         send_pressed(&mut app);
         assert_eq!(
             *fake.turns.lock().unwrap(),
-            vec![(SessionId::new("s-1"), String::from("hello"))]
+            vec![(
+                SessionId::new("s-1"),
+                manifest_domain::TurnInput::Text(String::from("hello"))
+            )]
         );
         assert!(fake.spawns.lock().unwrap().is_empty());
         assert_eq!(user_entries(&app), vec!["hello"]);
@@ -4306,6 +4694,368 @@ mod tests {
         assert!(!app.composer.send_enabled);
     }
 
+    /// One catalog skill for the slash tests.
+    fn review_skill() -> manifest_domain::SkillInfo {
+        manifest_domain::SkillInfo {
+            selector: String::from("review"),
+            display_name: String::from("Review"),
+            description: String::from("Reviews code"),
+            source: String::from("user"),
+            plugin_id: None,
+            argument_hint: None,
+        }
+    }
+
+    /// A connected app with one listed session and its skill catalog
+    /// loaded, as the subscription would deliver it.
+    fn slash_app() -> (App, FakeEngine) {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert_eq!(
+            *fake.skills.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "the list load requests the visible session's catalog"
+        );
+        assert!(app.skills_pending);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SkillsLoaded {
+                session: SessionId::new("s-1"),
+                skills: vec![review_skill()],
+            }),
+        );
+        (app, fake)
+    }
+
+    #[test]
+    fn skills_loaded_for_visible_sets_ready() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.skills_pending);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SkillsLoaded {
+                session: SessionId::new("s-1"),
+                skills: vec![review_skill()],
+            }),
+        );
+        assert!(!app.skills_pending);
+        assert_eq!(
+            app.composer.skill_catalog,
+            composer::SkillCatalog::Ready(vec![review_skill()])
+        );
+    }
+
+    #[test]
+    fn skills_loaded_for_other_session_does_not_clobber() {
+        let (mut app, fake) = slash_app();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SkillsLoaded {
+                session: SessionId::new("s-2"),
+                skills: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            app.composer.skill_catalog,
+            composer::SkillCatalog::Ready(vec![review_skill()])
+        );
+        assert!(!app.skills_pending);
+        assert_eq!(
+            *fake.skills.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "no re-list follows an ignored load"
+        );
+    }
+
+    #[test]
+    fn skills_failed_for_visible_marks_failed() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.skills_pending);
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Skills(SessionId::new("s-1")),
+            "skills broke",
+        );
+        assert!(!app.skills_pending);
+        assert_eq!(
+            app.composer.skill_catalog,
+            composer::SkillCatalog::Failed(String::from("skills broke"))
+        );
+    }
+
+    #[test]
+    fn send_slash_skill_records_skill_turn_and_clears_draft() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/review fix it");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.turns.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                manifest_domain::TurnInput::Skill(manifest_domain::SkillInvocation {
+                    selector: String::from("review"),
+                    source: Some(String::from("user")),
+                    arguments: String::from("fix it"),
+                })
+            )]
+        );
+        assert_eq!(user_entries(&app), vec!["/review fix it"]);
+        assert_eq!(app.composer.content.text(), "");
+    }
+
+    #[test]
+    fn plain_send_with_ready_catalog_stays_text() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "hello");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.turns.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                manifest_domain::TurnInput::Text(String::from("hello"))
+            )]
+        );
+    }
+
+    #[test]
+    fn unknown_slash_sends_text() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/nope fix it");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.turns.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                manifest_domain::TurnInput::Text(String::from("/nope fix it"))
+            )]
+        );
+    }
+
+    #[test]
+    fn goal_changed_shows_visible_goal_in_composer() {
+        let (mut app, _) = slash_app();
+        assert!(app.composer.goal_display.is_none());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: Some(String::from("Wiring the mapper")),
+                    next_work: None,
+                }),
+            },
+        );
+        let display = app.composer.goal_display.as_ref().expect("strip shows");
+        assert_eq!(display.objective, "Ship the slice");
+        assert_eq!(display.percent, 42.0);
+        assert_eq!(display.percent_label, "42%");
+        assert_eq!(
+            display.current_work,
+            Some(String::from("Wiring the mapper"))
+        );
+    }
+
+    #[test]
+    fn goal_changed_for_other_session_does_not_clobber_visible() {
+        let (mut app, _) = slash_app();
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-9"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Other work"),
+                    percent_complete: 10.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+        assert!(app.composer.goal_display.is_none());
+        assert_eq!(
+            app.goals
+                .get(&SessionId::new("s-9"))
+                .and_then(|goal| goal.as_ref())
+                .map(|goal| goal.objective.as_str()),
+            Some("Other work")
+        );
+    }
+
+    #[test]
+    fn goal_changed_clear_removes_the_strip() {
+        let (mut app, _) = slash_app();
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+        assert!(app.composer.goal_display.is_some());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: None,
+            },
+        );
+        assert!(app.composer.goal_display.is_none());
+    }
+
+    #[test]
+    fn catalog_changed_relits_visible_once() {
+        let (mut app, fake) = slash_app();
+        assert_eq!(fake.skills.lock().unwrap().len(), 1);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::CatalogChanged {
+                session: SessionId::new("s-1"),
+            },
+        );
+        assert_eq!(
+            *fake.skills.lock().unwrap(),
+            vec![SessionId::new("s-1"), SessionId::new("s-1")]
+        );
+        assert!(app.skills_pending);
+        // A second hint while the re-list is in flight doubles nothing.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::CatalogChanged {
+                session: SessionId::new("s-1"),
+            },
+        );
+        assert_eq!(fake.skills.lock().unwrap().len(), 2);
+        // Other sessions' hints are ignored.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::CatalogChanged {
+                session: SessionId::new("s-9"),
+            },
+        );
+        assert_eq!(fake.skills.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn send_model_opens_menu_without_sending() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/model");
+        send_pressed(&mut app);
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert!(fake.spawns.lock().unwrap().is_empty());
+        assert_eq!(app.composer.model_menu, composer::ModelMenu::Open);
+        assert_eq!(app.composer.content.text(), "/model");
+    }
+
+    #[test]
+    fn send_compact_compacts_visible_and_clears_draft() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/compact");
+        send_pressed(&mut app);
+        assert_eq!(*fake.compacts.lock().unwrap(), vec![SessionId::new("s-1")]);
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert_eq!(app.composer.content.text(), "");
+    }
+
+    #[test]
+    fn send_goal_sets_objective_and_clears_draft() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/goal ship the slice");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.goals.lock().unwrap(),
+            vec![(SessionId::new("s-1"), String::from("ship the slice"))]
+        );
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert_eq!(app.composer.content.text(), "");
+    }
+
+    #[test]
+    fn send_bare_goal_keeps_draft_and_sends_nothing() {
+        let (mut app, fake) = slash_app();
+        type_composer_text(&mut app, "/goal");
+        send_pressed(&mut app);
+        assert!(fake.goals.lock().unwrap().is_empty());
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert_eq!(app.composer.content.text(), "/goal");
+    }
+
+    #[test]
+    fn selecting_another_session_relits_its_catalog() {
+        let (mut app, fake) = slash_app();
+        // A routine list refresh never re-lists a ready catalog.
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(
+            *fake.skills.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "no re-list on refresh"
+        );
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            SessionId::new("s-2"),
+        )));
+        assert_eq!(
+            *fake.skills.lock().unwrap(),
+            vec![SessionId::new("s-1"), SessionId::new("s-2")]
+        );
+        assert!(app.skills_pending);
+    }
+
+    #[test]
+    fn steer_with_slash_draft_stays_text() {
+        let (mut app, fake) = slash_app();
+        start_turn(&mut app, "s-1", "turn-7");
+        type_composer_text(&mut app, "/review fix it");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.steers.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("/review fix it"),
+                manifest_domain::TurnId::new("turn-7")
+            )]
+        );
+        assert!(fake.turns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compact_and_goal_failures_surface_on_transcript() {
+        let (mut app, _) = slash_app();
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Compact(SessionId::new("s-1")),
+            "compact broke",
+        );
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Goal(SessionId::new("s-1")),
+            "goal broke",
+        );
+        let errors: Vec<&str> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::Error { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(errors.contains(&"compact broke"));
+        assert!(errors.contains(&"goal broke"));
+    }
+
     #[test]
     fn spawn_path_records_workspace_and_adopts_on_spawned() {
         let (mut app, fake) = live_app();
@@ -4318,7 +5068,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 workspace,
-                String::from("start me"),
+                manifest_domain::TurnInput::Text(String::from("start me")),
                 manifest_domain::SpawnChoices::default()
             )]
         );
@@ -4448,7 +5198,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("fresh idea"),
+                manifest_domain::TurnInput::Text(String::from("fresh idea")),
                 manifest_domain::SpawnChoices::default()
             )]
         );
@@ -5236,7 +5986,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("build it"),
+                manifest_domain::TurnInput::Text(String::from("build it")),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Existing {
                         path: String::from("/tmp/wt-x"),
@@ -5257,7 +6007,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("build it"),
+                manifest_domain::TurnInput::Text(String::from("build it")),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Create {
                         base: Some(String::from("main")),
@@ -5278,7 +6028,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("build it"),
+                manifest_domain::TurnInput::Text(String::from("build it")),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Create { base: None },
                     ..Default::default()
@@ -5343,7 +6093,7 @@ mod tests {
             vec![
                 (
                     String::from("/live/workspace"),
-                    String::from("build it"),
+                    manifest_domain::TurnInput::Text(String::from("build it")),
                     manifest_domain::SpawnChoices {
                         worktree: manifest_domain::WorktreeChoice::Existing {
                             path: String::from("/tmp/wt-x"),
@@ -5353,7 +6103,7 @@ mod tests {
                 ),
                 (
                     String::from("/live/workspace"),
-                    String::from("build it"),
+                    manifest_domain::TurnInput::Text(String::from("build it")),
                     manifest_domain::SpawnChoices::default()
                 ),
             ]
@@ -5381,7 +6131,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 workspace,
-                String::from("start me"),
+                manifest_domain::TurnInput::Text(String::from("start me")),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Off,
                     model: manifest_domain::ModelChoice::Named(String::from("muse-spark")),
@@ -5730,7 +6480,7 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("fresh idea"),
+                manifest_domain::TurnInput::Text(String::from("fresh idea")),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Off,
                     model: manifest_domain::ModelChoice::Named(String::from("muse-spark")),
@@ -5978,7 +6728,9 @@ mod tests {
             *fake.spawns.lock().unwrap(),
             vec![(
                 String::from("/live/workspace"),
-                String::from("fresh idea\n[ref: /work/notes.md]"),
+                manifest_domain::TurnInput::Text(
+                    String::from("fresh idea\n[ref: /work/notes.md]",)
+                ),
                 manifest_domain::SpawnChoices::default()
             )]
         );
@@ -6003,7 +6755,7 @@ mod tests {
             *fake.turns.lock().unwrap(),
             vec![(
                 SessionId::new("s-1"),
-                String::from("hello\n[ref: /work/notes.md]")
+                manifest_domain::TurnInput::Text(String::from("hello\n[ref: /work/notes.md]"))
             )]
         );
     }

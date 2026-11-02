@@ -114,13 +114,34 @@ pub enum TranscriptItem {
     ErrorNote { text: String },
 }
 
+/// Lifecycle status of one checklist entry, matching the four
+/// statuses of the `write_todos` tool schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    /// Waiting to start.
+    Pending,
+    /// Actively being worked on.
+    InProgress,
+    /// Finished.
+    Done,
+    /// Dropped without finishing.
+    Cancelled,
+}
+
+impl TodoStatus {
+    /// Whether the step counts as finished.
+    pub fn is_done(self) -> bool {
+        matches!(self, TodoStatus::Done)
+    }
+}
+
 /// One checklist entry the agent works through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoItem {
     /// Short human description of the step.
     pub label: String,
-    /// Whether the step is finished.
-    pub done: bool,
+    /// Lifecycle status of the step.
+    pub status: TodoStatus,
 }
 
 /// The whole fixture: projects, sessions, one visible transcript, and todos.
@@ -288,19 +309,19 @@ pub fn fixture() -> Fixture {
         todos: vec![
             TodoItem {
                 label: String::from("Reproduce the expired-token failure"),
-                done: true,
+                status: TodoStatus::Done,
             },
             TodoItem {
                 label: String::from("Move token refresh into the request path"),
-                done: false,
+                status: TodoStatus::InProgress,
             },
             TodoItem {
                 label: String::from("Apply the patch after approval"),
-                done: false,
+                status: TodoStatus::Pending,
             },
             TodoItem {
                 label: String::from("Rerun the checkout sync suite"),
-                done: false,
+                status: TodoStatus::Pending,
             },
         ],
         pending: vec![
@@ -564,8 +585,9 @@ mod tests {
         let got = fixture();
         assert!(got.transcript.len() >= 4);
         assert!(got.todos.len() >= 3);
-        assert!(got.todos.iter().any(|t| t.done));
-        assert!(got.todos.iter().any(|t| !t.done));
+        assert!(got.todos.iter().any(|t| t.status == TodoStatus::Done));
+        assert!(got.todos.iter().any(|t| t.status == TodoStatus::InProgress));
+        assert!(got.todos.iter().any(|t| t.status == TodoStatus::Pending));
     }
 
     #[test]
