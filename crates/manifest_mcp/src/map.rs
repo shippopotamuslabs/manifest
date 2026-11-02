@@ -11,8 +11,8 @@ use crate::error::Error;
 use manifest_domain::{
     ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
     PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
-    SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem, TodoItem, TurnId, UsageKind,
-    UsageSnapshot,
+    SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem, TodoItem, TodoStatus,
+    TurnId, UsageKind, UsageSnapshot,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -177,12 +177,13 @@ fn is_todo_tool(tool: &str) -> bool {
 /// Parsed todo list from raw toolCall args JSON.
 ///
 /// Returns `Some` only for the todo tool carrying a `$.todos` array of
-/// `{text, status}` entries, with `done` from the snake_case entry
-/// status (`completed` is done; `pending`, `in_progress`, and the
-/// schema's `cancelled` are not). Anything else — another tool, empty
-/// or malformed JSON, a missing or non-array `todos`, an entry without
-/// string `text`/`status`, or an unrecognized status — is `None`:
-/// an expected shape the shell ignores, never a whole-item failure.
+/// `{text, status}` entries, with [`TodoStatus`] from the snake_case
+/// entry status (`completed` is done; `in_progress` is in progress;
+/// `pending` waits; `cancelled` is dropped). Anything else — another
+/// tool, empty or malformed JSON, a missing or non-array `todos`, an
+/// entry without string `text`/`status`, or an unrecognized status —
+/// is `None`: an expected shape the shell ignores, never a
+/// whole-item failure.
 fn parse_todo_list(tool: &str, args_json: &str) -> Option<Vec<TodoItem>> {
     if !is_todo_tool(tool) {
         return None;
@@ -195,14 +196,16 @@ fn parse_todo_list(tool: &str, args_json: &str) -> Option<Vec<TodoItem>> {
     let mut todos = Vec::with_capacity(entries.len());
     for entry in &entries {
         let label = entry.get("text")?.as_str()?;
-        let done = match entry.get("status")?.as_str()? {
-            "completed" => true,
-            "pending" | "in_progress" | "cancelled" => false,
+        let status = match entry.get("status")?.as_str()? {
+            "completed" => TodoStatus::Done,
+            "in_progress" => TodoStatus::InProgress,
+            "pending" => TodoStatus::Pending,
+            "cancelled" => TodoStatus::Cancelled,
             _ => return None,
         };
         todos.push(TodoItem {
             label: label.to_string(),
-            done,
+            status,
         });
     }
     Some(todos)
@@ -1755,19 +1758,19 @@ mod tests {
                             label: String::from(
                                 "create the file task-one.txt containing the word alpha"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                         TodoItem {
                             label: String::from(
                                 "create the file task-two.txt containing the word beta"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                         TodoItem {
                             label: String::from(
                                 "create the file task-three.txt containing the word gamma"
                             ),
-                            done: false,
+                            status: TodoStatus::Pending,
                         },
                     ]),
                     status: ItemStatus::InProgress,
@@ -1780,7 +1783,7 @@ mod tests {
     }
 
     /// Mid-turn capture shape: `completed`/`in_progress`/`pending`
-    /// entry statuses map to done/not-done.
+    /// entry statuses map to `Done`/`InProgress`/`Pending`.
     #[test]
     fn stream_write_todos_completed_maps_snake_case_statuses() {
         let args = serde_json::to_string(&json!({"todos": [
@@ -1809,8 +1812,12 @@ mod tests {
                 StreamItem::ToolCall { todos, output, .. } => {
                     let todos = todos.expect("todo tool carries todos");
                     assert_eq!(
-                        todos.iter().map(|todo| todo.done).collect::<Vec<_>>(),
-                        vec![true, false, false]
+                        todos.iter().map(|todo| todo.status).collect::<Vec<_>>(),
+                        vec![
+                            TodoStatus::Done,
+                            TodoStatus::InProgress,
+                            TodoStatus::Pending
+                        ]
                     );
                     assert_eq!(
                         todos[0].label,
@@ -1853,7 +1860,7 @@ mod tests {
                     todos,
                     Some(vec![TodoItem {
                         label: String::from("a step"),
-                        done: true,
+                        status: TodoStatus::Done,
                     }])
                 ),
                 other => panic!("wrong item: {other:?}"),

@@ -23,5 +23,5 @@ pub use engine::{
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,
-    TranscriptItem, assign_projects, fixture, seed_projects, workspace_name,
+    TodoStatus, TranscriptItem, assign_projects, fixture, seed_projects, workspace_name,
 };

@@ -11,7 +11,7 @@ use iced::{Element, Length, Task};
 use manifest_domain::{
     Connection, EffortChoice, EngineEvent, Fixture, ModelChoice, PermissionMode, ProjectId,
     ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
-    StreamItem, TodoItem, TurnId, UsageSnapshot, WorktreeChoice,
+    StreamItem, TodoItem, TodoStatus, TurnId, UsageSnapshot, WorktreeChoice,
 };
 
 use crate::engine;
@@ -361,14 +361,14 @@ impl App {
         let fixture_pending = fixture.pending.clone();
         let fixture_settled = fixture.settled_pending.clone();
         let seed_fallback = fixture.sessions.first().map(|summary| summary.id.clone());
-        let done = fixture.todos.iter().filter(|todo| todo.done).count();
-        let total = fixture.todos.len();
-        let todo_summary = format!("{done} of {total} done");
-        let current_todo = fixture
+        let done = fixture
             .todos
             .iter()
-            .find(|todo| !todo.done)
-            .map(|todo| todo.label.clone());
+            .filter(|todo| todo.status.is_done())
+            .count();
+        let total = fixture.todos.len();
+        let todo_summary = format!("{done} of {total} done");
+        let current_todo = current_todo_label(&fixture.todos);
         let mut app = App {
             sessions: sessions::State::from_projects(fixture.projects, fixture.sessions),
             transcript: transcript::State::from_items(fixture.transcript),
@@ -869,11 +869,8 @@ impl App {
             .and_then(|session| self.todo_lists.get(session))
         {
             Some(todos) => {
-                let done = todos.iter().filter(|todo| todo.done).count();
-                let current = todos
-                    .iter()
-                    .find(|todo| !todo.done)
-                    .map(|todo| todo.label.clone());
+                let done = todos.iter().filter(|todo| todo.status.is_done()).count();
+                let current = current_todo_label(todos);
                 (done, todos.len(), current)
             }
             None => (0, 0, None),
@@ -2821,11 +2818,25 @@ fn worktree_bar_view(draft: &NewSessionDraft) -> Element<'_, Message> {
     bar.into()
 }
 
+/// The drawer's current step: the first in-progress entry, else
+/// the first pending one. Cancelled and done entries are never
+/// current; a list with neither in-progress nor pending entries has
+/// no current step, which the view renders as "All done".
+fn current_todo_label(todos: &[TodoItem]) -> Option<String> {
+    todos
+        .iter()
+        .find(|todo| todo.status == TodoStatus::InProgress)
+        .or_else(|| todos.iter().find(|todo| todo.status == TodoStatus::Pending))
+        .map(|todo| todo.label.clone())
+}
+
 /// The open TODO drawer: a panel whose first row is the shared bar
-/// header, followed by one line per todo: the label in full width with
-/// a trailing status icon (check-in-circle for finished steps, empty
-/// circle for pending ones). Finished rows read in the tertiary tone;
-/// pending rows read in the primary tone.
+/// header, followed by one line per todo: a leading status icon
+/// (check-in-circle for finished steps, play-in-circle while in
+/// progress, empty circle for pending or cancelled ones) beside the
+/// label in full width. Finished and cancelled rows read in the
+/// tertiary tone; pending and in-progress rows read in the primary
+/// tone.
 fn todo_drawer_view<'a>(
     todos: &'a [TodoItem],
     current: &'a str,
@@ -2841,15 +2852,14 @@ fn todo_drawer_view<'a>(
     for todo in todos {
         // No string building in the view (UI contract §2): the status
         // icon is a static mapping beside the borrowed todo text.
-        let color = if todo.done {
-            TEXT_TERTIARY
-        } else {
-            TEXT_PRIMARY
+        let color = match todo.status {
+            TodoStatus::Done | TodoStatus::Cancelled => TEXT_TERTIARY,
+            TodoStatus::Pending | TodoStatus::InProgress => TEXT_PRIMARY,
         };
         list = list.push(
             iced::widget::container(
                 iced::widget::row![
-                    kit::icon(kit::todo_status_icon(todo.done), FONT_SIZE_SMALL, color),
+                    kit::icon(kit::todo_status_icon(todo.status), FONT_SIZE_SMALL, color),
                     iced::widget::text(todo.label.as_str())
                         .size(FONT_SIZE_SMALL)
                         .color(color)
@@ -2965,10 +2975,10 @@ mod tests {
         );
     }
 
-    fn todo_entry(label: &str, done: bool) -> TodoItem {
+    fn todo_entry(label: &str, status: TodoStatus) -> TodoItem {
         TodoItem {
             label: String::from(label),
-            done,
+            status,
         }
     }
 
@@ -3022,7 +3032,10 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Pending),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         assert_eq!(app.todo_summary, "0 of 2 done");
         assert_eq!(app.current_todo.as_deref(), Some("first"));
@@ -3030,11 +3043,11 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-2",
-            vec![todo_entry("third", true)],
+            vec![todo_entry("third", TodoStatus::Done)],
         ));
         assert_eq!(
             app.todo_lists.get(&SessionId::new("s-1")),
-            Some(&vec![todo_entry("third", true)])
+            Some(&vec![todo_entry("third", TodoStatus::Done)])
         );
         assert_eq!(app.todo_summary, "1 of 1 done");
         assert_eq!(app.current_todo, None);
@@ -3048,14 +3061,17 @@ mod tests {
         let _ = app.apply_stream_event(todo_started(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false)],
+            vec![todo_entry("first", TodoStatus::Pending)],
         ));
         assert_eq!(app.todo_summary, "0 of 1 done");
         assert_eq!(app.current_todo.as_deref(), Some("first"));
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         assert_eq!(app.todo_summary, "1 of 2 done");
         assert_eq!(app.current_todo.as_deref(), Some("second"));
@@ -3069,7 +3085,10 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-2",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", false)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Pending),
+            ],
         ));
         // The background list stores without touching the visible drawer.
         assert_eq!(
@@ -3097,12 +3116,51 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", true), todo_entry("second", true)],
+            vec![
+                todo_entry("first", TodoStatus::Done),
+                todo_entry("second", TodoStatus::Done),
+            ],
         ));
         assert_eq!(app.todo_summary, "2 of 2 done");
         // No unfinished step: the view renders this as "All done".
         assert_eq!(app.current_todo, None);
         assert_eq!(app.visible_todos().len(), 2);
+    }
+
+    #[test]
+    fn todo_in_progress_is_current_ahead_of_pending() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![
+                todo_entry("waiting", TodoStatus::Pending),
+                todo_entry("working", TodoStatus::InProgress),
+                todo_entry("dropped", TodoStatus::Cancelled),
+            ],
+        ));
+        assert_eq!(app.todo_summary, "0 of 3 done");
+        assert_eq!(app.current_todo.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn todo_cancelled_never_becomes_current() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.apply_stream_event(todo_completed(
+            "s-1",
+            "todo-1",
+            vec![
+                todo_entry("finished", TodoStatus::Done),
+                todo_entry("dropped", TodoStatus::Cancelled),
+            ],
+        ));
+        assert_eq!(app.todo_summary, "1 of 2 done");
+        // No in-progress or pending step: the view renders "All done".
+        assert_eq!(app.current_todo, None);
     }
 
     #[test]
@@ -3113,7 +3171,7 @@ mod tests {
         let _ = app.apply_stream_event(todo_completed(
             "s-1",
             "todo-1",
-            vec![todo_entry("first", false)],
+            vec![todo_entry("first", TodoStatus::Pending)],
         ));
         assert!(!app.visible_todos().is_empty());
         let _ = app.apply_stream_event(todo_completed("s-1", "todo-2", Vec::new()));

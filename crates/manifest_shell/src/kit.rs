@@ -14,6 +14,7 @@
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
+use manifest_domain::TodoStatus;
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
@@ -344,13 +345,14 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     .into()
 }
 
-/// Icon for a TODO drawer row: check-in-circle when done, empty
-/// circle when pending.
-pub(crate) fn todo_status_icon(done: bool) -> lucide_icons::Icon {
-    if done {
-        lucide_icons::Icon::CircleCheck
-    } else {
-        lucide_icons::Icon::Circle
+/// Icon for a TODO drawer row: check-in-circle when done, play
+/// button in a circle while in progress, empty circle when pending
+/// or cancelled.
+pub(crate) fn todo_status_icon(status: TodoStatus) -> lucide_icons::Icon {
+    match status {
+        TodoStatus::Done => lucide_icons::Icon::CircleCheck,
+        TodoStatus::InProgress => lucide_icons::Icon::CirclePlay,
+        TodoStatus::Pending | TodoStatus::Cancelled => lucide_icons::Icon::Circle,
     }
 }
 
@@ -1605,13 +1607,22 @@ mod tests {
     }
 
     #[test]
-    fn todo_status_icon_maps_done_to_check() {
+    fn todo_status_icon_maps_each_status() {
+        use manifest_domain::TodoStatus;
         assert!(matches!(
-            super::todo_status_icon(true),
+            super::todo_status_icon(TodoStatus::Done),
             lucide_icons::Icon::CircleCheck
         ));
         assert!(matches!(
-            super::todo_status_icon(false),
+            super::todo_status_icon(TodoStatus::InProgress),
+            lucide_icons::Icon::CirclePlay
+        ));
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::Pending),
+            lucide_icons::Icon::Circle
+        ));
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::Cancelled),
             lucide_icons::Icon::Circle
         ));
     }
