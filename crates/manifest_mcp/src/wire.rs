@@ -4,13 +4,14 @@
 //! newline and flushes. Shapes follow the server contract: `initialize`
 //! declares the `muse.stream` experimental capability, `tools/call`
 //! invokes `muse_status`, `muse_spawn`, `muse_turn`, `muse_steer`,
-//! `muse_cancel`, or `muse_models` (catalog listing, or session resume
-//! with the catalog discarded), and server requests we never
+//! `muse_cancel`, `muse_models` (catalog listing, or session resume
+//! with the catalog discarded), or `muse_raw` (session compaction and
+//! goal setting, forwarded unchanged), and server requests we never
 //! serve get `-32601` so none is left hanging.
 
 use manifest_domain::{
-    AnswerValue, ApprovalDecision, PendingAnswer, PermissionMode, SpawnChoices, WorktreeChoice,
-    truncate_free_text,
+    AnswerValue, ApprovalDecision, PendingAnswer, PermissionMode, SpawnChoices, TurnInput,
+    WorktreeChoice, truncate_free_text,
 };
 use serde_json::{Value, json};
 
@@ -42,11 +43,59 @@ pub(crate) fn initialized_notification() -> String {
     .to_string()
 }
 
+/// Encode one [`TurnInput`] into spawn/turn arguments.
+///
+/// Plain text keeps the exact historical shape (`prompt`); a skill
+/// invocation replaces it with `parts` carrying one `skill` part
+/// (`selector`, plus `source` only when `Some` and non-empty, plus
+/// `arguments` only when non-empty). `parts` is the companion-server
+/// contract: `muse_turn`/`muse_spawn` accept optional `parts` while
+/// `prompt` is unchanged otherwise.
+fn input_arguments(session_id: Option<&str>, input: &TurnInput) -> serde_json::Map<String, Value> {
+    let mut arguments = serde_json::Map::new();
+    if let Some(session_id) = session_id {
+        arguments.insert(String::from("session_id"), Value::from(session_id));
+    }
+    match input {
+        TurnInput::Text(prompt) => {
+            arguments.insert(String::from("prompt"), Value::from(prompt.as_str()));
+        }
+        TurnInput::Skill(invocation) => {
+            let mut part = serde_json::Map::from_iter([
+                (String::from("type"), Value::from("skill")),
+                (
+                    String::from("selector"),
+                    Value::from(invocation.selector.as_str()),
+                ),
+            ]);
+            if let Some(source) = invocation
+                .source
+                .as_deref()
+                .filter(|source| !source.is_empty())
+            {
+                part.insert(String::from("source"), Value::from(source));
+            }
+            if !invocation.arguments.is_empty() {
+                part.insert(
+                    String::from("arguments"),
+                    Value::from(invocation.arguments.as_str()),
+                );
+            }
+            arguments.insert(
+                String::from("parts"),
+                Value::Array(vec![Value::Object(part)]),
+            );
+        }
+    }
+    arguments
+}
+
 /// A `tools/call` request invoking `muse_spawn` with the given numeric id.
 ///
 /// Argument names follow the server's `muse_spawn` input schema:
-/// `workspace`, `prompt`, `wait`, plus optional `model`,
-/// `reasoning_effort`, and `approval_mode`. Spawns return immediately.
+/// `workspace`, `prompt` (or `parts` for a skill input), `wait`,
+/// plus optional `model`, `reasoning_effort`, and
+/// `approval_mode`. Spawns return immediately.
 /// `model` and `reasoning_effort` ride only when the choice names one;
 /// `approval_mode` rides only when the posture differs from the server
 /// default (Muse yolo), so a default [`SpawnChoices`] sends exactly
@@ -56,12 +105,19 @@ pub(crate) fn initialized_notification() -> String {
 /// `worktree_base` only when the base is `Some` and non-empty after
 /// trimming (sent exactly as held); [`WorktreeChoice::Existing`] adds
 /// `worktree: 'existing'` with `worktree_path`.
-pub(crate) fn spawn_call(id: u64, workspace: &str, prompt: &str, choices: &SpawnChoices) -> String {
+pub(crate) fn spawn_call(
+    id: u64,
+    workspace: &str,
+    input: &TurnInput,
+    choices: &SpawnChoices,
+) -> String {
     let mut arguments = serde_json::Map::from_iter([
         (String::from("workspace"), Value::from(workspace)),
-        (String::from("prompt"), Value::from(prompt)),
         (String::from("wait"), Value::from(false)),
     ]);
+    for (key, value) in input_arguments(None, input) {
+        arguments.insert(key, value);
+    }
     match &choices.worktree {
         WorktreeChoice::Off => {}
         WorktreeChoice::Create { base } => {
@@ -105,16 +161,36 @@ pub(crate) fn spawn_call(id: u64, workspace: &str, prompt: &str, choices: &Spawn
 /// A `tools/call` request invoking `muse_turn` with the given numeric id.
 ///
 /// Argument names follow the server's `muse_turn` input schema:
-/// `session_id`, `prompt`, `wait`. Turns return immediately; their
-/// events stream next.
-pub(crate) fn turn_call(id: u64, session_id: &str, prompt: &str) -> String {
+/// `session_id`, `prompt` (or `parts` for a skill input), `wait`.
+/// Turns return immediately; their events stream next. A skill input
+/// emits `parts` instead of `prompt`; see [`input_arguments`].
+pub(crate) fn turn_call(id: u64, session_id: &str, input: &TurnInput) -> String {
+    let mut arguments = input_arguments(Some(session_id), input);
+    arguments.insert(String::from("wait"), Value::from(false));
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
         "params": {
             "name": "muse_turn",
-            "arguments": {"session_id": session_id, "prompt": prompt, "wait": false},
+            "arguments": Value::Object(arguments),
+        },
+    })
+    .to_string()
+}
+
+/// A `tools/call` request invoking `muse_skills` for a catalog listing.
+///
+/// Argument names follow the server's `muse_skills` input schema:
+/// `session_id` names the session whose catalog is listed.
+pub(crate) fn skills_call(id: u64, session_id: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "muse_skills",
+            "arguments": {"session_id": session_id},
         },
     })
     .to_string()
@@ -136,6 +212,88 @@ pub(crate) fn steer_call(id: u64, session_id: &str, prompt: &str, turn_id: &str)
         },
     })
     .to_string()
+}
+
+/// A process-local UUIDv7-shaped idempotency handle for `muse_raw`
+/// host methods (`session/compact`, `goal/set`), which require a
+/// `commandId`.
+///
+/// The crate takes no UUID dependency, so this mints the shape from
+/// the wall clock (48-bit Unix millis) plus a process counter for
+/// the random bits: unique per command in this process, version 7,
+/// RFC 4122 variant. Randomness quality is irrelevant here; the host
+/// only needs a fresh handle per command.
+fn command_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0) as u64
+        & 0xFFFF_FFFF_FFFF;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Twelve versioned bits plus the low variant bits; the counter
+    // keeps same-millisecond commands distinct.
+    let rand_a = (n ^ (millis >> 16)) & 0x0FFF;
+    let rand_b = (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ millis) & 0x3FFF_FFFF_FFFF_FFFF;
+    format!(
+        "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+        (millis >> 16) & 0xFFFF_FFFF,
+        millis & 0xFFFF,
+        rand_a,
+        0x8000 | ((rand_b >> 48) & 0x3FFF),
+        rand_b & 0xFFFF_FFFF_FFFF,
+    )
+}
+
+/// A `tools/call` request invoking `muse_raw` with the given numeric id.
+///
+/// Argument names follow the server's `muse_raw` input schema:
+/// `session_id`, `method`, `params` (forwarded unchanged to the
+/// session's host). Credential methods stay refused server-side
+/// (`account/*`, `oauth`, `login`, `logout`); this client never sends
+/// them.
+pub(crate) fn raw_call(id: u64, session_id: &str, method: &str, params: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "muse_raw",
+            "arguments": {"session_id": session_id, "method": method, "params": params},
+        },
+    })
+    .to_string()
+}
+
+/// A `tools/call` request compacting `session_id` through `muse_raw`.
+///
+/// The host method is `session/compact` with `commandId` (see
+/// [`command_id`]) and `sessionId`; `turnId` is omitted so the server
+/// resolves the session's current run. The ack admits the compaction;
+/// its outcome arrives as a terminal view event.
+pub(crate) fn compact_call(id: u64, session_id: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "session/compact",
+        json!({"commandId": command_id(), "sessionId": session_id}),
+    )
+}
+
+/// A `tools/call` request setting `session_id`'s goal through `muse_raw`.
+///
+/// The host method is `goal/set` with `commandId` (see
+/// [`command_id`]), `sessionId`, and the trimmed `objective` (the
+/// host rejects empty-after-trim, so the shell never sends one).
+pub(crate) fn goal_call(id: u64, session_id: &str, objective: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "goal/set",
+        json!({"commandId": command_id(), "sessionId": session_id, "objective": objective}),
+    )
 }
 
 /// A `tools/call` request invoking `muse_cancel` with the given numeric id.
@@ -333,6 +491,12 @@ pub(crate) fn method_not_supported(id: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifest_domain::SkillInvocation;
+
+    /// Plain-text input for the pre-skill call shapes.
+    fn text(prompt: &str) -> TurnInput {
+        TurnInput::Text(String::from(prompt))
+    }
 
     #[test]
     fn initialize_declares_stream_capability() {
@@ -359,9 +523,13 @@ mod tests {
 
     #[test]
     fn spawn_call_carries_workspace_prompt_and_no_wait() {
-        let value: Value =
-            serde_json::from_str(&spawn_call(3, "/tmp/ws", "hello", &SpawnChoices::default()))
-                .expect("valid JSON");
+        let value: Value = serde_json::from_str(&spawn_call(
+            3,
+            "/tmp/ws",
+            &text("hello"),
+            &SpawnChoices::default(),
+        ))
+        .expect("valid JSON");
         assert_eq!(value.get("id"), Some(&json!(3)));
         assert_eq!(value.pointer("/params/name"), Some(&json!("muse_spawn")));
         assert_eq!(
@@ -377,9 +545,13 @@ mod tests {
 
     #[test]
     fn spawn_off_adds_no_worktree_keys() {
-        let value: Value =
-            serde_json::from_str(&spawn_call(3, "/tmp/ws", "hello", &SpawnChoices::default()))
-                .expect("valid JSON");
+        let value: Value = serde_json::from_str(&spawn_call(
+            3,
+            "/tmp/ws",
+            &text("hello"),
+            &SpawnChoices::default(),
+        ))
+        .expect("valid JSON");
         let arguments = value
             .pointer("/params/arguments")
             .expect("arguments present")
@@ -396,7 +568,7 @@ mod tests {
         let value: Value = serde_json::from_str(&spawn_call(
             3,
             "/tmp/ws",
-            "hello",
+            &text("hello"),
             &SpawnChoices {
                 worktree: WorktreeChoice::Create { base: None },
                 ..Default::default()
@@ -416,7 +588,7 @@ mod tests {
         let value: Value = serde_json::from_str(&spawn_call(
             3,
             "/tmp/ws",
-            "hello",
+            &text("hello"),
             &SpawnChoices {
                 worktree: WorktreeChoice::Create { base: Some(base) },
                 ..Default::default()
@@ -439,7 +611,7 @@ mod tests {
         let value: Value = serde_json::from_str(&spawn_call(
             3,
             "/tmp/ws",
-            "hello",
+            &text("hello"),
             &SpawnChoices {
                 worktree: WorktreeChoice::Existing {
                     path: String::from("/tmp/wt-1"),
@@ -473,7 +645,7 @@ mod tests {
     #[test]
     fn turn_call_carries_session_prompt_and_no_wait() {
         let value: Value =
-            serde_json::from_str(&turn_call(4, "sess-1", "again")).expect("valid JSON");
+            serde_json::from_str(&turn_call(4, "sess-1", &text("again"))).expect("valid JSON");
         assert_eq!(value.get("id"), Some(&json!(4)));
         assert_eq!(value.pointer("/params/name"), Some(&json!("muse_turn")));
         assert_eq!(
@@ -489,9 +661,13 @@ mod tests {
 
     #[test]
     fn spawn_default_omits_model_effort_and_approval() {
-        let value: Value =
-            serde_json::from_str(&spawn_call(3, "/tmp/ws", "hello", &SpawnChoices::default()))
-                .expect("valid JSON");
+        let value: Value = serde_json::from_str(&spawn_call(
+            3,
+            "/tmp/ws",
+            &text("hello"),
+            &SpawnChoices::default(),
+        ))
+        .expect("valid JSON");
         let arguments = value
             .pointer("/params/arguments")
             .expect("arguments present")
@@ -510,7 +686,7 @@ mod tests {
         let value: Value = serde_json::from_str(&spawn_call(
             3,
             "/tmp/ws",
-            "hello",
+            &text("hello"),
             &SpawnChoices {
                 model: ModelChoice::Named(String::from("muse-spark")),
                 effort: EffortChoice::High,
@@ -539,7 +715,7 @@ mod tests {
         let value: Value = serde_json::from_str(&spawn_call(
             3,
             "/tmp/ws",
-            "hello",
+            &text("hello"),
             &SpawnChoices {
                 model: ModelChoice::Named(String::from("  ")),
                 ..Default::default()
@@ -596,6 +772,72 @@ mod tests {
             value.pointer("/params/arguments/turn_id"),
             Some(&json!("turn-9"))
         );
+    }
+
+    #[test]
+    fn compact_call_sends_session_compact_without_turn() {
+        let value: Value = serde_json::from_str(&compact_call(6, "sess-1")).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_raw")));
+        assert_eq!(
+            value.pointer("/params/arguments/session_id"),
+            Some(&json!("sess-1"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("session/compact"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert!(params.get("turnId").is_none());
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn goal_call_sends_goal_set_with_objective() {
+        let value: Value =
+            serde_json::from_str(&goal_call(7, "sess-1", "ship it")).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_raw")));
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("goal/set"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert_eq!(params.get("objective"), Some(&json!("ship it")));
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn command_ids_are_unique_per_call() {
+        let first: Value = serde_json::from_str(&compact_call(6, "sess-1")).expect("valid JSON");
+        let second: Value = serde_json::from_str(&compact_call(6, "sess-1")).expect("valid JSON");
+        let id = |value: &Value| value.pointer("/params/arguments/params/commandId").cloned();
+        assert_ne!(id(&first), id(&second));
+    }
+
+    /// Whether `text` parses as a UUIDv7 string (version nibble `7`,
+    /// RFC 4122 variant): the shape [`command_id`] mints.
+    fn is_uuid_v7(text: &str) -> bool {
+        let parts: Vec<&str> = text.split('-').collect();
+        if parts.len() != 5 {
+            return false;
+        }
+        let hex = |part: &str| part.chars().all(|c| c.is_ascii_hexdigit());
+        parts.iter().all(|part| hex(part))
+            && parts[2].starts_with('7')
+            && matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b'))
     }
 
     #[test]
@@ -739,6 +981,132 @@ mod tests {
             value.pointer("/params/arguments/workspace"),
             Some(&json!("/tmp/ws"))
         );
+        assert_eq!(
+            value.pointer("/params/arguments/session_id"),
+            Some(&json!("sess-1"))
+        );
+    }
+
+    #[test]
+    fn text_turn_call_json_unchanged() {
+        let value: Value =
+            serde_json::from_str(&turn_call(4, "sess-1", &text("again"))).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_turn")));
+        let arguments = value
+            .pointer("/params/arguments")
+            .expect("arguments present")
+            .as_object()
+            .expect("arguments is an object");
+        assert_eq!(arguments.len(), 3);
+        assert_eq!(arguments.get("session_id"), Some(&json!("sess-1")));
+        assert_eq!(arguments.get("prompt"), Some(&json!("again")));
+        assert_eq!(arguments.get("wait"), Some(&json!(false)));
+        assert!(!arguments.contains_key("parts"));
+    }
+
+    /// A skill turn replaces `prompt` with one `skill` part carrying
+    /// every populated field.
+    #[test]
+    fn skill_turn_call_emits_parts_without_prompt() {
+        let input = TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: Some(String::from("user")),
+            arguments: String::from("pr 42"),
+        });
+        let value: Value =
+            serde_json::from_str(&turn_call(4, "sess-1", &input)).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_turn")));
+        let arguments = value
+            .pointer("/params/arguments")
+            .expect("arguments present")
+            .as_object()
+            .expect("arguments is an object");
+        assert_eq!(arguments.len(), 3);
+        assert_eq!(arguments.get("session_id"), Some(&json!("sess-1")));
+        assert_eq!(arguments.get("wait"), Some(&json!(false)));
+        assert!(!arguments.contains_key("prompt"));
+        assert_eq!(
+            arguments.get("parts"),
+            Some(&json!([{
+                "type": "skill",
+                "selector": "review",
+                "source": "user",
+                "arguments": "pr 42",
+            }])),
+        );
+    }
+
+    /// `source` rides only when `Some` and non-empty; `arguments`
+    /// rides only when non-empty.
+    #[test]
+    fn skill_turn_call_omits_empty_source_and_arguments() {
+        for (source, expect_source) in [
+            (None, false),
+            (Some(String::new()), false),
+            (Some(String::from("user")), true),
+        ] {
+            let input = TurnInput::Skill(SkillInvocation {
+                selector: String::from("review"),
+                source,
+                arguments: String::new(),
+            });
+            let value: Value =
+                serde_json::from_str(&turn_call(4, "sess-1", &input)).expect("valid JSON");
+            let part = value
+                .pointer("/params/arguments/parts/0")
+                .expect("one skill part")
+                .as_object()
+                .expect("part is an object");
+            assert_eq!(part.len(), if expect_source { 3 } else { 2 });
+            assert_eq!(part.get("type"), Some(&json!("skill")));
+            assert_eq!(part.get("selector"), Some(&json!("review")));
+            assert!(!part.contains_key("arguments"));
+            assert_eq!(
+                part.get("source"),
+                expect_source.then_some(&json!("user")),
+                "source rides only when Some and non-empty"
+            );
+        }
+    }
+
+    /// A skill spawn keeps the workspace/choices shape and swaps
+    /// `prompt` for the same `parts` idea, without `session_id`.
+    #[test]
+    fn skill_spawn_call_emits_parts_without_prompt_or_session() {
+        let input = TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: None,
+            arguments: String::from("pr 42"),
+        });
+        let value: Value =
+            serde_json::from_str(&spawn_call(3, "/tmp/ws", &input, &SpawnChoices::default()))
+                .expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_spawn")));
+        let arguments = value
+            .pointer("/params/arguments")
+            .expect("arguments present")
+            .as_object()
+            .expect("arguments is an object");
+        assert_eq!(arguments.len(), 3);
+        assert_eq!(arguments.get("workspace"), Some(&json!("/tmp/ws")));
+        assert_eq!(arguments.get("wait"), Some(&json!(false)));
+        assert!(!arguments.contains_key("prompt"));
+        assert!(!arguments.contains_key("session_id"));
+        assert_eq!(
+            arguments.get("parts"),
+            Some(&json!([{
+                "type": "skill",
+                "selector": "review",
+                "arguments": "pr 42",
+            }])),
+        );
+    }
+
+    #[test]
+    fn skills_call_names_muse_skills_with_session_id() {
+        let value: Value = serde_json::from_str(&skills_call(9, "sess-1")).expect("valid JSON");
+        assert_eq!(value.get("id"), Some(&json!(9)));
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_skills")));
         assert_eq!(
             value.pointer("/params/arguments/session_id"),
             Some(&json!("sess-1"))

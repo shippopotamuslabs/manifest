@@ -14,14 +14,14 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use manifest_domain::{
     ApprovalDecision, Connection, EngineEvent, FailedCommand, PendingAnswer, PendingResolution,
-    SessionId, SpawnChoices, TurnId,
+    SessionId, SpawnChoices, TurnId, TurnInput,
 };
 use serde_json::Value;
 
 use crate::error::Error;
 use crate::map::{
-    map_ack_result, map_models_result, map_pending_result, map_resume_result, map_spawn_result,
-    map_status_result, map_stream_event, map_turn_result,
+    map_ack_result, map_models_result, map_pending_result, map_resume_result, map_skills_result,
+    map_spawn_result, map_status_result, map_stream_event, map_turn_result,
 };
 use crate::{ServerConfig, wire};
 
@@ -38,11 +38,14 @@ pub(crate) enum Command {
     /// Spawn a session: `muse_spawn` with `wait: false`.
     SpawnSession {
         workspace: String,
-        prompt: String,
+        input: TurnInput,
         choices: SpawnChoices,
     },
     /// Send a follow-up turn: `muse_turn` with `wait: false`.
-    SendTurn { session: SessionId, prompt: String },
+    SendTurn {
+        session: SessionId,
+        input: TurnInput,
+    },
     /// Resume a session: `muse_models` by session id (catalog discarded).
     ResumeSession { session: SessionId },
     /// Inject a prompt into the running turn: `muse_steer`.
@@ -56,6 +59,13 @@ pub(crate) enum Command {
         session: SessionId,
         turn: Option<TurnId>,
     },
+    /// Compact the session: `muse_raw` with `session/compact`.
+    CompactSession { session: SessionId },
+    /// Set the session's goal: `muse_raw` with `goal/set`.
+    SetGoal {
+        session: SessionId,
+        objective: String,
+    },
     /// List the host model catalog: `muse_models` (read-only query).
     /// Carries the host context the server needs: a workspace, a
     /// session id, or both.
@@ -63,6 +73,8 @@ pub(crate) enum Command {
         workspace: Option<String>,
         session: Option<SessionId>,
     },
+    /// List the host skill catalog: `muse_skills` for one session.
+    ListSkills { session: SessionId },
     /// Fetch pending approvals/questions: `muse_pending`.
     FetchPending,
     /// Decide a pending approval: `muse_decide` as `actor: "user"`.
@@ -101,7 +113,10 @@ enum Pending {
     Resume(SessionId),
     Steer(SessionId),
     Cancel(SessionId),
+    Compact(SessionId),
+    Goal(SessionId),
     Models,
+    Skills(SessionId),
     Fetch,
     Decide {
         session: SessionId,
@@ -125,7 +140,10 @@ fn failed_command(pending: &Pending) -> Option<FailedCommand> {
         Pending::Resume(session) => Some(FailedCommand::Resume(session.clone())),
         Pending::Steer(session) => Some(FailedCommand::Steer(session.clone())),
         Pending::Cancel(session) => Some(FailedCommand::Cancel(session.clone())),
+        Pending::Compact(session) => Some(FailedCommand::Compact(session.clone())),
+        Pending::Goal(session) => Some(FailedCommand::Goal(session.clone())),
         Pending::Models => Some(FailedCommand::Models),
+        Pending::Skills(session) => Some(FailedCommand::Skills(session.clone())),
         Pending::Fetch => Some(FailedCommand::PendingFetch),
         Pending::Decide {
             session,
@@ -200,13 +218,13 @@ impl Worker {
     fn send_spawn_call(
         &mut self,
         workspace: &str,
-        prompt: &str,
+        input: &TurnInput,
         choices: &SpawnChoices,
     ) -> Result<(), Error> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::Spawn);
-        self.send_line(&wire::spawn_call(id, workspace, prompt, choices))
+        self.send_line(&wire::spawn_call(id, workspace, input, choices))
     }
 
     /// Issue a `muse_models` session-resume round trip with a fresh id.
@@ -218,11 +236,11 @@ impl Worker {
     }
 
     /// Issue a `muse_turn` round trip with a fresh id.
-    fn send_turn_call(&mut self, session: &SessionId, prompt: &str) -> Result<(), Error> {
+    fn send_turn_call(&mut self, session: &SessionId, input: &TurnInput) -> Result<(), Error> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::Turn(session.clone()));
-        self.send_line(&wire::turn_call(id, session.as_str(), prompt))
+        self.send_line(&wire::turn_call(id, session.as_str(), input))
     }
 
     /// Issue a `muse_steer` round trip with a fresh id.
@@ -257,6 +275,23 @@ impl Worker {
             session.as_str(),
             turn.map(TurnId::as_str),
         ))
+    }
+
+    /// Issue a `session/compact` round trip through `muse_raw` with a
+    /// fresh id.
+    fn send_compact_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Compact(session.clone()));
+        self.send_line(&wire::compact_call(id, session.as_str()))
+    }
+
+    /// Issue a `goal/set` round trip through `muse_raw` with a fresh id.
+    fn send_goal_call(&mut self, session: &SessionId, objective: &str) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Goal(session.clone()));
+        self.send_line(&wire::goal_call(id, session.as_str(), objective))
     }
 
     /// Issue a `muse_pending` round trip with a fresh id.
@@ -319,6 +354,14 @@ impl Worker {
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::Models);
         self.send_line(&wire::models_call(id, workspace, session))
+    }
+
+    /// Issue a `muse_skills` catalog round trip with a fresh id.
+    fn send_skills_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Skills(session.clone()));
+        self.send_line(&wire::skills_call(id, session.as_str()))
     }
 
     /// Handle one stdout line. `Ok(true)` keeps looping, `Ok(false)`
@@ -392,7 +435,10 @@ impl Worker {
             | Pending::Resume(_)
             | Pending::Steer(_)
             | Pending::Cancel(_)
+            | Pending::Compact(_)
+            | Pending::Goal(_)
             | Pending::Models
+            | Pending::Skills(_)
             | Pending::Fetch
             | Pending::Decide { .. }
             | Pending::Answer { .. } => self.handle_command_reply(&pending, message),
@@ -439,7 +485,8 @@ impl Worker {
     }
 
     /// Handle the reply to a `muse_spawn`, `muse_turn`, `muse_steer`,
-    /// `muse_cancel`, `muse_models`, or resume call.
+    /// `muse_cancel`, `muse_raw` (compact, goal), `muse_models`, or
+    /// resume call.
     ///
     /// The connection stays up: every outcome is a value the shell
     /// renders, mirroring [`Worker::handle_status_reply`]. Steer and
@@ -485,8 +532,36 @@ impl Worker {
                     Err(message) => EngineEvent::CommandFailed { command, message },
                 }
             }
+            // Compaction and goal ack like cancel: success emits
+            // nothing (the outcome streams in as events), failure
+            // arrives as `CommandFailed` for the shell's transcript.
+            Pending::Compact(_) => {
+                match map_ack_result(
+                    &result,
+                    "Couldn't compact that session on the Muse MCP server.",
+                ) {
+                    Ok(()) => return true,
+                    Err(message) => EngineEvent::CommandFailed { command, message },
+                }
+            }
+            Pending::Goal(_) => {
+                match map_ack_result(
+                    &result,
+                    "Couldn't set that session's goal on the Muse MCP server.",
+                ) {
+                    Ok(()) => return true,
+                    Err(message) => EngineEvent::CommandFailed { command, message },
+                }
+            }
             Pending::Models => match map_models_result(&result) {
                 Ok(models) => EngineEvent::ModelsLoaded { models },
+                Err(message) => EngineEvent::CommandFailed { command, message },
+            },
+            Pending::Skills(commanded) => match map_skills_result(&result) {
+                Ok(skills) => EngineEvent::SkillsLoaded {
+                    session: commanded.clone(),
+                    skills,
+                },
                 Err(message) => EngineEvent::CommandFailed { command, message },
             },
             Pending::Fetch => match map_pending_result(&result) {
@@ -673,7 +748,7 @@ pub(crate) fn run(
             }
             WorkerMsg::Command(Command::SpawnSession {
                 workspace,
-                prompt,
+                input,
                 choices,
             }) => {
                 if !worker.connected {
@@ -681,20 +756,20 @@ pub(crate) fn run(
                         command: FailedCommand::Spawn,
                         message: not_connected_message(),
                     })
-                } else if let Err(err) = worker.send_spawn_call(&workspace, &prompt, &choices) {
+                } else if let Err(err) = worker.send_spawn_call(&workspace, &input, &choices) {
                     let _ = worker.fail(err);
                     false
                 } else {
                     true
                 }
             }
-            WorkerMsg::Command(Command::SendTurn { session, prompt }) => {
+            WorkerMsg::Command(Command::SendTurn { session, input }) => {
                 if !worker.connected {
                     worker.emit(EngineEvent::CommandFailed {
                         command: FailedCommand::Turn(session.clone()),
                         message: not_connected_message(),
                     })
-                } else if let Err(err) = worker.send_turn_call(&session, &prompt) {
+                } else if let Err(err) = worker.send_turn_call(&session, &input) {
                     let _ = worker.fail(err);
                     false
                 } else {
@@ -738,6 +813,32 @@ pub(crate) fn run(
                         message: not_connected_message(),
                     })
                 } else if let Err(err) = worker.send_cancel_call(&session, turn.as_ref()) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::CompactSession { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Compact(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_compact_call(&session) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::SetGoal { session, objective }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Goal(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_goal_call(&session, &objective) {
                     let _ = worker.fail(err);
                     false
                 } else {
@@ -804,6 +905,19 @@ pub(crate) fn run(
                     workspace.as_deref(),
                     session.as_ref().map(SessionId::as_str),
                 ) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::ListSkills { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Skills(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_skills_call(&session) {
                     let _ = worker.fail(err);
                     false
                 } else {

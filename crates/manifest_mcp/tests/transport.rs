@@ -3,7 +3,8 @@
 use manifest_domain::{
     AnswerValue, ApprovalDecision, Connection, EngineEvent, FailedCommand, ItemStatus,
     PendingAnswer, PendingKind, PendingPhase, PendingRequest, PendingResolution, SessionEngine,
-    SessionId, SessionStatus, SpawnChoices, StreamEvent, StreamItem, TurnId, WorktreeChoice,
+    SessionId, SessionStatus, SkillInvocation, SpawnChoices, StreamEvent, StreamItem, TurnId,
+    TurnInput, WorktreeChoice,
 };
 use manifest_mcp::{MuseEngine, ServerConfig, connect};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -201,7 +202,7 @@ fn spawn_flows_into_typed_stream() {
 
     engine.spawn_session(
         String::from("/tmp/ws"),
-        String::from("Read note.txt"),
+        TurnInput::Text(String::from("Read note.txt")),
         SpawnChoices::default(),
     );
     let mut seen = recv_until(&rx, "SessionSpawned", |event| {
@@ -320,7 +321,7 @@ fn spawn_bad_workspace_is_command_failed() {
 
     engine.spawn_session(
         String::from("/tmp/does-not-exist/ws"),
-        String::from("Read note.txt"),
+        TurnInput::Text(String::from("Read note.txt")),
         SpawnChoices::default(),
     );
     let seen = recv_until(&rx, "CommandFailed", |event| {
@@ -347,7 +348,7 @@ fn spawn_with_existing_worktree_succeeds_and_streams() {
 
     engine.spawn_session(
         String::from("/tmp/ws"),
-        String::from("Read note.txt"),
+        TurnInput::Text(String::from("Read note.txt")),
         SpawnChoices {
             worktree: WorktreeChoice::Existing {
                 path: String::from("/tmp/wt-1"),
@@ -380,7 +381,7 @@ fn spawn_untrusted_create_is_command_failed() {
 
     engine.spawn_session(
         String::from("/untrusted"),
-        String::from("Read note.txt"),
+        TurnInput::Text(String::from("Read note.txt")),
         SpawnChoices {
             worktree: WorktreeChoice::Create { base: None },
             ..Default::default()
@@ -456,7 +457,10 @@ fn send_turn_flows_into_acceptance_and_stream() {
     let engine = connect(fake_config("ok"), tx);
     let _ = connected_with_sessions(&rx);
 
-    engine.send_turn(SessionId::new("fake-session-1"), String::from("And again"));
+    engine.send_turn(
+        SessionId::new("fake-session-1"),
+        TurnInput::Text(String::from("And again")),
+    );
     let mut seen = recv_until(&rx, "TurnAccepted", |event| {
         matches!(event, EngineEvent::TurnAccepted { .. })
     });
@@ -484,6 +488,69 @@ fn send_turn_flows_into_acceptance_and_stream() {
         _ => None,
     });
     assert_eq!(answer.as_deref(), Some("Second turn done."));
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn list_skills_yields_scripted_catalog() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.list_skills(SessionId::new("fake-session-1"));
+    let seen = recv_until(&rx, "SkillsLoaded", |event| {
+        matches!(event, EngineEvent::SkillsLoaded { .. })
+    });
+    let loaded = seen.iter().find_map(|event| match event {
+        EngineEvent::SkillsLoaded { session, skills } => Some((session, skills)),
+        _ => None,
+    });
+    let (session, skills) = loaded.expect("SkillsLoaded seen above");
+    assert_eq!(session, &SessionId::new("fake-session-1"));
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].selector, "review");
+    assert_eq!(skills[0].label(), "Review");
+    assert_eq!(skills[0].description, "Reviews code");
+    assert_eq!(skills[0].source, "user");
+    assert_eq!(skills[0].plugin_id.as_deref(), Some("pr-tools"));
+    assert_eq!(skills[0].argument_hint.as_deref(), Some("<pr>"));
+    assert_eq!(skills[1].selector, "summarize");
+    assert_eq!(skills[1].source, "bundled");
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn send_skill_turn_flows_into_acceptance() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.send_turn(
+        SessionId::new("fake-session-1"),
+        TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: Some(String::from("user")),
+            arguments: String::from("pr 42"),
+        }),
+    );
+    let seen = recv_until(&rx, "TurnAccepted", |event| {
+        matches!(event, EngineEvent::TurnAccepted { .. })
+    });
+    let accepted = seen.iter().find_map(|event| match event {
+        EngineEvent::TurnAccepted { session, turn } => Some((session, turn)),
+        _ => None,
+    });
+    let (session, turn) = accepted.expect("TurnAccepted seen above");
+    assert_eq!(session, &SessionId::new("fake-session-1"));
+    assert_eq!(turn, &Some(TurnId::new("fake-turn-2")));
     assert!(
         !seen.iter().any(is_failed),
         "the connection stays up, saw {seen:#?}"

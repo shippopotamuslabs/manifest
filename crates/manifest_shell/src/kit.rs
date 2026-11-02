@@ -974,16 +974,40 @@ fn composer_input_style(_theme: &Theme, _status: text_editor::Status) -> text_ed
     }
 }
 
+/// Key interception for the composer input: maps a key press to an
+/// editor binding, replacing the editor defaults while installed.
+/// The composer installs one only while its slash menu is open; every
+/// other key falls back to [`text_editor::Binding::from_key_press`]
+/// inside the composer's closure, so the editor behaves exactly as
+/// before when the menu is closed.
+pub(crate) type ComposerKeys<'a, Message> =
+    Box<dyn Fn(text_editor::KeyPress) -> Option<text_editor::Binding<Message>> + 'a>;
+
 /// The multi-line composer input. Its height grows with
 /// `visible_lines` up to [`COMPOSER_MAX_LINES`]; past that cap the
 /// caller holds the height fixed and the editor scrolls internally,
 /// so later slices inherit the growth contract from this constructor.
+/// The draft's first `/selector` token highlights through
+/// [`crate::composer::SlashHighlighter`] (no-op while
+/// `highlight_selectors` names nothing); `key_binding` intercepts
+/// keys before the editor consumes them, when the caller installs one.
 pub(crate) fn composer_input<'a, Message: Clone + 'a>(
     content: &'a text_editor::Content,
     visible_lines: usize,
     on_action: impl Fn(text_editor::Action) -> Message + 'a,
+    highlight_selectors: &[String],
+    key_binding: Option<ComposerKeys<'a, Message>>,
 ) -> Element<'a, Message> {
-    text_editor::TextEditor::new(content)
+    // Concrete widget generics: pinning the renderer lets the
+    // highlight closure below fill its (unnameable) `Format` by
+    // inference, since the expected return type is then concrete.
+    let mut editor: text_editor::TextEditor<
+        '_,
+        crate::composer::SlashHighlighter,
+        Message,
+        iced::Theme,
+        iced::Renderer,
+    > = text_editor::TextEditor::new(content)
         .placeholder("Message the agent...")
         .on_action(on_action)
         .size(FONT_SIZE_BODY)
@@ -992,7 +1016,69 @@ pub(crate) fn composer_input<'a, Message: Clone + 'a>(
         .height(Length::Fixed(
             visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
         ))
-        .style(composer_input_style)
+        .highlight_with::<crate::composer::SlashHighlighter>(
+            highlight_selectors.to_vec(),
+            // The highlight `Format` type is not nameable through the
+            // `iced` facade (its `core` module is hidden), so the
+            // closure below fills it by inference: `Default` plus field
+            // writes against the style pair, coerced to the `fn`
+            // pointer `highlight_with` expects.
+            |_highlight, theme| {
+                let (color, font) = crate::composer::slash_token_style(theme);
+                iced_core::text::highlighter::Format {
+                    color: Some(color),
+                    font: Some(font),
+                }
+            },
+        );
+    if let Some(keys) = key_binding {
+        editor = editor.key_binding(keys);
+    }
+    editor.style(composer_input_style).into()
+}
+
+/// One slash-menu row: a source icon, the `/selector` in strong text,
+/// and the description on one truncated line. Selected rows read as
+/// the quiet surface-2 step, mirroring [`menu_row`].
+pub(crate) fn slash_row<'a, Message: Clone + 'a>(
+    source_icon: lucide_icons::Icon,
+    selector: &'a str,
+    description: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let content = iced::widget::row![
+        icon(source_icon, FONT_SIZE_PANEL_SMALL, TEXT_TERTIARY),
+        container(
+            text(selector)
+                .size(FONT_SIZE_PANEL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(title_color),
+        )
+        .width(Length::Shrink)
+        .clip(true),
+        container(
+            text(description)
+                .size(FONT_SIZE_PANEL_SMALL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(TEXT_TERTIARY),
+        )
+        .width(Length::Fill)
+        .clip(true),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    button(content)
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(menu_row_style(selected))
         .into()
 }
 

@@ -11,7 +11,7 @@ use crate::error::Error;
 use manifest_domain::{
     ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
     PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
-    SessionStatus, SessionSummary, StreamEvent, StreamItem, TodoItem, TurnId, UsageKind,
+    SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem, TodoItem, TurnId, UsageKind,
     UsageSnapshot,
 };
 use serde::Deserialize;
@@ -431,6 +431,10 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
                 phase,
             }))
         }
+        "catalog-changed" => {
+            let session = SessionId::new(req_string(params, "sessionId")?);
+            Ok(Some(StreamEvent::CatalogChanged { session }))
+        }
         _ => Ok(None),
     }
 }
@@ -825,6 +829,76 @@ pub(crate) fn map_models_result(result: &Value) -> Result<Vec<ModelInfo>, String
         });
     }
     Ok(models)
+}
+
+/// Map a `muse_skills` catalog result into domain catalog values.
+///
+/// The content text parses as the catalog object: a `skills` array
+/// whose rows carry `selector`, `display_name`, `description`,
+/// `source`, `plugin_id`, and `argument_hint` (the server's
+/// snake_case names). Rows with a missing or empty `selector` cannot
+/// round-trip as a skill part, so they are skipped; an absent
+/// `display_name` falls back to the selector (see
+/// [`SkillInfo::label`); `description` and `source` default to empty
+/// and `plugin_id`/`argument_hint` default to absent. A
+/// server-authored `isError` body passes through as the failure text;
+/// anything else that does not parse fails with the friendly generic
+/// message.
+pub(crate) fn map_skills_result(result: &Value) -> Result<Vec<SkillInfo>, String> {
+    let generic = "Couldn't load the skill catalog from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let rows = match body.get("skills").and_then(Value::as_array) {
+        Some(rows) => rows,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let mut skills = Vec::new();
+    for row in rows {
+        let selector = match row.get("selector").and_then(Value::as_str) {
+            Some(selector) if !selector.is_empty() => selector.to_string(),
+            _ => continue,
+        };
+        let display_name = row
+            .get("display_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&selector)
+            .to_string();
+        skills.push(SkillInfo {
+            display_name,
+            description: row
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            source: row
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            plugin_id: row
+                .get("plugin_id")
+                .and_then(Value::as_str)
+                .map(String::from),
+            argument_hint: row
+                .get("argument_hint")
+                .and_then(Value::as_str)
+                .map(String::from),
+            selector,
+        });
+    }
+    Ok(skills)
 }
 
 /// Map a `muse_models` session-resume result into the resumed session.
@@ -2149,5 +2223,94 @@ mod tests {
         assert_eq!(map_models_result(&no_models), Err(String::from(generic)));
         let empty = json!({"content": [], "isError": true});
         assert_eq!(map_models_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn skills_result_maps_catalog_rows_in_order() {
+        let body = serde_json::to_string(&json!({
+            "skills": [
+                {
+                    "selector": "review",
+                    "display_name": "Review",
+                    "description": "Reviews code",
+                    "source": "user",
+                    "plugin_id": "pr-tools",
+                    "argument_hint": "<pr>",
+                },
+                {"selector": "bare"},
+            ],
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let skills = map_skills_result(&result).expect("catalog parses");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].selector, "review");
+        assert_eq!(skills[0].label(), "Review");
+        assert_eq!(skills[0].description, "Reviews code");
+        assert_eq!(skills[0].source, "user");
+        assert_eq!(skills[0].plugin_id.as_deref(), Some("pr-tools"));
+        assert_eq!(skills[0].argument_hint.as_deref(), Some("<pr>"));
+        assert_eq!(skills[1].selector, "bare");
+        assert_eq!(skills[1].label(), "bare");
+        assert_eq!(skills[1].description, String::new());
+        assert_eq!(skills[1].source, String::new());
+        assert_eq!(skills[1].plugin_id, None);
+        assert_eq!(skills[1].argument_hint, None);
+    }
+
+    #[test]
+    fn skills_result_skips_rows_without_usable_selectors() {
+        let body = serde_json::to_string(&json!({
+            "skills": [
+                {"display_name": "No selector"},
+                {"selector": ""},
+                {"selector": 7},
+                {"selector": "kept", "display_name": "Kept", "source": "project"},
+            ],
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let skills = map_skills_result(&result).expect("catalog parses");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].selector, "kept");
+        assert_eq!(skills[0].source, "project");
+    }
+
+    #[test]
+    fn skills_result_failures_carry_server_or_generic_text() {
+        let generic = "Couldn't load the skill catalog from the Muse MCP server.";
+        let server = json!({
+            "content": [{"type": "text", "text": "skills requires session_id"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_skills_result(&server),
+            Err(String::from("skills requires session_id"))
+        );
+        let garbage = json!({"content": [{"type": "text", "text": "not json"}]});
+        assert_eq!(map_skills_result(&garbage), Err(String::from(generic)));
+        let no_skills =
+            json!({"content": [{"type": "text", "text": "{\"provider_id\":\"muse\"}"}]});
+        assert_eq!(map_skills_result(&no_skills), Err(String::from(generic)));
+        let empty = json!({"content": [], "isError": true});
+        assert_eq!(map_skills_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn stream_catalog_changed_maps_to_session_event() {
+        let event = map_stream_event(&json!({
+            "type": "catalog-changed",
+            "sessionId": "sess-1",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::CatalogChanged {
+                session: SessionId::new("sess-1"),
+            }
+        );
+        let missing = map_stream_event(&json!({"type": "catalog-changed"}));
+        assert!(missing.is_err());
     }
 }

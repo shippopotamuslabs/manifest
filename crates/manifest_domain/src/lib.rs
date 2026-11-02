@@ -13,12 +13,13 @@ mod fixture;
 
 pub use branch::{parse_gitdir_pointer, parse_head, resolve_git_dir};
 pub use engine::{
-    AnswerValue, ApprovalChoiceSummary, ApprovalDecision, ApprovalRequest, Connection,
-    EffortChoice, EngineEvent, FREE_TEXT_LIMIT, FailedCommand, ItemStatus, ModelChoice, ModelInfo,
-    MusePermission, PendingAnswer, PendingDecision, PendingKind, PendingPhase, PendingRequest,
-    PendingResolution, PermissionMode, Question, QuestionOption, QuestionRequest, SessionEngine,
-    SpawnChoices, StreamEvent, StreamItem, TurnId, UsageKind, UsageSnapshot, WireAnswerKind,
-    WorktreeChoice, truncate_free_text,
+    AnswerValue, ApprovalChoiceSummary, ApprovalDecision, ApprovalRequest, BuiltinCommand,
+    Connection, DraftAction, EffortChoice, EngineEvent, FREE_TEXT_LIMIT, FailedCommand, ItemStatus,
+    ModelChoice, ModelInfo, MusePermission, PendingAnswer, PendingDecision, PendingKind,
+    PendingPhase, PendingRequest, PendingResolution, PermissionMode, Question, QuestionOption,
+    QuestionRequest, SessionEngine, SkillInfo, SkillInvocation, SpawnChoices, StreamEvent,
+    StreamItem, TurnId, TurnInput, UsageKind, UsageSnapshot, WireAnswerKind, WorktreeChoice,
+    parse_slash_draft, truncate_free_text,
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,

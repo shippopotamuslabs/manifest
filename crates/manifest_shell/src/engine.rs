@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use iced::futures::StreamExt;
 use manifest_domain::{
-    Connection, EngineEvent, SessionEngine, SessionId, SpawnChoices, StreamEvent,
+    Connection, EngineEvent, SessionEngine, SessionId, SpawnChoices, StreamEvent, TurnInput,
 };
 
 /// Folds `next` into `into` when both are item deltas for the same
@@ -74,13 +74,13 @@ impl EngineHandle {
     }
 
     /// Spawns a session; success arrives as `SessionSpawned`.
-    pub fn spawn_session(&self, workspace: String, prompt: String, choices: SpawnChoices) {
-        self.inner.spawn_session(workspace, prompt, choices);
+    pub fn spawn_session(&self, workspace: String, input: TurnInput, choices: SpawnChoices) {
+        self.inner.spawn_session(workspace, input, choices);
     }
 
     /// Sends a follow-up turn; success arrives as `TurnAccepted`.
-    pub fn send_turn(&self, session: SessionId, prompt: String) {
-        self.inner.send_turn(session, prompt);
+    pub fn send_turn(&self, session: SessionId, input: TurnInput) {
+        self.inner.send_turn(session, input);
     }
 
     /// Steers the running turn; failures arrive as `CommandFailed`.
@@ -99,6 +99,25 @@ impl EngineHandle {
     /// host is live.
     pub fn list_models(&self, workspace: Option<String>, session: Option<SessionId>) {
         self.inner.list_models(workspace, session);
+    }
+
+    /// Requests a skill-catalog refresh for the session; results
+    /// arrive as `SkillsLoaded`. The shell re-lists on the
+    /// catalog-changed stream hint.
+    pub fn list_skills(&self, session: SessionId) {
+        self.inner.list_skills(session);
+    }
+
+    /// Compacts the session's context; failures arrive as
+    /// `CommandFailed(Compact)`, success emits nothing.
+    pub fn compact_session(&self, session: SessionId) {
+        self.inner.compact_session(session);
+    }
+
+    /// Sets the session's goal objective; failures arrive as
+    /// `CommandFailed(Goal)`, success emits nothing.
+    pub fn set_goal(&self, session: SessionId, objective: String) {
+        self.inner.set_goal(session, objective);
     }
 
     /// Resumes a session; success arrives as `SessionResumed`.
@@ -374,12 +393,12 @@ mod tests {
         fn spawn_session(
             &self,
             _workspace: String,
-            _prompt: String,
+            _input: manifest_domain::TurnInput,
             _choices: manifest_domain::SpawnChoices,
         ) {
         }
 
-        fn send_turn(&self, _session: SessionId, _prompt: String) {}
+        fn send_turn(&self, _session: SessionId, _input: manifest_domain::TurnInput) {}
 
         fn resume_session(&self, session: SessionId) {
             self.resumed.lock().unwrap().push(session);

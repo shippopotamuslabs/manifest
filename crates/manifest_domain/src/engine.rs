@@ -652,6 +652,14 @@ pub enum StreamEvent {
         /// Which phase the request is in.
         phase: PendingPhase,
     },
+    /// The host skill catalog changed for this session.
+    ///
+    /// A hint to re-list, never the catalog itself: the shell
+    /// re-lists through [`SessionEngine::list_skills`] on this event.
+    CatalogChanged {
+        /// Session whose catalog changed.
+        session: SessionId,
+    },
 }
 
 /// One Muse approval posture, mirroring the server's `approval_mode`.
@@ -884,6 +892,205 @@ impl ModelInfo {
     }
 }
 
+/// One row of the host skill catalog, mirroring the server's
+/// `muse_skills` entries; the shell picks from these, never raw JSON.
+///
+/// Selectors are slash-menu handles sent back as the skill part's
+/// `selector`; rows without one never reach this type (the mapper
+/// skips them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInfo {
+    /// Slash-menu handle, sent back as `selector`.
+    pub selector: String,
+    /// Human name from the catalog; falls back to `selector`.
+    pub display_name: String,
+    /// One-line account of what the skill does; empty when unsent.
+    pub description: String,
+    /// Catalog scope (`bundled`, `user`, `project`, or `plugin`).
+    pub source: String,
+    /// Plugin that provides the skill, when the host named one.
+    pub plugin_id: Option<String>,
+    /// Argument hint shown in the slash menu, when the host sent one.
+    pub argument_hint: Option<String>,
+}
+
+impl SkillInfo {
+    /// Human name for pickers: the display name, or the selector when blank.
+    pub fn label(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            &self.selector
+        } else {
+            &self.display_name
+        }
+    }
+}
+
+/// One skill invocation: a slash-menu pick plus its raw arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInvocation {
+    /// Slash-menu handle of the skill to run.
+    pub selector: String,
+    /// Catalog scope, when known.
+    pub source: Option<String>,
+    /// Raw argument text after the selector; empty when none was typed.
+    pub arguments: String,
+}
+
+/// What one turn sends: plain text or a skill invocation.
+///
+/// The data layer maps `Text` to the server's `prompt` field and
+/// `Skill` to a `parts` array carrying one `skill` part; the shell
+/// builds this from the composer and echoes
+/// [`TurnInput::display_text`] optimistically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnInput {
+    /// Plain prompt text, sent as the server's `prompt` field.
+    Text(String),
+    /// A slash-menu skill pick, sent as one `skill` part.
+    Skill(SkillInvocation),
+}
+
+impl TurnInput {
+    /// Transcript echo: text as-is; skills as `/selector` plus the
+    /// arguments when any were typed.
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text(prompt) => prompt.clone(),
+            Self::Skill(invocation) => {
+                if invocation.arguments.trim().is_empty() {
+                    format!("/{}", invocation.selector)
+                } else {
+                    format!("/{} {}", invocation.selector, invocation.arguments)
+                }
+            }
+        }
+    }
+}
+
+/// One hard-coded composer slash command, listed ahead of the skill
+/// catalog rows. Builtins never reach the data layer as turns: the
+/// shell folds each into its own behavior on send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinCommand {
+    /// Open the model menu instead of sending a turn.
+    Model,
+    /// Compact the visible session's context through `muse_raw`.
+    Compact,
+    /// Set the visible session's goal through `muse_raw`.
+    Goal,
+}
+
+impl BuiltinCommand {
+    /// Every builtin, in slash-menu order.
+    pub fn all() -> [Self; 3] {
+        [Self::Model, Self::Compact, Self::Goal]
+    }
+
+    /// Slash-menu handle, typed after `/`.
+    pub fn selector(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Compact => "compact",
+            Self::Goal => "goal",
+        }
+    }
+
+    /// Short human name for the slash menu.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Compact => "Compact",
+            Self::Goal => "Goal",
+        }
+    }
+
+    /// One-line account of what accepting the row does.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Model => "Switch the model new sessions spawn with.",
+            Self::Compact => "Compact the visible session's context.",
+            Self::Goal => "Set the visible session's goal.",
+        }
+    }
+
+    /// Classify a first-token selector; unknown text is not a builtin.
+    pub fn parse(selector: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|builtin| builtin.selector() == selector)
+    }
+}
+
+/// What the shell does with one composer draft on send.
+///
+/// Pure data: the shell owns the follow-through (engine calls, menu
+/// opens, draft clears), so this stays unit-testable with no engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftAction {
+    /// Plain text: send as [`TurnInput::Text`], exactly as typed.
+    Text,
+    /// A ready catalog skill: send as [`TurnInput::Skill`].
+    Skill(SkillInvocation),
+    /// Open the model menu instead of sending; the draft is kept.
+    OpenModelMenu,
+    /// Compact the visible session; the draft clears like a send.
+    Compact,
+    /// Set the visible session's goal; the draft clears like a send.
+    SetGoal(String),
+    /// A builtin that needs more input (`/goal` with no objective):
+    /// send nothing and keep the draft.
+    KeepDraft,
+}
+
+/// Parse one composer draft for slash handling.
+///
+/// Only a draft whose first whitespace-delimited token starts with
+/// `/` is a slash draft; anything else is [`DraftAction::Text`].
+/// Builtins win over catalog rows on a selector clash (they list
+/// first in the menu). A catalog match needs the ready catalog and
+/// an exact selector; unknown selectors stay [`DraftAction::Text`].
+/// `/goal` with an empty objective is [`DraftAction::KeepDraft`];
+/// `/model` (with any trailing text) opens the menu.
+pub fn parse_slash_draft(draft: &str, skills: &[SkillInfo]) -> DraftAction {
+    // Leading whitespace never owns the first token: the token after
+    // it does, so the rest slices from the trimmed draft.
+    let trimmed = draft.trim_start();
+    let mut tokens = trimmed.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return DraftAction::Text;
+    };
+    let Some(selector) = first.strip_prefix('/') else {
+        return DraftAction::Text;
+    };
+    if selector.is_empty() {
+        return DraftAction::Text;
+    }
+    // The rest of the draft after the first token, trimmed; the
+    // skill arguments and the goal objective both read from here.
+    let rest = trimmed[first.len()..].trim();
+    if let Some(builtin) = BuiltinCommand::parse(selector) {
+        return match builtin {
+            BuiltinCommand::Model => DraftAction::OpenModelMenu,
+            BuiltinCommand::Compact => DraftAction::Compact,
+            BuiltinCommand::Goal => {
+                if rest.is_empty() {
+                    DraftAction::KeepDraft
+                } else {
+                    DraftAction::SetGoal(rest.to_string())
+                }
+            }
+        };
+    }
+    if let Some(skill) = skills.iter().find(|skill| skill.selector == selector) {
+        return DraftAction::Skill(SkillInvocation {
+            selector: skill.selector.clone(),
+            source: (!skill.source.trim().is_empty()).then(|| skill.source.clone()),
+            arguments: rest.to_string(),
+        });
+    }
+    DraftAction::Text
+}
+
 /// Read one flat numeric field from raw JSON text.
 ///
 /// Best-effort scan for a crate with no JSON dependency: finds the
@@ -1065,6 +1272,12 @@ pub enum FailedCommand {
     Cancel(SessionId),
     /// Listing the model catalog failed.
     Models,
+    /// Listing the skill catalog of this session failed.
+    Skills(SessionId),
+    /// Compacting this session failed.
+    Compact(SessionId),
+    /// Setting this session's goal failed.
+    Goal(SessionId),
     /// Fetching pending approvals/questions failed.
     ///
     /// The fetch is global (`muse_pending` takes no session), so
@@ -1103,6 +1316,16 @@ pub enum EngineEvent {
     ModelsLoaded {
         /// Catalog rows in the host's order.
         models: Vec<ModelInfo>,
+    },
+    /// A skill-catalog refresh succeeded.
+    ///
+    /// Selection stays the shell's job; selectors go back as the
+    /// skill part's `selector`.
+    SkillsLoaded {
+        /// Session the catalog belongs to.
+        session: SessionId,
+        /// Catalog rows in the host's order.
+        skills: Vec<SkillInfo>,
     },
     /// A session spawn succeeded; the first turn streams next, when sent.
     SessionSpawned {
@@ -1168,21 +1391,21 @@ pub enum EngineEvent {
 pub trait SessionEngine: Send + Sync {
     /// Request a session-list refresh; results arrive as [`EngineEvent`] values.
     fn list_sessions(&self);
-    /// Spawn a session on `workspace` with `prompt` as its first turn.
+    /// Spawn a session on `workspace` with `input` as its first turn.
     ///
     /// Non-blocking; success arrives as
     /// [`EngineEvent::SessionSpawned`], failure as
     /// [`EngineEvent::CommandFailed`]. Commands submitted while
     /// disconnected fail fast with [`EngineEvent::CommandFailed`]
     /// rather than queueing.
-    fn spawn_session(&self, workspace: String, prompt: String, choices: SpawnChoices);
+    fn spawn_session(&self, workspace: String, input: TurnInput, choices: SpawnChoices);
     /// Send a follow-up turn to `session`.
     ///
     /// Non-blocking; success arrives as [`EngineEvent::TurnAccepted`],
     /// failure as [`EngineEvent::CommandFailed`]. Commands submitted
     /// while disconnected fail fast with [`EngineEvent::CommandFailed`]
     /// rather than queueing.
-    fn send_turn(&self, session: SessionId, prompt: String);
+    fn send_turn(&self, session: SessionId, input: TurnInput);
     /// Resume `session` on the server.
     ///
     /// Non-blocking; success arrives as
@@ -1213,6 +1436,28 @@ pub trait SessionEngine: Send + Sync {
     /// from, so the caller passes a workspace, a session id, or both;
     /// a bare request fails while no host is live.
     fn list_models(&self, _workspace: Option<String>, _session: Option<SessionId>) {}
+    /// Request a skill-catalog refresh for `session`; results arrive
+    /// as [`EngineEvent::SkillsLoaded`], failures as
+    /// [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Skills`]. Engines without skill support keep
+    /// the default, which drops the call.
+    fn list_skills(&self, _session: SessionId) {}
+    /// Compact `session`'s context through the server's `muse_raw`
+    /// (`session/compact`, admitted asynchronously).
+    ///
+    /// Non-blocking; success emits nothing (the compaction's terminal
+    /// view event carries the outcome), failure arrives as
+    /// [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Compact`]. Engines without compaction keep
+    /// the default, which drops the call.
+    fn compact_session(&self, _session: SessionId) {}
+    /// Set `session`'s goal objective through the server's `muse_raw`
+    /// (`goal/set`).
+    ///
+    /// Non-blocking; success emits nothing, failure arrives as
+    /// [`EngineEvent::CommandFailed`] with [`FailedCommand::Goal`].
+    /// Engines without goals keep the default, which drops the call.
+    fn set_goal(&self, _session: SessionId, _objective: String) {}
     /// Fetch pending approvals/questions; results arrive as
     /// [`EngineEvent::PendingLoaded`], failures as
     /// [`EngineEvent::CommandFailed`] with
@@ -1512,8 +1757,8 @@ mod tests {
 
     impl SessionEngine for LegacyEngine {
         fn list_sessions(&self) {}
-        fn spawn_session(&self, _workspace: String, _prompt: String, _choices: SpawnChoices) {}
-        fn send_turn(&self, _session: SessionId, _prompt: String) {}
+        fn spawn_session(&self, _workspace: String, _input: TurnInput, _choices: SpawnChoices) {}
+        fn send_turn(&self, _session: SessionId, _input: TurnInput) {}
         fn resume_session(&self, _session: SessionId) {}
     }
 
@@ -1528,6 +1773,7 @@ mod tests {
         engine.cancel_turn(SessionId::new("s"), None);
         engine.cancel_turn(SessionId::new("s"), Some(TurnId::new("t")));
         engine.list_models(None, None);
+        engine.list_skills(SessionId::new("s"));
         engine.fetch_pending();
         engine.decide(
             SessionId::new("s"),
@@ -1540,6 +1786,80 @@ mod tests {
             String::from("r1"),
             PendingAnswer::single("q1", AnswerValue::Skipped),
         );
+    }
+
+    #[test]
+    fn turn_input_display_text_echoes_text_and_skill() {
+        assert_eq!(
+            TurnInput::Text(String::from("hello")).display_text(),
+            "hello"
+        );
+        let bare = TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: None,
+            arguments: String::new(),
+        });
+        assert_eq!(bare.display_text(), "/review");
+        let blank_args = TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: Some(String::from("user")),
+            arguments: String::from("   "),
+        });
+        assert_eq!(blank_args.display_text(), "/review");
+        let with_args = TurnInput::Skill(SkillInvocation {
+            selector: String::from("review"),
+            source: Some(String::from("user")),
+            arguments: String::from("pr 42"),
+        });
+        assert_eq!(with_args.display_text(), "/review pr 42");
+    }
+
+    #[test]
+    fn skill_label_falls_back_to_selector() {
+        let named = SkillInfo {
+            selector: String::from("review"),
+            display_name: String::from("Review"),
+            description: String::new(),
+            source: String::from("user"),
+            plugin_id: None,
+            argument_hint: None,
+        };
+        assert_eq!(named.label(), "Review");
+        let blank = SkillInfo {
+            display_name: String::from("  "),
+            ..named.clone()
+        };
+        assert_eq!(blank.label(), "review");
+        assert_eq!(
+            named.clone(),
+            SkillInfo {
+                selector: String::from("review"),
+                ..named
+            }
+        );
+    }
+
+    #[test]
+    fn skills_loaded_event_carries_session_and_catalog() {
+        let event = EngineEvent::SkillsLoaded {
+            session: SessionId::new("s-1"),
+            skills: vec![SkillInfo {
+                selector: String::from("review"),
+                display_name: String::from("Review"),
+                description: String::from("Reviews code"),
+                source: String::from("user"),
+                plugin_id: None,
+                argument_hint: Some(String::from("<pr>")),
+            }],
+        };
+        match event {
+            EngineEvent::SkillsLoaded { session, skills } => {
+                assert_eq!(session, SessionId::new("s-1"));
+                assert_eq!(skills.len(), 1);
+                assert_eq!(skills[0].label(), "Review");
+            }
+            _ => panic!("expected SkillsLoaded"),
+        }
     }
 
     fn sample_question(multi: bool) -> Question {
@@ -1772,6 +2092,173 @@ mod tests {
         assert_ne!(
             FailedCommand::Answer(SessionId::new("s1"), String::from("r1")),
             FailedCommand::PendingFetch
+        );
+    }
+
+    /// One catalog skill for the slash-parse tests.
+    fn parse_skills() -> Vec<SkillInfo> {
+        vec![
+            SkillInfo {
+                selector: String::from("review"),
+                display_name: String::from("Review"),
+                description: String::from("Review code"),
+                source: String::from("user"),
+                plugin_id: None,
+                argument_hint: None,
+            },
+            SkillInfo {
+                selector: String::from("empty-source"),
+                display_name: String::new(),
+                description: String::new(),
+                source: String::new(),
+                plugin_id: None,
+                argument_hint: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn slash_parse_skill_with_args_carries_source_and_arguments() {
+        let got = parse_slash_draft("/review pr 42", &parse_skills());
+        assert_eq!(
+            got,
+            DraftAction::Skill(SkillInvocation {
+                selector: String::from("review"),
+                source: Some(String::from("user")),
+                arguments: String::from("pr 42"),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_parse_skill_without_args_has_empty_arguments() {
+        let got = parse_slash_draft("/review", &parse_skills());
+        assert_eq!(
+            got,
+            DraftAction::Skill(SkillInvocation {
+                selector: String::from("review"),
+                source: Some(String::from("user")),
+                arguments: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_parse_skill_with_empty_source_sends_no_source() {
+        let got = parse_slash_draft("/empty-source x", &parse_skills());
+        assert_eq!(
+            got,
+            DraftAction::Skill(SkillInvocation {
+                selector: String::from("empty-source"),
+                source: None,
+                arguments: String::from("x"),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_parse_unknown_selector_is_text() {
+        assert_eq!(
+            parse_slash_draft("/nope fix it", &parse_skills()),
+            DraftAction::Text
+        );
+    }
+
+    #[test]
+    fn slash_parse_plain_text_is_text() {
+        assert_eq!(
+            parse_slash_draft("hello there", &parse_skills()),
+            DraftAction::Text
+        );
+        assert_eq!(parse_slash_draft("", &parse_skills()), DraftAction::Text);
+        assert_eq!(parse_slash_draft("/", &parse_skills()), DraftAction::Text);
+    }
+
+    #[test]
+    fn slash_parse_prefix_match_is_not_a_skill() {
+        // Only an exact selector matches; `/rev` is plain text even
+        // though `/review` exists.
+        assert_eq!(
+            parse_slash_draft("/rev", &parse_skills()),
+            DraftAction::Text
+        );
+    }
+
+    #[test]
+    fn slash_parse_goal_with_objective_sets_it() {
+        assert_eq!(
+            parse_slash_draft("/goal ship the slice", &parse_skills()),
+            DraftAction::SetGoal(String::from("ship the slice"))
+        );
+    }
+
+    #[test]
+    fn slash_parse_goal_without_objective_keeps_draft() {
+        assert_eq!(
+            parse_slash_draft("/goal", &parse_skills()),
+            DraftAction::KeepDraft
+        );
+        assert_eq!(
+            parse_slash_draft("/goal   ", &parse_skills()),
+            DraftAction::KeepDraft
+        );
+    }
+
+    #[test]
+    fn slash_parse_compact_and_model() {
+        assert_eq!(
+            parse_slash_draft("/compact", &parse_skills()),
+            DraftAction::Compact
+        );
+        assert_eq!(
+            parse_slash_draft("/model", &parse_skills()),
+            DraftAction::OpenModelMenu
+        );
+        assert_eq!(
+            parse_slash_draft("/model muse-spark", &parse_skills()),
+            DraftAction::OpenModelMenu
+        );
+    }
+
+    #[test]
+    fn slash_parse_builtin_wins_over_catalog_clash() {
+        let mut skills = parse_skills();
+        skills.push(SkillInfo {
+            selector: String::from("model"),
+            display_name: String::from("Model skill"),
+            description: String::new(),
+            source: String::from("user"),
+            plugin_id: None,
+            argument_hint: None,
+        });
+        assert_eq!(
+            parse_slash_draft("/model", &skills),
+            DraftAction::OpenModelMenu
+        );
+    }
+
+    #[test]
+    fn slash_parse_ignores_leading_whitespace() {
+        let got = parse_slash_draft("  /review x", &parse_skills());
+        assert_eq!(
+            got,
+            DraftAction::Skill(SkillInvocation {
+                selector: String::from("review"),
+                source: Some(String::from("user")),
+                arguments: String::from("x"),
+            })
+        );
+    }
+
+    #[test]
+    fn compact_and_goal_failures_carry_their_session() {
+        assert_eq!(
+            FailedCommand::Compact(SessionId::new("s1")),
+            FailedCommand::Compact(SessionId::new("s1"))
+        );
+        assert_ne!(
+            FailedCommand::Compact(SessionId::new("s1")),
+            FailedCommand::Goal(SessionId::new("s1"))
         );
     }
 }

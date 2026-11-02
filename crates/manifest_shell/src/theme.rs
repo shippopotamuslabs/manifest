@@ -141,6 +141,10 @@ pub fn attach_menu_bottom_offset(visible_lines: usize) -> f32 {
             + 2.0 * SPACE_XS)
         + SPACE_S
 }
+// Fixed width of the floating slash-menu card above the composer.
+// The card carries a source icon, the selector, and a one-line
+// description per row, so it runs wider than the model card.
+pub const SLASH_POPUP_WIDTH: f32 = 420.0;
 // Fixed max height of the scrollable catalog list inside the model
 // card, so a long catalog never grows the popup unbounded.
 pub const MODEL_LIST_MAX_HEIGHT: f32 = 240.0;

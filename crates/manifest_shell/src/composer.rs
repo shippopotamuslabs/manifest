@@ -7,17 +7,20 @@
 //! the send, stop, attach-picker, and menu-selection messages; the
 //! reducer here only folds popup toggles and local display state.
 
+use std::ops::Range;
+
 use iced::widget::text_editor;
 use iced::{Element, Length};
 use manifest_domain::{
-    EffortChoice, ModelChoice, ModelInfo, MusePermission, PermissionMode, UsageSnapshot,
+    BuiltinCommand, EffortChoice, ModelChoice, ModelInfo, MusePermission, PermissionMode,
+    SkillInfo, UsageSnapshot,
 };
 
 use crate::kit::{self, IconButtonKind};
 use crate::theme::{
     ATTACH_POPUP_WIDTH, COMPOSER_MAX_LINES, CONTEXT_POPUP_WIDTH, EFFORT_POPUP_WIDTH,
     FONT_SIZE_PANEL, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH,
-    PERMISSION_POPUP_WIDTH, SPACE_S, SPACE_XS, TEXT_FAINT, TEXT_TERTIARY,
+    PERMISSION_POPUP_WIDTH, SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, TEXT_FAINT, TEXT_TERTIARY,
 };
 
 /// The attach popup has two real situations, so it is an enum, not a
@@ -82,6 +85,71 @@ pub enum ModelCatalog {
     Failed(String),
 }
 
+/// The skill catalog has three real situations, so it is an enum, not
+/// a tuple of options (UI contract §1), mirroring [`ModelCatalog`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SkillCatalog {
+    /// The catalog was requested and has not arrived yet.
+    #[default]
+    Loading,
+    /// The catalog arrived; the slash menu picks from these rows.
+    Ready(Vec<SkillInfo>),
+    /// The catalog request failed; carries the message. The App
+    /// constructs this when a skills-tagged `CommandFailed` arrives
+    /// while a catalog request is pending (`skills_pending` in `app.rs`).
+    Failed(String),
+}
+
+/// The slash menu has three real situations, so it is an enum, not a
+/// bool (UI contract §1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SlashMenu {
+    /// No slash menu is showing.
+    #[default]
+    Closed,
+    /// The menu is showing; `selected` indexes [`State::slash_rows`].
+    Open {
+        /// Selected row, always in range while rows are non-empty.
+        selected: usize,
+    },
+    /// Esc dismissed the menu for this exact draft text: the same text
+    /// does not reopen it, and any edit re-arms it.
+    Dismissed {
+        /// Draft text at dismissal time.
+        text: String,
+    },
+}
+
+/// One slash-menu row's identity, carried by click messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashPick {
+    /// A hard-coded builtin row.
+    Builtin(BuiltinCommand),
+    /// A catalog skill row, by selector.
+    Skill(String),
+}
+
+/// One precomputed visible slash-menu row: builtins first, then the
+/// filtered catalog rows. Computed once in `update()` and stored in
+/// [`State::slash_rows`], so the view reads without filtering
+/// (UI contract §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashRow {
+    /// Row identity for click messages.
+    pub pick: SlashPick,
+    /// Slash-menu handle, without the leading `/`.
+    pub selector: String,
+    /// Precomputed `/selector` display text.
+    pub display: String,
+    /// Human name: the skill label or the builtin name.
+    pub name: String,
+    /// One-line account of the row.
+    pub description: String,
+    /// Catalog scope (`builtin`, `bundled`, `user`, `project`, or
+    /// `plugin`); picks the row's source icon.
+    pub source: String,
+}
+
 /// Messages the composer can receive, enumerated before the view.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -121,6 +189,20 @@ pub enum Message {
     ContextPressed,
     /// A press landed outside the floating context popup; closes it.
     ContextDismissed,
+    /// The selection moved down one slash row (wraps); no-op while
+    /// the menu is closed or has no rows.
+    SlashNext,
+    /// The selection moved up one slash row (wraps); no-op while the
+    /// menu is closed or has no rows.
+    SlashPrev,
+    /// The selected slash row was accepted: the draft becomes
+    /// `/selector ` and the menu closes. No-op without a selection.
+    SlashAccept,
+    /// A slash row was clicked: accepts that row's identity.
+    SlashSelected(SlashPick),
+    /// Esc closed the slash menu for the current draft text; the same
+    /// text does not reopen it.
+    SlashDismiss,
 }
 
 /// Composer state: the draft content plus the live picker state and
@@ -164,6 +246,19 @@ pub struct State {
     pub effort: EffortChoice,
     /// The host model catalog.
     pub catalog: ModelCatalog,
+    /// The host skill catalog.
+    pub skill_catalog: SkillCatalog,
+    /// Whether the slash menu is showing, and its selection.
+    pub slash_menu: SlashMenu,
+    /// Precomputed visible slash rows for the current draft query:
+    /// builtins first, then filtered catalog rows. The view reads
+    /// these without filtering (UI contract §2).
+    pub slash_rows: Vec<SlashRow>,
+    /// Selectors the input highlights as a leading `/selector` token:
+    /// builtins plus the ready catalog's selectors, refreshed with
+    /// the catalog. The view passes these to the editor as highlight
+    /// settings, so the editor re-highlights only when they change.
+    pub highlight_selectors: Vec<String>,
     /// Path refs attached to the draft, in pick order.
     pub attachments: Vec<String>,
     /// The visible session's latest usage snapshot, when reported.
@@ -196,6 +291,10 @@ impl State {
             model: ModelChoice::default(),
             effort: EffortChoice::default(),
             catalog: ModelCatalog::Loading,
+            skill_catalog: SkillCatalog::Loading,
+            slash_menu: SlashMenu::Closed,
+            slash_rows: Vec::new(),
+            highlight_selectors: builtin_selectors(),
             attachments: Vec::new(),
             usage: None,
             model_effort_label: String::new(),
@@ -224,6 +323,7 @@ impl State {
         self.permission_menu = PermissionMenu::Closed;
         self.model_menu = ModelMenu::Closed;
         self.context_popover = ContextPopover::Closed;
+        self.close_slash();
         self.refresh_derived();
     }
 
@@ -234,6 +334,7 @@ impl State {
         self.content = text_editor::Content::with_text(&text);
         self.has_text = !self.content.text().is_empty();
         self.visible_lines = self.content.line_count().clamp(1, COMPOSER_MAX_LINES);
+        self.refresh_slash_menu();
     }
 
     /// Recomputes the derived display strings from the picker state.
@@ -312,6 +413,7 @@ impl State {
                 self.content.perform(action);
                 self.has_text = !self.content.text().is_empty();
                 self.visible_lines = self.content.line_count().clamp(1, COMPOSER_MAX_LINES);
+                self.refresh_slash_menu();
             }
             Message::AttachPressed => {
                 self.attach_popup = match self.attach_popup {
@@ -319,6 +421,7 @@ impl State {
                         self.permission_menu = PermissionMenu::Closed;
                         self.model_menu = ModelMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
+                        self.close_slash();
                         AttachPopup::Open
                     }
                     AttachPopup::Open => AttachPopup::Closed,
@@ -333,6 +436,7 @@ impl State {
                         self.model_menu = ModelMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
                         self.attach_popup = AttachPopup::Closed;
+                        self.close_slash();
                         PermissionMenu::Open
                     }
                     PermissionMenu::Open => PermissionMenu::Closed,
@@ -351,6 +455,7 @@ impl State {
                         self.permission_menu = PermissionMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
                         self.attach_popup = AttachPopup::Closed;
+                        self.close_slash();
                         ModelMenu::Open
                     }
                     ModelMenu::Open | ModelMenu::EffortOpen => ModelMenu::Closed,
@@ -384,6 +489,7 @@ impl State {
                         self.permission_menu = PermissionMenu::Closed;
                         self.model_menu = ModelMenu::Closed;
                         self.attach_popup = AttachPopup::Closed;
+                        self.close_slash();
                         ContextPopover::Open
                     }
                     ContextPopover::Open => ContextPopover::Closed,
@@ -392,11 +498,103 @@ impl State {
             Message::ContextDismissed => {
                 self.context_popover = ContextPopover::Closed;
             }
+            Message::SlashNext => {
+                if let SlashMenu::Open { selected } = &mut self.slash_menu
+                    && !self.slash_rows.is_empty()
+                {
+                    *selected = (*selected + 1) % self.slash_rows.len();
+                }
+            }
+            Message::SlashPrev => {
+                if let SlashMenu::Open { selected } = &mut self.slash_menu
+                    && !self.slash_rows.is_empty()
+                {
+                    let len = self.slash_rows.len();
+                    *selected = (*selected + len - 1) % len;
+                }
+            }
+            Message::SlashAccept => {
+                if let SlashMenu::Open { selected } = &self.slash_menu
+                    && let Some(row) = self.slash_rows.get(*selected)
+                {
+                    let pick = row.pick.clone();
+                    self.accept_slash_pick(&pick);
+                }
+            }
+            Message::SlashSelected(pick) => {
+                if self.slash_rows.iter().any(|row| row.pick == pick) {
+                    self.accept_slash_pick(&pick);
+                }
+            }
+            Message::SlashDismiss => {
+                if matches!(self.slash_menu, SlashMenu::Open { .. }) {
+                    let text = self.content.text();
+                    self.slash_menu = SlashMenu::Dismissed { text };
+                    self.slash_rows.clear();
+                }
+            }
             Message::SendPressed
             | Message::StopPressed
             | Message::AttachFilesPressed
             | Message::AttachPicked(_) => {}
         }
+    }
+
+    /// Accepts one slash row: the draft becomes `/selector ` with the
+    /// caret after it, and the menu closes. Accepting the model
+    /// builtin also opens the model menu, matching what sending
+    /// `/model` does.
+    fn accept_slash_pick(&mut self, pick: &SlashPick) {
+        let selector = match pick {
+            SlashPick::Builtin(builtin) => builtin.selector(),
+            SlashPick::Skill(selector) => selector.as_str(),
+        };
+        self.content = text_editor::Content::with_text(&format!("/{selector} "));
+        self.has_text = true;
+        self.visible_lines = self.content.line_count().clamp(1, COMPOSER_MAX_LINES);
+        self.close_slash();
+        if matches!(pick, SlashPick::Builtin(BuiltinCommand::Model)) {
+            self.permission_menu = PermissionMenu::Closed;
+            self.context_popover = ContextPopover::Closed;
+            self.attach_popup = AttachPopup::Closed;
+            self.model_menu = ModelMenu::Open;
+        }
+    }
+
+    /// Closes the slash menu without dismissing it for the draft: the
+    /// next edit re-arms it while the draft still triggers. Only one
+    /// menu shows at a time, so the other menu toggles call this when
+    /// they open.
+    fn close_slash(&mut self) {
+        self.slash_menu = SlashMenu::Closed;
+        self.slash_rows.clear();
+    }
+
+    /// Recomputes the slash menu from the draft after every edit: a
+    /// draft whose first token starts with `/` opens (or refilters)
+    /// the menu, anything else closes it. A dismissed menu stays shut
+    /// for its exact dismissal text; any edit re-arms it. The visible
+    /// rows are precomputed here so the view reads without filtering
+    /// (UI contract §2); the selection clamps into the new rows.
+    fn refresh_slash_menu(&mut self) {
+        let text = self.content.text();
+        let Some(query) = slash_query(&text) else {
+            self.close_slash();
+            return;
+        };
+        if let SlashMenu::Dismissed { text: dismissed } = &self.slash_menu
+            && dismissed == &text
+        {
+            self.slash_rows.clear();
+            return;
+        }
+        let rows = filter_slash_rows(&query, &self.skill_catalog);
+        let selected = match self.slash_menu {
+            SlashMenu::Open { selected } => selected.min(rows.len().saturating_sub(1)),
+            SlashMenu::Closed | SlashMenu::Dismissed { .. } => 0,
+        };
+        self.slash_rows = rows;
+        self.slash_menu = SlashMenu::Open { selected };
     }
 
     /// Inserts a picked path ref into the draft and closes the popup.
@@ -431,6 +629,19 @@ impl State {
         self.refresh_derived();
     }
 
+    /// Replaces the skill catalog, refreshes the highlight selectors
+    /// and the visible slash rows, so the view reads without lookup
+    /// (UI contract §2).
+    pub fn set_skill_catalog(&mut self, catalog: SkillCatalog) {
+        self.skill_catalog = catalog;
+        let mut selectors = builtin_selectors();
+        if let SkillCatalog::Ready(skills) = &self.skill_catalog {
+            selectors.extend(skills.iter().map(|skill| skill.selector.clone()));
+        }
+        self.highlight_selectors = selectors;
+        self.refresh_slash_menu();
+    }
+
     /// Replaces the usage snapshot and recomputes the meter strings,
     /// so the view reads without formatting (UI contract §2).
     pub fn set_usage(&mut self, usage: Option<UsageSnapshot>) {
@@ -445,6 +656,17 @@ impl State {
     /// [`State::model_menu_overlay`], [`State::permission_menu_overlay`],
     /// and [`State::context_popover_overlay`].
     pub fn view(&self) -> Element<'_, Message> {
+        // While the slash menu is open, arrows/Tab/Enter/Esc fold into
+        // menu messages through the editor's key binding, before the
+        // editor can consume them (arrows must not move the caret, Tab
+        // must not leave the input, Enter must accept). Every other
+        // key falls back to the editor defaults inside the closure.
+        let slash_active = matches!(self.slash_menu, SlashMenu::Open { .. });
+        let has_rows = slash_active && !self.slash_rows.is_empty();
+        let keys: Option<kit::ComposerKeys<'_, Message>> = slash_active.then(|| {
+            Box::new(move |press: text_editor::KeyPress| slash_key_binding(press, has_rows))
+                as kit::ComposerKeys<'_, Message>
+        });
         let mut row = iced::widget::row![
             kit::composer_icon_slot(kit::icon_button(
                 lucide_icons::Icon::Plus,
@@ -455,6 +677,8 @@ impl State {
                 &self.content,
                 self.visible_lines,
                 Message::Edit,
+                &self.highlight_selectors,
+                keys,
             ))
             .width(Length::Fill),
         ]
@@ -548,6 +772,20 @@ impl State {
             None
         } else {
             Some(self.context_popover_view())
+        }
+    }
+
+    /// The floating slash menu for the App to overlay above the
+    /// composer, or `None` when the menu is closed or dismissed. The
+    /// menu never sits in the composer's layout flow, so opening it
+    /// cannot change the composer's height or push the transcript
+    /// around; the App anchors this card at the main column's left
+    /// edge, just above the input bar.
+    pub(crate) fn slash_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        if matches!(self.slash_menu, SlashMenu::Open { .. }) {
+            Some(self.slash_menu_view())
+        } else {
+            None
         }
     }
 
@@ -695,7 +933,7 @@ impl State {
                 }
                 rows = rows.push(
                     iced::widget::scrollable(list)
-                        .height(Length::Fixed(model_list_height(models.len())))
+                        .height(Length::Fixed(popup_list_height(models.len())))
                         .width(Length::Fill),
                 );
             }
@@ -747,6 +985,52 @@ impl State {
         );
         kit::popup_card(popover.width(Length::Fill), CONTEXT_POPUP_WIDTH)
     }
+
+    /// The slash menu: one row per precomputed visible row, newest
+    /// selection highlighted. Catalog states without rows read as
+    /// notes, never as a blank card: loading while the request is in
+    /// flight, the failure message on error, an empty state for an
+    /// empty catalog, and a no-match note for a filtered-out query.
+    fn slash_menu_view(&self) -> Element<'_, Message> {
+        let selected = match self.slash_menu {
+            SlashMenu::Open { selected } => selected,
+            SlashMenu::Closed | SlashMenu::Dismissed { .. } => 0,
+        };
+        let mut menu = iced::widget::column![].spacing(SPACE_XS);
+        if self.slash_rows.is_empty() {
+            let note = match &self.skill_catalog {
+                SkillCatalog::Loading => "Loading skills…",
+                SkillCatalog::Failed(message) => message.as_str(),
+                SkillCatalog::Ready(_) => {
+                    if slash_query(&self.content.text()).is_some_and(|query| query.is_empty()) {
+                        "No skills available"
+                    } else {
+                        "No matching commands"
+                    }
+                }
+            };
+            menu = menu.push(kit::popup_note(note));
+        } else {
+            let mut list = iced::widget::column![]
+                .spacing(SPACE_XS)
+                .width(Length::Fill);
+            for (index, row) in self.slash_rows.iter().enumerate() {
+                list = list.push(kit::slash_row(
+                    slash_source_icon(&row.source),
+                    row.display.as_str(),
+                    row.description.as_str(),
+                    index == selected,
+                    Message::SlashSelected(row.pick.clone()),
+                ));
+            }
+            menu = menu.push(
+                iced::widget::scrollable(list)
+                    .height(Length::Fixed(popup_list_height(self.slash_rows.len())))
+                    .width(Length::Fill),
+            );
+        }
+        kit::popup_card(menu.width(Length::Fill), SLASH_POPUP_WIDTH)
+    }
 }
 
 impl Default for State {
@@ -755,14 +1039,227 @@ impl Default for State {
     }
 }
 
-/// Height of the scrollable catalog list for `row_count` models:
-/// fits the rows (and the spacing between them) up to
+/// Height of a scrollable popup list for `row_count` rows: fits the
+/// rows (and the spacing between them) up to
 /// [`MODEL_LIST_MAX_HEIGHT`], and is at least one row tall so an
-/// empty catalog still occupies a single row.
-fn model_list_height(row_count: usize) -> f32 {
+/// empty list still occupies a single row. Shared by the model card
+/// and the slash menu, whose rows share [`MENU_ROW_HEIGHT`].
+fn popup_list_height(row_count: usize) -> f32 {
     let rows = row_count.max(1);
     let spacing = (rows - 1) as f32 * SPACE_XS;
     (rows as f32 * MENU_ROW_HEIGHT + spacing).min(MODEL_LIST_MAX_HEIGHT)
+}
+
+/// Selectors highlighted as a leading token before any catalog
+/// arrives: the hard-coded builtins.
+fn builtin_selectors() -> Vec<String> {
+    BuiltinCommand::all()
+        .iter()
+        .map(|builtin| builtin.selector().to_string())
+        .collect()
+}
+
+/// The slash query for one draft: the text after the leading `/` of
+/// the first token, or `None` when the first token does not start
+/// with `/`. An empty query (a bare `/`) matches every row.
+fn slash_query(text: &str) -> Option<String> {
+    // `split_whitespace` skips leading whitespace, so no trim is
+    // needed before taking the first token.
+    let token = text.split_whitespace().next()?;
+    token.strip_prefix('/').map(str::to_string)
+}
+
+/// Whether one row matches the query: a case-insensitive substring
+/// hit on the selector, the display name, or the description. An
+/// empty query matches everything.
+fn slash_matches(query: &str, selector: &str, name: &str, description: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    selector.to_lowercase().contains(&query)
+        || name.to_lowercase().contains(&query)
+        || description.to_lowercase().contains(&query)
+}
+
+/// One builtin slash row, precomputed for the menu.
+fn builtin_row(builtin: BuiltinCommand) -> SlashRow {
+    SlashRow {
+        pick: SlashPick::Builtin(builtin),
+        selector: builtin.selector().to_string(),
+        display: format!("/{}", builtin.selector()),
+        name: builtin.name().to_string(),
+        description: builtin.description().to_string(),
+        source: String::from("builtin"),
+    }
+}
+
+/// One catalog skill slash row, precomputed for the menu.
+fn skill_row(skill: &SkillInfo) -> SlashRow {
+    SlashRow {
+        pick: SlashPick::Skill(skill.selector.clone()),
+        selector: skill.selector.clone(),
+        display: format!("/{}", skill.selector),
+        name: skill.label().to_string(),
+        description: skill.description.clone(),
+        source: skill.source.clone(),
+    }
+}
+
+/// Visible slash rows for one query: builtins first, then the ready
+/// catalog's matching skills. Loading, failed, and empty catalogs
+/// contribute no skill rows; the view renders those states as notes.
+fn filter_slash_rows(query: &str, catalog: &SkillCatalog) -> Vec<SlashRow> {
+    let mut rows: Vec<SlashRow> = BuiltinCommand::all()
+        .iter()
+        .map(|builtin| builtin_row(*builtin))
+        .filter(|row| slash_matches(query, &row.selector, &row.name, &row.description))
+        .collect();
+    if let SkillCatalog::Ready(skills) = catalog {
+        rows.extend(
+            skills
+                .iter()
+                .map(skill_row)
+                .filter(|row| slash_matches(query, &row.selector, &row.name, &row.description)),
+        );
+    }
+    rows
+}
+
+/// The Lucide source icon for one slash row: builtins read as a
+/// terminal, catalog scopes as package (bundled), user, folder
+/// (project), or puzzle (plugin). Unknown scopes read as sparkles,
+/// never as a missing icon.
+fn slash_source_icon(source: &str) -> lucide_icons::Icon {
+    match source {
+        "builtin" => lucide_icons::Icon::SquareTerminal,
+        "bundled" => lucide_icons::Icon::Package,
+        "user" => lucide_icons::Icon::User,
+        "project" => lucide_icons::Icon::Folder,
+        "plugin" => lucide_icons::Icon::Puzzle,
+        _ => lucide_icons::Icon::Sparkles,
+    }
+}
+
+/// Byte range of the draft's highlightable first token: the leading
+/// `/selector` token when its selector is known, `None` otherwise.
+/// The range covers the first token only, and only on an exact
+/// selector match; the arguments region never highlights.
+pub(crate) fn slash_token_range(line: &str, selectors: &[String]) -> Option<Range<usize>> {
+    let start = line.find(|next: char| !next.is_whitespace())?;
+    let token = line[start..].split_whitespace().next()?;
+    let selector = token.strip_prefix('/')?;
+    if selector.is_empty() {
+        return None;
+    }
+    selectors
+        .iter()
+        .any(|known| known == selector)
+        .then(|| start..start + token.len())
+}
+
+/// The slash-menu key binding: while the menu has rows, arrows move
+/// the selection, Enter and Tab accept it, and Esc dismisses the
+/// menu, all before the editor consumes them. Esc also dismisses a
+/// row-less menu. Every other key (including modified Enter, so
+/// Ctrl+Enter still reaches the pending shortcut) falls back to the
+/// editor defaults.
+fn slash_key_binding(
+    press: text_editor::KeyPress,
+    has_rows: bool,
+) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, Modifiers, key::Named};
+    if press.modifiers != Modifiers::empty() {
+        return text_editor::Binding::from_key_press(press);
+    }
+    match &press.key {
+        Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::SlashDismiss)),
+        Key::Named(Named::ArrowUp) if has_rows => {
+            Some(text_editor::Binding::Custom(Message::SlashPrev))
+        }
+        Key::Named(Named::ArrowDown) if has_rows => {
+            Some(text_editor::Binding::Custom(Message::SlashNext))
+        }
+        Key::Named(Named::Enter) if has_rows => {
+            Some(text_editor::Binding::Custom(Message::SlashAccept))
+        }
+        Key::Named(Named::Tab) if has_rows => {
+            Some(text_editor::Binding::Custom(Message::SlashAccept))
+        }
+        _ => text_editor::Binding::from_key_press(press),
+    }
+}
+
+/// The editor style for a matched slash token: the theme's strong
+/// primary in bold, so the token reads distinct from body text under
+/// any theme the app runs. Plain data (no editor highlight types: the
+/// `iced` facade hides the highlight `Format` path, so `kit` fills it
+/// by inference from this pair).
+pub(crate) fn slash_token_style(theme: &iced::Theme) -> (iced::Color, iced::Font) {
+    (
+        theme.extended_palette().primary.strong.color,
+        iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..iced::Font::DEFAULT
+        },
+    )
+}
+
+/// The editor highlight value for a matched slash token: a unit
+/// marker, since the token style is fixed in [`slash_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashHighlight;
+
+/// Highlights the draft's leading `/selector` token.
+///
+/// The editor feeds lines in order from the last `change_line`
+/// notification, so this tracks its position: only position 0 (the
+/// draft's first line) can highlight, and each fed line advances the
+/// position by one. Selector changes arrive through `update`, which
+/// re-arms from line 0 so the next draw re-highlights.
+pub(crate) struct SlashHighlighter {
+    /// Known selectors: builtins plus the ready catalog's.
+    selectors: Vec<String>,
+    /// Line index of the next fed line.
+    line: usize,
+}
+
+impl iced::widget::text::Highlighter for SlashHighlighter {
+    type Settings = Vec<String>;
+    type Highlight = SlashHighlight;
+    type Iterator<'a> = std::option::IntoIter<(Range<usize>, SlashHighlight)>;
+
+    fn new(settings: &Vec<String>) -> Self {
+        Self {
+            selectors: settings.clone(),
+            line: 0,
+        }
+    }
+
+    fn update(&mut self, new_settings: &Vec<String>) {
+        self.selectors = new_settings.clone();
+        self.line = 0;
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        let at_first = self.line == 0;
+        self.line = self.line.saturating_add(1);
+        if at_first {
+            slash_token_range(line, &self.selectors)
+                .map(|range| (range, SlashHighlight))
+                .into_iter()
+        } else {
+            None.into_iter()
+        }
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
 }
 
 /// Short human name of an effort choice, for the effort submenu.
@@ -1070,6 +1567,53 @@ mod tests {
         got
     }
 
+    /// Composer state with a ready skill catalog of two rows.
+    fn skill_state() -> State {
+        let mut got = State::new();
+        got.set_skill_catalog(SkillCatalog::Ready(vec![
+            SkillInfo {
+                selector: String::from("review"),
+                display_name: String::from("Code Review"),
+                description: String::from("Reviews pull requests"),
+                source: String::from("user"),
+                plugin_id: None,
+                argument_hint: None,
+            },
+            SkillInfo {
+                selector: String::from("tests"),
+                display_name: String::from("Tests"),
+                description: String::from("Runs the suite"),
+                source: String::from("bundled"),
+                plugin_id: None,
+                argument_hint: None,
+            },
+        ]));
+        got
+    }
+
+    /// Selectors of the visible slash rows, in order.
+    fn row_selectors(state: &State) -> Vec<&str> {
+        state
+            .slash_rows
+            .iter()
+            .map(|row| row.selector.as_str())
+            .collect()
+    }
+
+    /// One unmodified key press for `named`.
+    fn key_press(named: iced::keyboard::key::Named) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: iced::keyboard::Key::Named(named),
+            modified_key: iced::keyboard::Key::Named(named),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: true },
+        }
+    }
+
     #[test]
     fn model_menu_selects_catalog_row_and_effort() {
         let mut got = catalog_state();
@@ -1271,14 +1815,14 @@ mod tests {
     }
 
     #[test]
-    fn model_list_height_fits_content_up_to_the_max() {
+    fn popup_list_height_fits_content_up_to_the_max() {
         // One row (and an empty catalog) fit exactly one row tall.
-        assert_eq!(model_list_height(0), MENU_ROW_HEIGHT);
-        assert_eq!(model_list_height(1), MENU_ROW_HEIGHT);
+        assert_eq!(popup_list_height(0), MENU_ROW_HEIGHT);
+        assert_eq!(popup_list_height(1), MENU_ROW_HEIGHT);
         // Two rows include the spacing between them.
-        assert_eq!(model_list_height(2), 2.0 * MENU_ROW_HEIGHT + SPACE_XS);
+        assert_eq!(popup_list_height(2), 2.0 * MENU_ROW_HEIGHT + SPACE_XS);
         // Many rows cap at the max height.
-        assert_eq!(model_list_height(100), MODEL_LIST_MAX_HEIGHT);
+        assert_eq!(popup_list_height(100), MODEL_LIST_MAX_HEIGHT);
     }
 
     #[test]
@@ -1327,5 +1871,337 @@ mod tests {
         assert_eq!(got.context_percent, None);
         got.set_usage(None);
         assert_eq!(got.context_label, "Context —");
+    }
+
+    #[test]
+    fn slash_opens_on_leading_slash_with_builtins_first() {
+        let mut got = State::new();
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        type_text(&mut got, "/");
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        // Loading catalog: builtins still list.
+        assert_eq!(row_selectors(&got), vec!["model", "compact", "goal"]);
+        assert!(got.slash_menu_overlay().is_some());
+    }
+
+    #[test]
+    fn slash_stays_closed_without_leading_slash() {
+        let mut got = skill_state();
+        type_text(&mut got, "hello /review");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert!(got.slash_rows.is_empty());
+        assert!(got.slash_menu_overlay().is_none());
+    }
+
+    #[test]
+    fn slash_filter_matches_selector_name_and_description() {
+        let mut got = skill_state();
+        type_text(&mut got, "/rev");
+        // Builtins carry no "rev"; only the review skill lists.
+        assert_eq!(row_selectors(&got), vec!["review"]);
+        let mut named = skill_state();
+        type_text(&mut named, "/code");
+        assert_eq!(row_selectors(&named), vec!["review"]);
+        let mut described = skill_state();
+        type_text(&mut described, "/pull");
+        assert_eq!(row_selectors(&described), vec!["review"]);
+        let mut upper = skill_state();
+        type_text(&mut upper, "/REV");
+        assert_eq!(row_selectors(&upper), vec!["review"]);
+    }
+
+    #[test]
+    fn slash_arrows_move_and_wrap() {
+        let mut got = skill_state();
+        type_text(&mut got, "/");
+        // Builtins first, then the catalog rows.
+        assert_eq!(
+            row_selectors(&got),
+            vec!["model", "compact", "goal", "review", "tests"]
+        );
+        got.update(Message::SlashNext);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 1 });
+        got.update(Message::SlashPrev);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        // Wraps both directions.
+        got.update(Message::SlashPrev);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 4 });
+        got.update(Message::SlashNext);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+    }
+
+    #[test]
+    fn slash_arrows_are_noops_without_rows() {
+        let mut got = skill_state();
+        type_text(&mut got, "/zzz");
+        assert!(got.slash_rows.is_empty());
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        got.update(Message::SlashNext);
+        got.update(Message::SlashPrev);
+        got.update(Message::SlashAccept);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        assert_eq!(got.content.text(), "/zzz");
+    }
+
+    #[test]
+    fn slash_accept_inserts_selector_and_closes() {
+        let mut got = skill_state();
+        type_text(&mut got, "/rev");
+        got.update(Message::SlashNext);
+        got.update(Message::SlashPrev);
+        got.update(Message::SlashAccept);
+        assert_eq!(got.content.text(), "/review ");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert!(got.slash_rows.is_empty());
+        assert!(got.slash_menu_overlay().is_none());
+    }
+
+    #[test]
+    fn slash_click_accepts_row_identity() {
+        let mut got = skill_state();
+        type_text(&mut got, "/");
+        got.update(Message::SlashSelected(SlashPick::Skill(String::from(
+            "tests",
+        ))));
+        assert_eq!(got.content.text(), "/tests ");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        // An unknown pick is a no-op: the draft and menu survive it.
+        let mut unknown = skill_state();
+        type_text(&mut unknown, "/");
+        unknown.update(Message::SlashSelected(SlashPick::Skill(String::from(
+            "nope",
+        ))));
+        assert_eq!(unknown.content.text(), "/");
+        assert_eq!(unknown.slash_menu, SlashMenu::Open { selected: 0 });
+    }
+
+    #[test]
+    fn slash_esc_dismisses_and_editing_reopens() {
+        let mut got = skill_state();
+        type_text(&mut got, "/rev");
+        assert!(matches!(got.slash_menu, SlashMenu::Open { .. }));
+        got.update(Message::SlashDismiss);
+        assert_eq!(
+            got.slash_menu,
+            SlashMenu::Dismissed {
+                text: String::from("/rev"),
+            }
+        );
+        assert!(got.slash_menu_overlay().is_none());
+        // The same text does not reopen: a refresh with no edit is
+        // a no-op.
+        got.refresh_slash_menu();
+        assert_eq!(
+            got.slash_menu,
+            SlashMenu::Dismissed {
+                text: String::from("/rev"),
+            }
+        );
+        // Any edit re-arms the menu.
+        type_text(&mut got, "i");
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        assert_eq!(row_selectors(&got), vec!["review"]);
+    }
+
+    #[test]
+    fn slash_empty_catalog_lists_builtins_only() {
+        let mut got = State::new();
+        got.set_skill_catalog(SkillCatalog::Ready(Vec::new()));
+        type_text(&mut got, "/");
+        assert_eq!(row_selectors(&got), vec!["model", "compact", "goal"]);
+        type_text(&mut got, "zzz");
+        assert!(got.slash_rows.is_empty());
+    }
+
+    #[test]
+    fn slash_failed_catalog_keeps_composer_usable() {
+        let mut got = State::new();
+        got.set_skill_catalog(SkillCatalog::Failed(String::from("boom")));
+        type_text(&mut got, "/zzz");
+        // No rows, but the draft and the menu shell survive.
+        assert!(got.slash_rows.is_empty());
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        assert!(got.slash_menu_overlay().is_some());
+        assert_eq!(got.content.text(), "/zzz");
+    }
+
+    #[test]
+    fn slash_builtin_model_accept_opens_model_menu() {
+        let mut got = skill_state();
+        type_text(&mut got, "/mod");
+        assert_eq!(row_selectors(&got), vec!["model"]);
+        got.update(Message::SlashAccept);
+        assert_eq!(got.content.text(), "/model ");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert_eq!(got.model_menu, ModelMenu::Open);
+    }
+
+    #[test]
+    fn slash_selection_clamps_when_filter_shrinks() {
+        let mut got = skill_state();
+        type_text(&mut got, "/");
+        got.update(Message::SlashNext);
+        got.update(Message::SlashNext);
+        got.update(Message::SlashNext);
+        got.update(Message::SlashNext);
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 4 });
+        // Narrowing the filter clamps the selection into range.
+        type_text(&mut got, "zzz");
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+    }
+
+    #[test]
+    fn slash_clear_closes_menu() {
+        let mut got = skill_state();
+        type_text(&mut got, "/rev");
+        assert!(matches!(got.slash_menu, SlashMenu::Open { .. }));
+        got.clear();
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert!(got.slash_rows.is_empty());
+    }
+
+    #[test]
+    fn slash_source_icons_cover_every_scope() {
+        // `Icon` carries no `PartialEq`, so the mapping asserts by
+        // pattern: every known scope and the unknown-scope fallback.
+        use lucide_icons::Icon;
+        assert!(matches!(slash_source_icon("builtin"), Icon::SquareTerminal));
+        assert!(matches!(slash_source_icon("bundled"), Icon::Package));
+        assert!(matches!(slash_source_icon("user"), Icon::User));
+        assert!(matches!(slash_source_icon("project"), Icon::Folder));
+        assert!(matches!(slash_source_icon("plugin"), Icon::Puzzle));
+        assert!(matches!(slash_source_icon(""), Icon::Sparkles));
+        assert!(matches!(slash_source_icon("mystery"), Icon::Sparkles));
+    }
+
+    #[test]
+    fn slash_token_range_highlights_exact_first_token_only() {
+        let selectors = vec![String::from("review"), String::from("goal")];
+        assert_eq!(
+            slash_token_range("/review", &selectors),
+            Some(0..7),
+            "exact match highlights the token"
+        );
+        assert_eq!(
+            slash_token_range("/review fix it", &selectors),
+            Some(0..7),
+            "arguments never highlight"
+        );
+        assert_eq!(
+            slash_token_range("/rev", &selectors),
+            None,
+            "prefix match does not highlight"
+        );
+        assert_eq!(
+            slash_token_range("/nope", &selectors),
+            None,
+            "unknown selector does not highlight"
+        );
+        assert_eq!(
+            slash_token_range("hello", &selectors),
+            None,
+            "plain text does not highlight"
+        );
+        assert_eq!(slash_token_range("/", &selectors), None);
+        assert_eq!(slash_token_range("", &selectors), None);
+        assert_eq!(
+            slash_token_range("  /goal x", &selectors),
+            Some(2..7),
+            "leading whitespace still anchors the first token"
+        );
+    }
+
+    #[test]
+    fn slash_highlighter_marks_first_line_only() {
+        use iced::widget::text::Highlighter;
+        let selectors = vec![String::from("review")];
+        let mut got = SlashHighlighter::new(&selectors);
+        let first: Vec<_> = got.highlight_line("/review fix").collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 0..7);
+        // The second fed line never highlights, even for a match.
+        let second: Vec<_> = got.highlight_line("/review").collect();
+        assert!(second.is_empty());
+        // A change notification re-arms the position.
+        got.change_line(0);
+        let again: Vec<_> = got.highlight_line("/review").collect();
+        assert_eq!(again.len(), 1);
+        // New selectors re-arm from line 0 through update.
+        got.update(&vec![String::from("tests")]);
+        assert_eq!(got.current_line(), 0);
+        let switched: Vec<_> = got.highlight_line("/review").collect();
+        assert!(switched.is_empty());
+        let matched: Vec<_> = {
+            got.change_line(0);
+            got.highlight_line("/tests x").collect()
+        };
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, 0..6);
+    }
+
+    #[test]
+    fn slash_keys_map_menu_gestures_before_the_editor() {
+        use iced::keyboard::key::Named;
+        let accept = |named| slash_key_binding(key_press(named), true);
+        assert_eq!(
+            accept(Named::ArrowDown),
+            Some(text_editor::Binding::Custom(Message::SlashNext))
+        );
+        assert_eq!(
+            accept(Named::ArrowUp),
+            Some(text_editor::Binding::Custom(Message::SlashPrev))
+        );
+        assert_eq!(
+            accept(Named::Enter),
+            Some(text_editor::Binding::Custom(Message::SlashAccept))
+        );
+        assert_eq!(
+            accept(Named::Tab),
+            Some(text_editor::Binding::Custom(Message::SlashAccept))
+        );
+        assert_eq!(
+            accept(Named::Escape),
+            Some(text_editor::Binding::Custom(Message::SlashDismiss))
+        );
+        // Without rows, navigation and accept fall back to the editor
+        // defaults; Esc still dismisses.
+        let bare = |named| slash_key_binding(key_press(named), false);
+        assert_eq!(
+            bare(Named::Escape),
+            Some(text_editor::Binding::Custom(Message::SlashDismiss))
+        );
+        assert_eq!(
+            bare(Named::ArrowDown),
+            text_editor::Binding::from_key_press(key_press(Named::ArrowDown))
+        );
+        assert_eq!(
+            bare(Named::Enter),
+            text_editor::Binding::from_key_press(key_press(Named::Enter))
+        );
+    }
+
+    #[test]
+    fn slash_modified_enter_falls_back_to_editor_defaults() {
+        use iced::keyboard::key::Named;
+        let mut press = key_press(Named::Enter);
+        press.modifiers = iced::keyboard::Modifiers::CTRL;
+        // Ctrl+Enter keeps its pending-shortcut meaning: the editor
+        // default applies, never an accept.
+        assert_eq!(
+            slash_key_binding(press.clone(), true),
+            text_editor::Binding::from_key_press(press)
+        );
+    }
+
+    #[test]
+    fn slash_token_style_reads_bold_primary_from_the_theme() {
+        let (color, font) = slash_token_style(&crate::theme::manifest_theme());
+        let expected = crate::theme::manifest_theme()
+            .extended_palette()
+            .primary
+            .strong
+            .color;
+        assert_eq!(color, expected);
+        assert_eq!(font.weight, iced::font::Weight::Bold);
     }
 }
