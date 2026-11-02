@@ -11,7 +11,8 @@ use crate::error::Error;
 use manifest_domain::{
     ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
     PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
-    SessionStatus, SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
+    SessionStatus, SessionSummary, StreamEvent, StreamItem, TodoItem, TurnId, UsageKind,
+    UsageSnapshot,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,16 +29,29 @@ struct StatusDto {
     pending_user_inputs: u64,
     #[serde(default)]
     stream_dropped_deltas: Option<u64>,
+    /// Cumulative token usage folded by the server from the session's
+    /// live `session/tokenUsage`; absent or unparseable stays out of
+    /// the carried vec, never a row failure.
+    #[serde(default)]
+    token_usage: Option<Value>,
 }
 
-/// Map raw `muse_status` rows into sessions and diagnostics.
+/// Map raw `muse_status` rows into sessions, diagnostics, and the
+/// usage snapshots that parsed.
 ///
 /// Server row order is preserved; project grouping happens in the
 /// shell via domain
 /// [`assign_projects`](manifest_domain::assign_projects).
-pub(crate) fn map_status_rows(rows: &[Value]) -> (Vec<SessionSummary>, Vec<String>) {
+pub(crate) fn map_status_rows(
+    rows: &[Value],
+) -> (
+    Vec<SessionSummary>,
+    Vec<String>,
+    Vec<(SessionId, UsageSnapshot)>,
+) {
     let mut sessions = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut usage = Vec::new();
 
     for row in rows {
         let dto: StatusDto = match serde_json::from_value(row.clone()) {
@@ -79,9 +93,18 @@ pub(crate) fn map_status_rows(rows: &[Value]) -> (Vec<SessionSummary>, Vec<Strin
             relative_time: String::new(),
             stream_dropped_deltas: dto.stream_dropped_deltas.unwrap_or(0),
         });
+        // The stream carries the same value as `usage_json` text, so
+        // the value's string form parses the same way. Rows without
+        // usable token usage carry no entry; the shell keeps its
+        // stored snapshot for those.
+        if let Some(raw) = dto.token_usage.as_ref()
+            && let Some(snapshot) = UsageSnapshot::parse(&raw.to_string())
+        {
+            usage.push((SessionId::new(&dto.session_id), snapshot));
+        }
     }
 
-    (sessions, diagnostics)
+    (sessions, diagnostics, usage)
 }
 
 /// Optional string field: a present non-string value counts as absent.
@@ -140,6 +163,49 @@ fn headline_from_args(args_json: &str) -> Option<String> {
     object
         .values()
         .find_map(|value| value.as_str().map(String::from))
+}
+
+/// Whether a tool name is the todo-list tool.
+///
+/// Matches the captured name verbatim (`write_todos`); a
+/// case-insensitive `todo` containment guard accepts renames, in
+/// addition to the verbatim match and never instead of it.
+fn is_todo_tool(tool: &str) -> bool {
+    tool == "write_todos" || tool.to_lowercase().contains("todo")
+}
+
+/// Parsed todo list from raw toolCall args JSON.
+///
+/// Returns `Some` only for the todo tool carrying a `$.todos` array of
+/// `{text, status}` entries, with `done` from the snake_case entry
+/// status (`completed` is done; `pending`, `in_progress`, and the
+/// schema's `cancelled` are not). Anything else — another tool, empty
+/// or malformed JSON, a missing or non-array `todos`, an entry without
+/// string `text`/`status`, or an unrecognized status — is `None`:
+/// an expected shape the shell ignores, never a whole-item failure.
+fn parse_todo_list(tool: &str, args_json: &str) -> Option<Vec<TodoItem>> {
+    if !is_todo_tool(tool) {
+        return None;
+    }
+    let entries = serde_json::from_str::<Value>(args_json)
+        .ok()?
+        .get("todos")?
+        .as_array()?
+        .clone();
+    let mut todos = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let label = entry.get("text")?.as_str()?;
+        let done = match entry.get("status")?.as_str()? {
+            "completed" => true,
+            "pending" | "in_progress" | "cancelled" => false,
+            _ => return None,
+        };
+        todos.push(TodoItem {
+            label: label.to_string(),
+            done,
+        });
+    }
+    Some(todos)
 }
 
 /// Renderable text from a `visibleOutput` value.
@@ -220,11 +286,14 @@ fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
                 Some(Value::String(args)) => args.clone(),
                 Some(other) => other.to_string(),
             };
+            let tool = item_text(item, "tool");
+            let todos = parse_todo_list(&tool, &args_json);
             Ok(StreamItem::ToolCall {
                 item_id,
-                tool: item_text(item, "tool"),
+                tool,
                 headline: headline_from_args(&args_json),
                 args_json,
+                todos,
                 status: map_item_status(item),
                 output: item
                     .get("visibleOutput")
@@ -399,12 +468,12 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
             )];
         }
     };
-    let (sessions, diagnostics) = map_status_rows(&rows);
+    let (sessions, diagnostics, usage) = map_status_rows(&rows);
     let mut events: Vec<EngineEvent> = diagnostics
         .into_iter()
         .map(EngineEvent::Diagnostic)
         .collect();
-    events.push(EngineEvent::SessionsLoaded { sessions });
+    events.push(EngineEvent::SessionsLoaded { sessions, usage });
     events
 }
 
@@ -821,12 +890,47 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_parses_into_carried_snapshots() {
+        let mut with_usage = row("u1", "idle", "/w/p", 0, None);
+        with_usage["token_usage"] = json!({"total": 42, "limit": 200});
+        let mut camel = row("u2", "running", "/w/q", 0, None);
+        camel["token_usage"] = json!({"promptTokens": 10, "outputTokens": 5});
+        let rows = vec![with_usage, camel, row("u3", "idle", "/w/r", 0, None)];
+        let (sessions, diagnostics, usage) = map_status_rows(&rows);
+        assert!(diagnostics.is_empty());
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].0, SessionId::new("u1"));
+        assert_eq!(usage[0].1.used, 42);
+        assert_eq!(usage[0].1.window, Some(200));
+        assert_eq!(usage[1].0, SessionId::new("u2"));
+        assert_eq!(usage[1].1.used, 15);
+    }
+
+    #[test]
+    fn token_usage_without_counts_or_garbage_stays_out() {
+        let mut empty = row("e1", "idle", "/w/p", 0, None);
+        empty["token_usage"] = json!({});
+        let mut number = row("e2", "idle", "/w/p", 0, None);
+        number["token_usage"] = json!(7);
+        let mut text = row("e3", "idle", "/w/p", 0, None);
+        text["token_usage"] = json!("nope");
+        let mut nil = row("e4", "idle", "/w/p", 0, None);
+        nil["token_usage"] = Value::Null;
+        let rows = vec![empty, number, text, nil, row("e5", "idle", "/w/p", 0, None)];
+        let (sessions, diagnostics, usage) = map_status_rows(&rows);
+        assert!(diagnostics.is_empty());
+        assert_eq!(sessions.len(), 5);
+        assert!(usage.is_empty());
+    }
+
+    #[test]
     fn orphaned_stays_orphaned_and_closed_is_excluded() {
         let rows = vec![
             row("a", "orphaned", "/w/p", 0, None),
             row("b", "closed", "/w/p", 0, None),
         ];
-        let (sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics, _) = map_status_rows(&rows);
         assert!(diagnostics.is_empty());
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Orphaned);
@@ -842,7 +946,7 @@ mod tests {
             "pending_approvals": u64::MAX,
             "pending_user_inputs": u64::MAX,
         })];
-        let (sessions, _) = map_status_rows(&rows);
+        let (sessions, _, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
     }
@@ -853,7 +957,7 @@ mod tests {
             row("p1", "running", "/w/p", 2, None),
             row("weird", "exploded", "/w/p", 0, None),
         ];
-        let (sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
         assert_eq!(
@@ -867,7 +971,7 @@ mod tests {
     #[test]
     fn dto_errors_skip_with_diagnostic() {
         let rows = vec![json!({"status": "running"})];
-        let (sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics, _) = map_status_rows(&rows);
         assert!(sessions.is_empty());
         assert_eq!(
             diagnostics,
@@ -884,7 +988,7 @@ mod tests {
             row("s2", "idle", "/home/dev/alpha", 0, None),
             row("s3", "idle", "/home/dev/beta", 0, None),
         ];
-        let (sessions, _) = map_status_rows(&rows);
+        let (sessions, _, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 3);
         assert_eq!(sessions[0].workspace, String::from("/home/dev/beta"));
         assert_eq!(sessions[0].title, String::from("s1"));
@@ -903,7 +1007,7 @@ mod tests {
             0,
             None,
         )];
-        let (sessions, _) = map_status_rows(&rows);
+        let (sessions, _, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Orphaned);
         assert_eq!(
@@ -916,7 +1020,7 @@ mod tests {
     #[test]
     fn title_truncates_by_chars_not_bytes() {
         let rows = vec![row("ééééééééXYZ", "idle", "/w/long-name", 0, Some(4))];
-        let (sessions, _) = map_status_rows(&rows);
+        let (sessions, _, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "éééééééé");
         assert_eq!(sessions[0].workspace, String::from("/w/long-name"));
@@ -1193,6 +1297,30 @@ mod tests {
     }
 
     #[test]
+    fn status_result_carries_parsed_token_usage() {
+        let mut with_usage = row("ok-1", "idle", "/w/p", 0, None);
+        with_usage["token_usage"] = json!({"total": 9});
+        let result = json!({
+            "content": [{"type": "text", "text": serde_json::to_string(&vec![
+                with_usage,
+                row("ok-2", "idle", "/w/q", 0, None),
+            ]).expect("rows")}],
+            "isError": false,
+        });
+        let events = map_status_result(&result);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EngineEvent::SessionsLoaded { sessions, usage } => {
+                assert_eq!(sessions.len(), 2);
+                assert_eq!(usage.len(), 1);
+                assert_eq!(usage[0].0, SessionId::new("ok-1"));
+                assert_eq!(usage[0].1.used, 9);
+            }
+            other => panic!("expected SessionsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn stream_turn_started_maps_view_cursor() {
         let event = map_stream_event(&json!({
             "type": "turn-started",
@@ -1358,6 +1486,7 @@ mod tests {
                         tool: String::from("read_file"),
                         headline: Some(String::from("/tmp/ws/note.txt")),
                         args_json: String::from("{\"path\":\"/tmp/ws/note.txt\"}"),
+                        todos: None,
                         status: ItemStatus::Completed,
                         output: Some(String::from("Read text file `/tmp/ws/note.txt`.")),
                         failure: None,
@@ -1404,6 +1533,7 @@ mod tests {
                     args_json: String::from(
                         "{\"command\":\"ls -la /tmp/ws\",\"description\":\"List workspace directory contents\"}"
                     ),
+                    todos: None,
                     status: ItemStatus::Completed,
                     output: Some(String::from("total 0")),
                     failure: None,
@@ -1439,6 +1569,7 @@ mod tests {
                     tool: String::from("read_file"),
                     headline: Some(String::from("missing-file.txt")),
                     args_json: String::from("{\"path\":\"missing-file.txt\"}"),
+                    todos: None,
                     status: ItemStatus::Failed,
                     output: Some(String::from(
                         "tool failed: No such file or directory (os error 2)"
@@ -1474,6 +1605,7 @@ mod tests {
                     tool: String::from("read_file"),
                     headline: Some(String::from("/tmp/ws/note.txt")),
                     args_json: String::from("{\"path\":\"/tmp/ws/note.txt\"}"),
+                    todos: None,
                     status: ItemStatus::InProgress,
                     output: None,
                     failure: None,
@@ -1506,6 +1638,246 @@ mod tests {
                     assert_eq!(status, ItemStatus::Other(String::from("paused")));
                     assert_eq!(args_json, String::new());
                 }
+                other => panic!("wrong item: {other:?}"),
+            },
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    /// Verbatim live capture (`plans/mfst-8/item-catalog.md`): the first
+    /// `write_todos` call, started, carries the full 3-item pending list.
+    #[test]
+    fn stream_write_todos_started_carries_full_pending_list() {
+        let args = serde_json::to_string(&json!({"todos": [
+            {"text": "create the file task-one.txt containing the word alpha", "status": "pending"},
+            {"text": "create the file task-two.txt containing the word beta", "status": "pending"},
+            {"text": "create the file task-three.txt containing the word gamma", "status": "pending"},
+        ]}))
+        .expect("args are JSON");
+        let event = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {
+                "itemId": "01a1a282-2cc9-7112-a173-fde23091588b",
+                "kind": "toolCall",
+                "status": "inProgress",
+                "tool": "write_todos",
+                "args": args.clone(),
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::ToolCall {
+                    item_id: String::from("01a1a282-2cc9-7112-a173-fde23091588b"),
+                    tool: String::from("write_todos"),
+                    headline: None,
+                    args_json: args,
+                    todos: Some(vec![
+                        TodoItem {
+                            label: String::from(
+                                "create the file task-one.txt containing the word alpha"
+                            ),
+                            done: false,
+                        },
+                        TodoItem {
+                            label: String::from(
+                                "create the file task-two.txt containing the word beta"
+                            ),
+                            done: false,
+                        },
+                        TodoItem {
+                            label: String::from(
+                                "create the file task-three.txt containing the word gamma"
+                            ),
+                            done: false,
+                        },
+                    ]),
+                    status: ItemStatus::InProgress,
+                    output: None,
+                    failure: None,
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    /// Mid-turn capture shape: `completed`/`in_progress`/`pending`
+    /// entry statuses map to done/not-done.
+    #[test]
+    fn stream_write_todos_completed_maps_snake_case_statuses() {
+        let args = serde_json::to_string(&json!({"todos": [
+            {"text": "create the file task-one.txt containing the word alpha", "status": "completed"},
+            {"text": "create the file task-two.txt containing the word beta", "status": "in_progress"},
+            {"text": "create the file task-three.txt containing the word gamma", "status": "pending"},
+        ]}))
+        .expect("args are JSON");
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "01a1a282-47ea-7112-a173-fde23091588b",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "write_todos",
+                "args": args,
+                "visibleOutput": "{\"items\":3,\"ok\":true,\"revision\":3}",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => match item {
+                StreamItem::ToolCall { todos, output, .. } => {
+                    let todos = todos.expect("todo tool carries todos");
+                    assert_eq!(
+                        todos.iter().map(|todo| todo.done).collect::<Vec<_>>(),
+                        vec![true, false, false]
+                    );
+                    assert_eq!(
+                        todos[0].label,
+                        "create the file task-one.txt containing the word alpha"
+                    );
+                    assert_eq!(
+                        output.as_deref(),
+                        Some("{\"items\":3,\"ok\":true,\"revision\":3}")
+                    );
+                }
+                other => panic!("wrong item: {other:?}"),
+            },
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_todo_tool_name_matches_case_insensitively() {
+        let args = serde_json::to_string(&json!({"todos": [
+            {"text": "a step", "status": "completed"},
+        ]}))
+        .expect("args are JSON");
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-todo",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "Write_Todos",
+                "args": args,
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => match item {
+                StreamItem::ToolCall { todos, .. } => assert_eq!(
+                    todos,
+                    Some(vec![TodoItem {
+                        label: String::from("a step"),
+                        done: true,
+                    }])
+                ),
+                other => panic!("wrong item: {other:?}"),
+            },
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    /// A non-todo tool carrying todos-looking args stays `None`: the
+    /// tool name decides, never the args shape.
+    #[test]
+    fn stream_other_tool_with_todos_args_carries_no_todos() {
+        let args = serde_json::to_string(&json!({"todos": [
+            {"text": "a step", "status": "completed"},
+        ]}))
+        .expect("args are JSON");
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-other",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "read_file",
+                "args": args,
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => match item {
+                StreamItem::ToolCall { todos, .. } => assert_eq!(todos, None),
+                other => panic!("wrong item: {other:?}"),
+            },
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    /// Malformed or unrecognized todo shapes degrade to `None` without
+    /// failing the whole item.
+    #[test]
+    fn stream_malformed_todo_args_carry_no_todos() {
+        for args in [
+            String::from("not json{"),
+            String::from("{\"path\":\"/tmp/ws/note.txt\"}"),
+            String::from("{\"todos\":\"not-an-array\"}"),
+            String::from("{\"todos\":[{\"status\":\"pending\"}]}"),
+            String::from("{\"todos\":[{\"text\":\"a step\"}]}"),
+            String::from("{\"todos\":[{\"text\":\"a step\",\"status\":\"done\"}]}"),
+        ] {
+            let event = map_stream_event(&json!({
+                "type": "item-completed",
+                "sessionId": "s",
+                "item": {
+                    "itemId": "c-bad",
+                    "kind": "toolCall",
+                    "status": "completed",
+                    "tool": "write_todos",
+                    "args": args,
+                    "turnId": "t",
+                },
+            }))
+            .expect("ok")
+            .expect("known");
+            match event {
+                StreamEvent::ItemCompleted { item, .. } => match item {
+                    StreamItem::ToolCall { todos, status, .. } => {
+                        assert_eq!(todos, None, "args: {args}");
+                        assert_eq!(status, ItemStatus::Completed);
+                    }
+                    other => panic!("wrong item: {other:?}"),
+                },
+                other => panic!("wrong event: {other:?}"),
+            }
+        }
+    }
+
+    /// An empty `todos` array is a cleared list, not a no-op.
+    #[test]
+    fn stream_empty_todos_array_is_some_empty() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-empty",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "write_todos",
+                "args": "{\"todos\":[]}",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => match item {
+                StreamItem::ToolCall { todos, .. } => assert_eq!(todos, Some(vec![])),
                 other => panic!("wrong item: {other:?}"),
             },
             other => panic!("wrong event: {other:?}"),

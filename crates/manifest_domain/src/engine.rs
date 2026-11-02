@@ -5,7 +5,7 @@
 //! engines later). These types carry everything an engine reports to the
 //! presentation layer and perform no I/O.
 
-use crate::fixture::{SessionId, SessionSummary};
+use crate::fixture::{SessionId, SessionSummary, TodoItem};
 
 /// Opaque handle for one agent turn.
 ///
@@ -83,6 +83,9 @@ pub enum StreamItem {
         headline: Option<String>,
         /// Raw args JSON text, kept for later slices; empty when none sent.
         args_json: String,
+        /// Parsed todo list, carried only for the todo tool; `None`
+        /// for every other tool and for malformed todo args.
+        todos: Option<Vec<TodoItem>>,
         /// How far the call got.
         status: ItemStatus,
         /// Renderable result text after envelope unwrap; none until sent.
@@ -1085,6 +1088,10 @@ pub enum EngineEvent {
     SessionsLoaded {
         /// Sessions for the left panel, in display order.
         sessions: Vec<SessionSummary>,
+        /// Cumulative usage per session, parsed from each row's
+        /// `token_usage`; rows without usable token usage carry no
+        /// entry, and the shell keeps its stored snapshot for those.
+        usage: Vec<(SessionId, UsageSnapshot)>,
     },
     /// A session-list refresh failed while the connection stays up.
     ///
@@ -1291,6 +1298,7 @@ mod tests {
                     tool: String::new(),
                     headline: None,
                     args_json: String::new(),
+                    todos: None,
                     status: ItemStatus::InProgress,
                     output: None,
                     failure: None,
