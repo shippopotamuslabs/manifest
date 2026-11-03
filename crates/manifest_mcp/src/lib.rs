@@ -4,8 +4,9 @@
 //! speaks JSON-RPC 2.0 with it over newline-delimited JSON on its stdio:
 //! `initialize` declaring the `muse.stream` experimental capability,
 //! `tools/call` for `muse_status`, `muse_spawn` (workspace, prompt,
-//! worktree choices, `wait: false`), `muse_turn`, and `muse_models`
-//! (session resume only; catalog discarded), and
+//! worktree and model/effort/permission choices, `wait: false`),
+//! `muse_turn`, `muse_steer`, `muse_cancel`, and `muse_models`
+//! (catalog listing, or session resume with the catalog discarded), and
 //! `notifications/muse/event` mapped into domain
 //! [`StreamEvent`](manifest_domain::StreamEvent) values. The client is
 //! blocking and thread-based; there is no async runtime in this crate.
@@ -20,7 +21,7 @@ mod worker;
 
 use std::sync::mpsc::Sender;
 
-use manifest_domain::{EngineEvent, SessionEngine, SessionId, SpawnChoices};
+use manifest_domain::{EngineEvent, SessionEngine, SessionId, SpawnChoices, TurnId};
 
 use worker::{Command, WorkerMsg};
 
@@ -148,6 +149,30 @@ impl SessionEngine for MuseEngine {
         let _ = self
             .worker_tx
             .send(WorkerMsg::Command(Command::ResumeSession { session }));
+    }
+
+    fn steer_session(&self, session: SessionId, prompt: String, turn: TurnId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self.worker_tx.send(WorkerMsg::Command(Command::SteerTurn {
+            session,
+            prompt,
+            turn,
+        }));
+    }
+
+    fn cancel_turn(&self, session: SessionId, turn: Option<TurnId>) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::CancelTurn { session, turn }));
+    }
+
+    fn list_models(&self, workspace: Option<String>, session: Option<SessionId>) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self.worker_tx.send(WorkerMsg::Command(Command::ListModels {
+            workspace,
+            session,
+        }));
     }
 }
 

@@ -9,8 +9,8 @@
 
 use crate::error::Error;
 use manifest_domain::{
-    EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionId, SessionStatus, SessionSummary,
-    StreamEvent, StreamItem, TurnId, UsageKind,
+    EngineEvent, ItemStatus, ModelInfo, PendingKind, PendingPhase, SessionId, SessionStatus,
+    SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -467,6 +467,77 @@ pub(crate) fn map_turn_result(
             .unwrap_or_else(|| commanded.clone()),
         turn.map(TurnId::new),
     ))
+}
+
+/// Map a `muse_steer` or `muse_cancel` result into its acknowledgement.
+///
+/// Either call succeeds with no payload worth rendering: any
+/// non-`isError` result is `Ok(())`, and only failures carry text. A
+/// server-authored `isError` body passes through as the failure text;
+/// anything else fails with the friendly `generic` message.
+pub(crate) fn map_ack_result(result: &Value, generic: &str) -> Result<(), String> {
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    Ok(())
+}
+
+/// Map a `muse_models` catalog result into domain catalog values.
+///
+/// The content text parses as the catalog object: a `models` array
+/// whose rows carry `id`, `display_label`, `is_default`, and
+/// `is_active` (the server's snake_case names). Rows without a
+/// non-empty string `id` cannot round-trip as `model`, so they are
+/// skipped; absent labels and flags default to empty and false, and
+/// [`ModelInfo::label`] falls back to the id for display. A
+/// server-authored `isError` body passes through as the failure text;
+/// anything else that does not parse fails with the friendly generic
+/// message.
+pub(crate) fn map_models_result(result: &Value) -> Result<Vec<ModelInfo>, String> {
+    let generic = "Couldn't load the model catalog from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let rows = match body.get("models").and_then(Value::as_array) {
+        Some(rows) => rows,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let mut models = Vec::new();
+    for row in rows {
+        let id = match row.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
+        models.push(ModelInfo {
+            display_label: row
+                .get("display_label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            is_default: row
+                .get("is_default")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            is_active: row
+                .get("is_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            id,
+        });
+    }
+    Ok(models)
 }
 
 /// Map a `muse_models` session-resume result into the resumed session.
@@ -1233,5 +1304,96 @@ mod tests {
                 "Couldn't load your sessions from the Muse MCP server."
             ))]
         );
+    }
+
+    #[test]
+    fn ack_result_accepts_any_non_error_body() {
+        let generic = "Couldn't steer that turn on the Muse MCP server.";
+        let ok = json!({"content": [{"type": "text", "text": "{}"}]});
+        assert_eq!(map_ack_result(&ok, generic), Ok(()));
+        let bare = json!({"content": []});
+        assert_eq!(map_ack_result(&bare, generic), Ok(()));
+    }
+
+    #[test]
+    fn ack_result_failures_carry_server_or_generic_text() {
+        let generic = "Couldn't cancel that turn on the Muse MCP server.";
+        let server = json!({
+            "content": [{"type": "text", "text": "session sess-1 is idle"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_ack_result(&server, generic),
+            Err(String::from("session sess-1 is idle"))
+        );
+        let empty = json!({"content": [], "isError": true});
+        assert_eq!(map_ack_result(&empty, generic), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn models_result_maps_catalog_rows_in_order() {
+        let body = serde_json::to_string(&json!({
+            "models": [
+                {
+                    "id": "muse-spark",
+                    "display_label": "Muse Spark",
+                    "is_default": true,
+                    "is_active": false,
+                },
+                {"id": "other-model"},
+            ],
+            "provider_id": "muse",
+            "source": "host",
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let models = map_models_result(&result).expect("catalog parses");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "muse-spark");
+        assert_eq!(models[0].label(), "Muse Spark");
+        assert!(models[0].is_default);
+        assert!(!models[0].is_active);
+        assert_eq!(models[1].id, "other-model");
+        assert_eq!(models[1].label(), "other-model");
+        assert!(!models[1].is_default);
+        assert!(!models[1].is_active);
+    }
+
+    #[test]
+    fn models_result_skips_rows_without_usable_ids() {
+        let body = serde_json::to_string(&json!({
+            "models": [
+                {"display_label": "No id"},
+                {"id": ""},
+                {"id": 7},
+                {"id": "kept", "display_label": "Kept", "is_active": true},
+            ],
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        let models = map_models_result(&result).expect("catalog parses");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "kept");
+        assert!(models[0].is_active);
+    }
+
+    #[test]
+    fn models_result_failures_carry_server_or_generic_text() {
+        let generic = "Couldn't load the model catalog from the Muse MCP server.";
+        let server = json!({
+            "content": [{"type": "text", "text": "models requires workspace or session_id"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_models_result(&server),
+            Err(String::from("models requires workspace or session_id"))
+        );
+        let garbage = json!({"content": [{"type": "text", "text": "not json"}]});
+        assert_eq!(map_models_result(&garbage), Err(String::from(generic)));
+        let no_models =
+            json!({"content": [{"type": "text", "text": "{\"provider_id\":\"muse\"}"}]});
+        assert_eq!(map_models_result(&no_models), Err(String::from(generic)));
+        let empty = json!({"content": [], "isError": true});
+        assert_eq!(map_models_result(&empty), Err(String::from(generic)));
     }
 }
