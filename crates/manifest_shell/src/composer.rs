@@ -585,11 +585,12 @@ impl State {
     }
 
     /// Recomputes the slash menu from the draft after every edit: a
-    /// draft whose first token starts with `/` opens (or refilters)
-    /// the menu, anything else closes it. A dismissed menu stays shut
-    /// for its exact dismissal text; any edit re-arms it. The visible
-    /// rows are precomputed here so the view reads without filtering
-    /// (UI contract §2); the selection clamps into the new rows.
+    /// draft whose unterminated first token starts with `/` opens
+    /// (or refilters) the menu, anything else closes it. A dismissed
+    /// menu stays shut for its exact dismissal text; any edit
+    /// re-arms it. The visible rows are precomputed here so the view
+    /// reads without filtering (UI contract §2); the selection
+    /// clamps into the new rows.
     fn refresh_slash_menu(&mut self) {
         let text = self.content.text();
         let Some(query) = slash_query(&text) else {
@@ -1022,6 +1023,10 @@ impl State {
                 SkillCatalog::Loading => "Loading skills…",
                 SkillCatalog::Failed(message) => message.as_str(),
                 SkillCatalog::Ready(_) => {
+                    // A bare `/` (the empty query) means the catalog
+                    // itself is empty; any other query filtered every
+                    // row out. A `None` query never renders here: the
+                    // menu is closed exactly when the query is `None`.
                     if slash_query(&self.content.text()).is_some_and(|query| query.is_empty()) {
                         "No skills available"
                     } else {
@@ -1081,11 +1086,20 @@ fn builtin_selectors() -> Vec<String> {
 
 /// The slash query for one draft: the text after the leading `/` of
 /// the first token, or `None` when the first token does not start
-/// with `/`. An empty query (a bare `/`) matches every row.
+/// with `/` or is already terminated by whitespace (the user has
+/// moved past the command word into arguments). An empty query (a
+/// bare `/`) matches every row.
 fn slash_query(text: &str) -> Option<String> {
-    // `split_whitespace` skips leading whitespace, so no trim is
-    // needed before taking the first token.
-    let token = text.split_whitespace().next()?;
+    // Leading whitespace is skipped by finding the first token
+    // start; the token must then run to the end of the draft. Any
+    // trailing text starts with whitespace (the token is the maximal
+    // non-whitespace run), so a length mismatch means the command
+    // word is terminated and the menu stays shut.
+    let rest = &text[text.find(|next: char| !next.is_whitespace())?..];
+    let token = rest.split_whitespace().next()?;
+    if rest.len() != token.len() {
+        return None;
+    }
     token.strip_prefix('/').map(str::to_string)
 }
 
@@ -1963,6 +1977,52 @@ mod tests {
         assert_eq!(got.slash_menu, SlashMenu::Closed);
         assert!(got.slash_rows.is_empty());
         assert!(got.slash_menu_overlay().is_none());
+    }
+
+    #[test]
+    fn slash_space_after_command_closes_menu() {
+        let mut got = skill_state();
+        type_text(&mut got, "/compact");
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        type_text(&mut got, " ");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert!(got.slash_rows.is_empty());
+        assert!(got.slash_menu_overlay().is_none());
+    }
+
+    #[test]
+    fn slash_args_close_menu_and_deleting_back_reopens() {
+        let mut got = skill_state();
+        type_text(&mut got, "/compact fix");
+        assert_eq!(got.content.text(), "/compact fix");
+        assert_eq!(got.slash_menu, SlashMenu::Closed);
+        assert!(got.slash_rows.is_empty());
+        for _ in 0.." fix".len() {
+            got.update(Message::Edit(text_editor::Action::Edit(
+                text_editor::Edit::Backspace,
+            )));
+        }
+        assert_eq!(got.content.text(), "/compact");
+        assert_eq!(got.slash_menu, SlashMenu::Open { selected: 0 });
+        assert!(!got.slash_rows.is_empty());
+    }
+
+    #[test]
+    fn slash_query_ignores_terminated_first_token() {
+        // Terminated first tokens (the user is past the command
+        // word) carry no query, so the menu closes.
+        assert_eq!(slash_query("/compact "), None);
+        assert_eq!(slash_query("/compact fix it"), None);
+        assert_eq!(slash_query("/compact\nfix"), None);
+        assert_eq!(slash_query("  /compact "), None);
+        // Unterminated first tokens behave as before.
+        assert_eq!(slash_query("/compact"), Some(String::from("compact")));
+        assert_eq!(slash_query("/"), Some(String::new()));
+        assert_eq!(slash_query("  /comp"), Some(String::from("comp")));
+        assert_eq!(slash_query(""), None);
+        assert_eq!(slash_query("   "), None);
+        assert_eq!(slash_query("hello"), None);
+        assert_eq!(slash_query("hello /review"), None);
     }
 
     #[test]
