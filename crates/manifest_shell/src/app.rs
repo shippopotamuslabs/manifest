@@ -21,7 +21,7 @@ use crate::theme::{
     PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY,
     TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE, attach_menu_bottom_offset,
 };
-use crate::{composer, sessions, transcript};
+use crate::{composer, pending, sessions, transcript};
 
 /// The TODO drawer has two real situations, so it is an enum, not a bool
 /// (UI contract §1).
@@ -62,6 +62,15 @@ pub enum Message {
     Composer(composer::Message),
     /// A transcript scroll message, routed to [`transcript::State`].
     Transcript(transcript::Message),
+    /// A pending-card message, routed to [`pending::State`]; its
+    /// effect (fetch/decide/answer) runs against the engine here.
+    /// Kept as the direct routing spelling; inline cards arrive via
+    /// `Transcript(Pending(..))`.
+    #[allow(dead_code)]
+    Pending(pending::Message),
+    /// Ctrl+Enter pressed: submits/advances the visible awaiting
+    /// question card, mirroring its Next/Submit button.
+    SubmitPendingShortcut,
     /// Toggles the TODO drawer between peek strip and open.
     ToggleTodoDrawer,
     /// A press landed on the panel divider; the next moves resize.
@@ -258,6 +267,9 @@ pub struct App {
     /// on session select. While set, the visible transcript is the
     /// draft's, and list syncs must not steal it.
     pub new_session: Option<NewSessionDraft>,
+    /// Pending approval/question cards, by session. Transcript
+    /// entries hold only request ids; this owns payloads/phases.
+    pub pending: pending::State,
     /// Draft input cluster.
     pub composer: composer::State,
     /// A model-catalog request is in flight. Set on each request,
@@ -316,6 +328,10 @@ impl App {
     /// (UI contract §2). Empty session lists fall back to the
     /// sessions-state placeholder (no `unwrap` / panic paths).
     pub fn from_fixture(fixture: Fixture) -> Self {
+        // Fixture pending data is seeded below, after the literal, so
+        // the cards exist without an engine. Live boot clears it.
+        let fixture_pending = fixture.pending.clone();
+        let fixture_settled = fixture.settled_pending.clone();
         let done = fixture.todos.iter().filter(|todo| todo.done).count();
         let total = fixture.todos.len();
         let todo_summary = format!("{done} of {total} done");
@@ -337,6 +353,7 @@ impl App {
             pending_spawn: None,
             resuming: HashSet::new(),
             new_session: None,
+            pending: pending::State::default(),
             composer: composer::State::new(),
             models_pending: false,
             todos: fixture.todos,
@@ -356,6 +373,33 @@ impl App {
             projects_ready: false,
             projects_missing: false,
         };
+        // Fixture mode only: seed the pending store from the fixture
+        // and point the visible transcript at the awaiting session, so
+        // The transcript pause-point entries render the cards inline
+        // with no engine attached. Settled
+        // fixture requests load as cards, then collapse in place to
+        // their one-line records.
+        let fixture_owner = fixture_pending
+            .first()
+            .map(|request| request.session().clone())
+            .or_else(|| {
+                fixture_settled
+                    .first()
+                    .map(|(request, _)| request.session().clone())
+            });
+        if let Some(owner) = fixture_owner {
+            app.visible_session = Some(owner);
+            let mut all = fixture_pending;
+            all.extend(fixture_settled.iter().map(|(request, _)| request.clone()));
+            app.apply_pending_loaded(all);
+            for (request, resolution) in fixture_settled {
+                app.apply_pending_settled(
+                    request.session().clone(),
+                    request.request_id().to_string(),
+                    resolution,
+                );
+            }
+        }
         app.refresh_send_gate();
         app
     }
@@ -372,6 +416,9 @@ impl App {
         let mut app = Self::from_fixture(manifest_domain::fixture());
         app.sessions = sessions::State::from_projects(Vec::new(), Vec::new());
         app.transcript = transcript::State::default();
+        // Live starts with no cards: the fixture seed is fixture-only.
+        app.pending = pending::State::default();
+        app.visible_session = None;
         app.todos = Vec::new();
         app.todo_summary = String::from("0 of 0 done");
         app.current_todo = None;
@@ -534,12 +581,114 @@ impl App {
             && selected
                 .as_ref()
                 .is_some_and(|id| self.resuming.contains(id));
+        // A visible awaiting card blocks Send (the turn is paused
+        // for input); Stop stays live through running_visible, which
+        // this gate never clears.
+        let blocked_by_pending = self
+            .visible_session
+            .as_ref()
+            .is_some_and(|id| self.pending.has_awaiting(id));
+        self.composer.pending_hint =
+            blocked_by_pending.then(|| String::from("Answer the pending card to continue"));
+        self.sessions
+            .set_pending_counts(self.pending.pending_counts());
         self.composer.running_visible = running_visible;
         self.composer.send_enabled = self.engine_config.is_some()
             && self.connection == Connection::Connected
             && self.engine.is_some()
             && !self.awaiting_spawn
-            && !gated_by_resume;
+            && !gated_by_resume
+            && !blocked_by_pending;
+    }
+
+    /// The transcript owning `session`: visible or parked.
+    fn target_transcript(&mut self, session: &SessionId) -> &mut transcript::State {
+        if self.is_visible(session) {
+            &mut self.transcript
+        } else {
+            self.stored_transcript(session)
+        }
+    }
+
+    /// Reconcile transcripts with a wholesale pending fetch: insert
+    /// entries for new cards at their pause point, collapse entries
+    /// whose cards vanished unsettled to the expired record.
+    /// Returns whether the visible transcript changed (for scroll).
+    fn apply_pending_loaded(&mut self, requests: Vec<manifest_domain::PendingRequest>) -> bool {
+        let diff = self.pending.apply_loaded(requests);
+        let mut visible_changed = false;
+        for (session, request_id) in &diff.inserted {
+            let visible = self.is_visible(session);
+            if self
+                .target_transcript(session)
+                .push_pending(request_id.clone())
+                && visible
+            {
+                visible_changed = true;
+            }
+        }
+        for (session, request_id, line) in &diff.expired {
+            let visible = self.is_visible(session);
+            if self
+                .target_transcript(session)
+                .collapse_pending(request_id, line.clone())
+                && visible
+            {
+                visible_changed = true;
+            }
+        }
+        visible_changed
+    }
+
+    /// Collapse one settled card's entry to its record. Returns
+    /// whether the visible transcript changed.
+    fn apply_pending_settled(
+        &mut self,
+        session: SessionId,
+        request_id: String,
+        resolution: manifest_domain::PendingResolution,
+    ) -> bool {
+        let visible = self.is_visible(&session);
+        match self
+            .pending
+            .apply_settled(&session, &request_id, resolution)
+        {
+            Some(line) => {
+                self.target_transcript(&session)
+                    .collapse_pending(&request_id, line)
+                    && visible
+            }
+            None => false,
+        }
+    }
+
+    /// Route one pending-card message through the reducer and engine.
+    fn apply_pending(&mut self, child: pending::Message) {
+        let effect = self.pending.update(child);
+        self.run_pending_effect(effect);
+        self.refresh_send_gate();
+    }
+
+    /// Perform a pending reducer effect against the engine.
+    fn run_pending_effect(&self, effect: pending::Effect) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        match effect {
+            pending::Effect::None => {}
+            pending::Effect::FetchPending => engine.fetch_pending(),
+            pending::Effect::Decide {
+                session,
+                request_id,
+                decision,
+                reason,
+            } => engine.decide(session, request_id, decision, reason),
+            pending::Effect::Answer {
+                session,
+                request_id,
+                answer,
+            } => engine.answer(session, request_id, answer),
+        }
     }
 
     /// Requests the model catalog for the selected session when the
@@ -1022,11 +1171,25 @@ impl App {
                 }
                 false
             }
-            StreamEvent::Pending { .. } => {
+            StreamEvent::Pending {
+                session,
+                request_id,
+                kind,
+                phase,
+                ..
+            } => {
+                // Hint only: the fetch is the source of truth, for
+                // both Requested and Settled hints. A Requested hint
+                // is remembered so a failed fetch can still name
+                // the request with a placeholder card; Settled
+                // hints never add.
+                if matches!(phase, manifest_domain::PendingPhase::Requested) {
+                    self.pending.record_hint(session, request_id, kind);
+                }
                 if self.connection == Connection::Connected
                     && let Some(engine) = &self.engine
                 {
-                    engine.list_sessions();
+                    engine.fetch_pending();
                 }
                 false
             }
@@ -1177,9 +1340,31 @@ impl App {
                 self.refresh_send_gate();
                 Task::none()
             }
+            Message::Pending(child) => {
+                self.apply_pending(child);
+                Task::none()
+            }
+            Message::SubmitPendingShortcut => {
+                if let Some(request) = self
+                    .visible_session
+                    .as_ref()
+                    .and_then(|id| self.pending.first_awaiting_question(id))
+                {
+                    let effect = self
+                        .pending
+                        .update(pending::Message::SubmitAnswers { request });
+                    self.run_pending_effect(effect);
+                }
+                self.refresh_send_gate();
+                Task::none()
+            }
             Message::Transcript(child) => match child {
                 // Clipboard writes are tasks, which state cannot produce.
                 transcript::Message::Copy(text) => iced::clipboard::write(text),
+                transcript::Message::Pending(child) => {
+                    self.apply_pending(child);
+                    Task::none()
+                }
                 other => {
                     self.transcript.update(other);
                     Task::none()
@@ -1371,6 +1556,42 @@ impl App {
                                     // stream (TurnCompleted) is what
                                     // clears running.
                                 }
+                                manifest_domain::FailedCommand::PendingFetch => {
+                                    // No loaded card owns a global fetch
+                                    // failure (the error shows above), but
+                                    // a hinted request with no card must
+                                    // not hang silently: materialize a
+                                    // Failed placeholder with a Retry.
+                                    for (session, request_id, kind) in
+                                        self.pending.hinted_requests()
+                                    {
+                                        if self.pending.mark_hint_failed(
+                                            &session,
+                                            &request_id,
+                                            kind,
+                                            message.clone(),
+                                        ) {
+                                            let visible = self.is_visible(&session);
+                                            if self
+                                                .target_transcript(&session)
+                                                .push_pending(request_id)
+                                                && visible
+                                            {
+                                                appended = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                manifest_domain::FailedCommand::Decide(session, request_id)
+                                | manifest_domain::FailedCommand::Answer(session, request_id) => {
+                                    // The card stays as Failed with
+                                    // Retry; retry re-fetches truth.
+                                    self.pending.mark_failed(
+                                        &session,
+                                        &request_id,
+                                        message.clone(),
+                                    );
+                                }
                             }
                         }
                         EngineEvent::SessionSpawned { session, turn } => {
@@ -1411,6 +1632,27 @@ impl App {
                                 && let Some(engine) = &self.engine
                             {
                                 engine.list_sessions();
+                            }
+                        }
+                        EngineEvent::PendingLoaded { requests } => {
+                            appended = self.apply_pending_loaded(requests);
+                        }
+                        EngineEvent::PendingSettled {
+                            session,
+                            request_id,
+                            resolution,
+                        } => {
+                            let settled = self.apply_pending_settled(
+                                session.clone(),
+                                request_id.clone(),
+                                resolution,
+                            );
+                            appended = settled;
+                            if !settled && self.pending.card(&request_id).is_none() {
+                                // Unknown card: reconcile from truth.
+                                if let Some(engine) = &self.engine {
+                                    engine.fetch_pending();
+                                }
                             }
                         }
                         EngineEvent::Diagnostic(message) => {
@@ -1475,9 +1717,13 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         // The stack root is unconditional so base keeps its widget state across popup changes.
         let mut main = iced::widget::column![
-            iced::widget::container(self.transcript.view().map(Message::Transcript))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            iced::widget::container(
+                self.transcript
+                    .view_with_pending(&self.pending, self.visible_session.as_ref())
+                    .map(Message::Transcript),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill),
         ]
         .spacing(SPACE_S)
         .width(Length::Fill)
@@ -1600,6 +1846,11 @@ fn window_event(
 ) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::Resized(_)) => Some(Message::WindowResized),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            modifiers,
+            ..
+        }) if modifiers.control() => Some(Message::SubmitPendingShortcut),
         _ => None,
     }
 }
@@ -2298,6 +2549,19 @@ mod tests {
     type CancelCall = (manifest_domain::SessionId, Option<manifest_domain::TurnId>);
     /// One recorded catalog call: workspace and session context.
     type ModelsCall = (Option<String>, Option<manifest_domain::SessionId>);
+    /// One recorded decide call: session, request, decision, reason.
+    type DecideCall = (
+        manifest_domain::SessionId,
+        String,
+        manifest_domain::ApprovalDecision,
+        Option<String>,
+    );
+    /// One recorded answer call: session, request, assembled answer.
+    type AnswerCall = (
+        manifest_domain::SessionId,
+        String,
+        manifest_domain::PendingAnswer,
+    );
 
     #[derive(Clone)]
     struct FakeEngine {
@@ -2309,6 +2573,9 @@ mod tests {
         steers: std::sync::Arc<std::sync::Mutex<Vec<SteerCall>>>,
         cancels: std::sync::Arc<std::sync::Mutex<Vec<CancelCall>>>,
         models: std::sync::Arc<std::sync::Mutex<Vec<ModelsCall>>>,
+        fetches: std::sync::Arc<std::sync::Mutex<usize>>,
+        decides: std::sync::Arc<std::sync::Mutex<Vec<DecideCall>>>,
+        answers: std::sync::Arc<std::sync::Mutex<Vec<AnswerCall>>>,
     }
 
     impl manifest_domain::SessionEngine for FakeEngine {
@@ -2360,6 +2627,35 @@ mod tests {
         ) {
             self.models.lock().unwrap().push((workspace, session));
         }
+
+        fn fetch_pending(&self) {
+            *self.fetches.lock().unwrap() += 1;
+        }
+
+        fn decide(
+            &self,
+            session: manifest_domain::SessionId,
+            request_id: String,
+            decision: manifest_domain::ApprovalDecision,
+            reason: Option<String>,
+        ) {
+            self.decides
+                .lock()
+                .unwrap()
+                .push((session, request_id, decision, reason));
+        }
+
+        fn answer(
+            &self,
+            session: manifest_domain::SessionId,
+            request_id: String,
+            answer: manifest_domain::PendingAnswer,
+        ) {
+            self.answers
+                .lock()
+                .unwrap()
+                .push((session, request_id, answer));
+        }
     }
 
     /// A fresh fake engine with empty call logs.
@@ -2372,6 +2668,9 @@ mod tests {
             steers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             cancels: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fetches: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            decides: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            answers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2510,23 +2809,458 @@ mod tests {
     }
 
     #[test]
-    fn pending_hint_refreshes_sessions() {
+    fn pending_hint_fetches_pending_not_sessions() {
         let (mut app, fake) = live_app();
         deliver_connected(&mut app);
         assert_eq!(*fake.calls.lock().unwrap(), 1);
+        assert_eq!(*fake.fetches.lock().unwrap(), 0);
+        for phase in [
+            manifest_domain::PendingPhase::Requested,
+            manifest_domain::PendingPhase::Settled,
+        ] {
+            deliver(
+                &mut app,
+                engine::Input::event(manifest_domain::EngineEvent::Stream(
+                    manifest_domain::StreamEvent::Pending {
+                        session: manifest_domain::SessionId::new("s-1"),
+                        turn: None,
+                        request_id: String::from("req-1"),
+                        kind: manifest_domain::PendingKind::Approval,
+                        phase,
+                    },
+                )),
+            );
+        }
+        // Both hints fetch pending; neither re-lists sessions.
+        assert_eq!(*fake.fetches.lock().unwrap(), 2);
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+    }
+
+    fn pending_approval(session: &str, id: &str) -> manifest_domain::PendingRequest {
+        manifest_domain::PendingRequest::Approval {
+            session: manifest_domain::SessionId::new(session),
+            request_id: String::from(id),
+            approval: manifest_domain::ApprovalRequest {
+                tool: String::from("bash"),
+                subject_line: String::from("ls"),
+                choices: Vec::new(),
+            },
+        }
+    }
+
+    fn pending_questions(session: &str, id: &str) -> manifest_domain::PendingRequest {
+        manifest_domain::PendingRequest::Question {
+            session: manifest_domain::SessionId::new(session),
+            request_id: String::from(id),
+            question: manifest_domain::QuestionRequest {
+                questions: vec![
+                    manifest_domain::Question {
+                        id: String::from("q1"),
+                        prompt: String::from("Colour?"),
+                        options: vec![manifest_domain::QuestionOption {
+                            label: String::from("Red"),
+                            description: None,
+                        }],
+                        multi: false,
+                    },
+                    manifest_domain::Question {
+                        id: String::from("q2"),
+                        prompt: String::from("File?"),
+                        options: vec![manifest_domain::QuestionOption {
+                            label: String::from("alpha"),
+                            description: None,
+                        }],
+                        multi: false,
+                    },
+                ],
+            },
+        }
+    }
+
+    /// Connected app with two listed sessions; s-1 visible.
+    fn live_app_two_sessions() -> (App, FakeEngine) {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![live_session("s-1"), live_session("s-2")],
+            }),
+        );
+        (app, fake)
+    }
+
+    #[test]
+    fn hint_then_loaded_inserts_card_and_gates_send() {
+        let (mut app, fake) = live_app_two_sessions();
+        assert!(app.composer.send_enabled);
         deliver(
             &mut app,
             engine::Input::event(manifest_domain::EngineEvent::Stream(
                 manifest_domain::StreamEvent::Pending {
                     session: manifest_domain::SessionId::new("s-1"),
                     turn: None,
-                    request_id: String::from("req-1"),
+                    request_id: String::from("r1"),
                     kind: manifest_domain::PendingKind::Approval,
                     phase: manifest_domain::PendingPhase::Requested,
                 },
             )),
         );
-        assert_eq!(*fake.calls.lock().unwrap(), 2);
+        assert_eq!(*fake.fetches.lock().unwrap(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        assert!(app.transcript.has_pending("r1"));
+        assert!(!app.composer.send_enabled, "awaiting card gates send");
+        assert_eq!(
+            app.composer.pending_hint.as_deref(),
+            Some("Answer the pending card to continue")
+        );
+        assert_eq!(
+            app.sessions
+                .pending_count(&manifest_domain::SessionId::new("s-1")),
+            1
+        );
+        // Stop path is untouched: running state still drives it.
+        assert_eq!(
+            app.pending
+                .pending_count(&manifest_domain::SessionId::new("s-1")),
+            1
+        );
+    }
+
+    #[test]
+    fn approve_flow_decides_then_settles_to_record() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        let _ = app.update(Message::Pending(crate::pending::Message::Approve {
+            request: String::from("r1"),
+        }));
+        assert_eq!(fake.decides.lock().unwrap().len(), 1);
+        assert_eq!(
+            fake.decides.lock().unwrap()[0].2,
+            manifest_domain::ApprovalDecision::Approve
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingSettled {
+                session: manifest_domain::SessionId::new("s-1"),
+                request_id: String::from("r1"),
+                resolution: manifest_domain::PendingResolution::Approved,
+            }),
+        );
+        assert!(!app.transcript.has_pending("r1"));
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            &entry.kind,
+            crate::transcript::EntryKind::Note { text } if text.contains("Approved by you")
+        )));
+        assert!(app.composer.send_enabled, "settled card releases gate");
+    }
+
+    #[test]
+    fn transcript_pending_approve_decides_like_direct_pending() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        let _ = app.update(Message::Transcript(crate::transcript::Message::Pending(
+            crate::pending::Message::Approve {
+                request: String::from("r1"),
+            },
+        )));
+        assert_eq!(fake.decides.lock().unwrap().len(), 1);
+        assert_eq!(
+            fake.decides.lock().unwrap()[0].2,
+            manifest_domain::ApprovalDecision::Approve
+        );
+        assert_eq!(
+            app.pending.card("r1").unwrap().phase,
+            crate::pending::Phase::Deciding
+        );
+    }
+
+    #[test]
+    fn decide_failure_marks_card_failed_and_retry_refetches() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        let _ = app.update(Message::Pending(crate::pending::Message::Approve {
+            request: String::from("r1"),
+        }));
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Decide(
+                    manifest_domain::SessionId::new("s-1"),
+                    String::from("r1"),
+                ),
+                message: String::from("nope"),
+            }),
+        );
+        assert!(matches!(
+            app.pending.card("r1").unwrap().phase,
+            crate::pending::Phase::Failed(ref m) if m == "nope"
+        ));
+        assert!(app.transcript.has_pending("r1"), "failed card stays");
+        let before = *fake.fetches.lock().unwrap();
+        let _ = app.update(Message::Pending(crate::pending::Message::RetryFetch {
+            request: String::from("r1"),
+        }));
+        assert_eq!(*fake.fetches.lock().unwrap(), before + 1);
+    }
+
+    #[test]
+    fn hinted_fetch_failure_materializes_placeholder_and_retry_revives() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-1"),
+                    turn: None,
+                    request_id: String::from("r1"),
+                    kind: manifest_domain::PendingKind::Approval,
+                    phase: manifest_domain::PendingPhase::Requested,
+                },
+            )),
+        );
+        assert_eq!(*fake.fetches.lock().unwrap(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        let card = app
+            .pending
+            .card("r1")
+            .expect("failed fetch must materialize a placeholder card");
+        assert!(matches!(
+            card.phase,
+            crate::pending::Phase::Failed(ref m) if m == "write EPIPE"
+        ));
+        assert!(
+            app.transcript.has_pending("r1"),
+            "placeholder has a transcript entry"
+        );
+        assert!(
+            app.composer.send_enabled,
+            "a Failed placeholder must not gate send"
+        );
+        // Retry re-fetches truth.
+        let before = *fake.fetches.lock().unwrap();
+        let _ = app.update(Message::Pending(crate::pending::Message::RetryFetch {
+            request: String::from("r1"),
+        }));
+        assert_eq!(*fake.fetches.lock().unwrap(), before + 1);
+        // The successful fetch revives the placeholder with real payload.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        let card = app.pending.card("r1").unwrap();
+        assert_eq!(card.phase, crate::pending::Phase::Awaiting);
+        match &card.request {
+            manifest_domain::PendingRequest::Approval { approval, .. } => {
+                assert_eq!(approval.tool, "bash");
+                assert_eq!(approval.subject_line, "ls");
+            }
+            other => panic!("expected revived approval payload, got {other:?}"),
+        }
+        assert!(app.transcript.has_pending("r1"));
+        assert!(!app.composer.send_enabled, "revived awaiting card gates");
+        // Hint was cleared by the load: a later global fetch failure
+        // must not fail the now-loaded awaiting card.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert_eq!(
+            app.pending.card("r1").unwrap().phase,
+            crate::pending::Phase::Awaiting
+        );
+    }
+
+    #[test]
+    fn settled_hint_fetch_failure_creates_no_placeholder() {
+        let (mut app, _fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-1"),
+                    turn: None,
+                    request_id: String::from("r1"),
+                    kind: manifest_domain::PendingKind::Approval,
+                    phase: manifest_domain::PendingPhase::Settled,
+                },
+            )),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert!(app.pending.card("r1").is_none());
+        assert!(!app.transcript.has_pending("r1"));
+    }
+
+    #[test]
+    fn hinted_fetch_failure_parks_placeholder_for_background_session() {
+        let (mut app, _fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::Stream(
+                manifest_domain::StreamEvent::Pending {
+                    session: manifest_domain::SessionId::new("s-2"),
+                    turn: None,
+                    request_id: String::from("r9"),
+                    kind: manifest_domain::PendingKind::UserInput,
+                    phase: manifest_domain::PendingPhase::Requested,
+                },
+            )),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::PendingFetch,
+                message: String::from("write EPIPE"),
+            }),
+        );
+        assert!(matches!(
+            app.pending.card("r9").unwrap().phase,
+            crate::pending::Phase::Failed(_)
+        ));
+        assert!(!app.transcript.has_pending("r9"), "visible is s-1");
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-2"),
+        )));
+        assert!(
+            app.transcript.has_pending("r9"),
+            "parked placeholder entry shows on switch"
+        );
+    }
+
+    #[test]
+    fn answer_flow_sends_assembled_answer() {
+        let (mut app, fake) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_questions("s-1", "r2")],
+            }),
+        );
+        let _ = app.update(Message::Pending(crate::pending::Message::SelectOption {
+            request: String::from("r2"),
+            question: String::from("q1"),
+            label: String::from("Red"),
+        }));
+        let _ = app.update(Message::Pending(crate::pending::Message::PagerNext {
+            request: String::from("r2"),
+        }));
+        let _ = app.update(Message::Pending(crate::pending::Message::SelectOption {
+            request: String::from("r2"),
+            question: String::from("q2"),
+            label: String::from("alpha"),
+        }));
+        let _ = app.update(Message::Pending(crate::pending::Message::SubmitAnswers {
+            request: String::from("r2"),
+        }));
+        let answers = fake.answers.lock().unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers[0].2.get("q1"),
+            Some(&manifest_domain::AnswerValue::Label(String::from("Red")))
+        );
+        assert_eq!(
+            answers[0].2.get("q2"),
+            Some(&manifest_domain::AnswerValue::Label(String::from("alpha")))
+        );
+    }
+
+    #[test]
+    fn expiry_vanish_collapses_to_expired_record() {
+        let (mut app, _) = live_app_two_sessions();
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_approval("s-1", "r1")],
+            }),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: Vec::new(),
+            }),
+        );
+        assert!(!app.transcript.has_pending("r1"));
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            &entry.kind,
+            crate::transcript::EntryKind::Note { text } if text.contains("Expired")
+        )));
+        assert!(app.composer.send_enabled);
+    }
+
+    #[test]
+    fn background_count_and_session_switch_preserves_pager() {
+        let (mut app, _) = live_app_two_sessions();
+        // Background session s-2 gets a question card while s-1 shows.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PendingLoaded {
+                requests: vec![pending_questions("s-2", "r2")],
+            }),
+        );
+        assert_eq!(
+            app.pending
+                .pending_count(&manifest_domain::SessionId::new("s-2")),
+            1
+        );
+        assert!(app.composer.send_enabled, "background card does not gate");
+        // Switch to s-2, advance pager, switch away and back.
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-2"),
+        )));
+        assert!(app.transcript.has_pending("r2"));
+        assert!(!app.composer.send_enabled);
+        let _ = app.update(Message::Pending(crate::pending::Message::PagerNext {
+            request: String::from("r2"),
+        }));
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-1"),
+        )));
+        let _ = app.update(Message::Sessions(crate::sessions::Message::Select(
+            manifest_domain::SessionId::new("s-2"),
+        )));
+        assert_eq!(
+            app.pending.card("r2").unwrap().interaction.pager_index,
+            1,
+            "pager survives session switches (state is per-session)"
+        );
+        assert!(app.transcript.has_pending("r2"));
     }
 
     #[test]
@@ -2579,6 +3313,60 @@ mod tests {
         assert_eq!(app.connection, manifest_domain::Connection::Disconnected);
         assert!(app.engine_config.is_none());
         assert!(app.engine.is_none());
+    }
+
+    #[test]
+    fn fixture_mode_renders_pending_cards_without_engine() {
+        let app = App::boot();
+        let awaiting = manifest_domain::SessionId::new("session-settings-copy");
+        assert!(app.engine.is_none(), "cards render without an engine");
+        assert_eq!(app.visible_session, Some(awaiting.clone()));
+        // Question card (3 questions) and approval card stay pending;
+        // the settled fixture approval collapsed to its record, so the
+        // 14 fixture transcript items gain exactly 2 pending entries
+        // and 1 settled note.
+        assert_eq!(app.pending.pending_count(&awaiting), 2);
+        assert_eq!(
+            app.pending
+                .card("fixture-question-1")
+                .and_then(|card| card.current_question())
+                .map(|q| q.prompt.as_str()),
+            Some("Which token refresh should settings sync use?")
+        );
+        assert!(app.transcript.has_pending("fixture-question-1"));
+        assert!(app.transcript.has_pending("fixture-approval-1"));
+        assert!(!app.transcript.has_pending("fixture-settled-1"));
+        assert_eq!(app.transcript.entries.len(), 14 + 3);
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            &entry.kind,
+            crate::transcript::EntryKind::Note { text }
+                if text == "Approval · Run the checkout sync suite — Approved by you"
+        )));
+        // Background badge, hint, and the inline card all read the seed.
+        assert_eq!(app.sessions.pending_count(&awaiting), 2);
+        assert_eq!(
+            app.composer.pending_hint.as_deref(),
+            Some("Answer the pending card to continue")
+        );
+        assert!(
+            crate::transcript::pending_element(
+                &app.pending,
+                app.visible_session.as_ref(),
+                "fixture-question-1"
+            )
+            .is_some()
+        );
+        let _ = app.view();
+    }
+
+    #[test]
+    fn live_boot_clears_fixture_pending_seed() {
+        let (app, _) = live_app();
+        let awaiting = manifest_domain::SessionId::new("session-settings-copy");
+        assert_eq!(app.pending.pending_count(&awaiting), 0);
+        assert!(app.pending.card("fixture-question-1").is_none());
+        assert_eq!(app.visible_session, None);
+        assert!(app.transcript.entries.is_empty());
     }
 
     /// Loads a live session list with the given ids.

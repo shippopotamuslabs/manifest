@@ -144,6 +144,10 @@ pub struct State {
     /// App (written by its gate refresh): while set, Send becomes
     /// Steer and the Stop control appears.
     pub running_visible: bool,
+    /// Precomputed hint shown while a pending card gates send, e.g.
+    /// "Answer the pending card to continue"; `None` hides it. Written
+    /// by the App in its gate refresh (UI contract §2).
+    pub pending_hint: Option<String>,
     /// Whether the attach popup is showing.
     pub attach_popup: AttachPopup,
     /// Whether the permission menu is showing.
@@ -183,6 +187,7 @@ impl State {
             has_text: false,
             send_enabled: true,
             running_visible: false,
+            pending_hint: None,
             attach_popup: AttachPopup::Closed,
             permission_menu: PermissionMenu::Closed,
             model_menu: ModelMenu::Closed,
@@ -476,6 +481,13 @@ impl State {
             )));
         }
         let mut column = iced::widget::column![kit::input_bar(row)].spacing(SPACE_XS);
+        if let Some(hint) = &self.pending_hint {
+            column = column.push(
+                iced::widget::text(hint.as_str())
+                    .size(FONT_SIZE_PANEL)
+                    .color(TEXT_TERTIARY),
+            );
+        }
         if !self.attachments.is_empty() {
             column = column.push(self.attachments_view());
         }

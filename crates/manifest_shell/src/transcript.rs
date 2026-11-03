@@ -11,9 +11,10 @@ use std::collections::HashSet;
 
 use iced::widget::markdown;
 use iced::{Element, Length};
-use manifest_domain::{ItemStatus, StreamItem, TranscriptItem};
+use manifest_domain::{ItemStatus, SessionId, StreamItem, TranscriptItem};
 
 use crate::kit;
+use crate::pending;
 use crate::theme::{
     ACCENT_BASE, DANGER, FONT_SIZE_BODY, FONT_SIZE_SMALL, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY,
     TEXT_SECONDARY, TEXT_TERTIARY,
@@ -37,6 +38,9 @@ const GROUP_HEADER_HEIGHT: f32 = FONT_SIZE_SMALL * 1.3 + 2.0 * crate::theme::SPA
 /// Matches the fixed square of the kit icon button it now renders.
 /// Tune against the release build if it drifts.
 const COPY_ROW_HEIGHT: f32 = crate::theme::ICON_BUTTON_SIZE;
+/// Approximate height of an inline pending card in px. Tune against
+/// the release build if the card drifts from the real height.
+pub const PENDING_CARD_HEIGHT: f32 = 340.0;
 /// Separator between headline parts, e.g. `Thinking · 2 tool calls`.
 const MIDDOT: &str = " · ";
 
@@ -110,6 +114,14 @@ pub enum EntryKind {
     Error {
         /// Error text.
         text: String,
+    },
+    /// A pending approval/question at its pause point. Only the
+    /// request id lives here; card payload and phase live in
+    /// `pending::State`. Settling collapses this entry in place to
+    /// a one-line `Note` record.
+    Pending {
+        /// Opaque pending request handle.
+        request_id: String,
     },
 }
 
@@ -195,6 +207,21 @@ pub enum Message {
     /// lands later, which will read the URI.
     #[allow(dead_code)]
     LinkClicked(String),
+    /// An inline pending-card interaction, routed by the app exactly
+    /// like `app::Message::Pending`.
+    Pending(crate::pending::Message),
+}
+
+/// Element for the pending entry at its pause point: the full card
+/// from `pending_state` for `session`, mapped to [`Message::Pending`].
+pub fn pending_element<'a>(
+    pending_state: &'a pending::State,
+    session: Option<&'a SessionId>,
+    request_id: &str,
+) -> Option<Element<'a, Message>> {
+    pending_state
+        .card_element(session, request_id)
+        .map(|element| element.map(Message::Pending))
 }
 
 /// Markdown rendering config, built once from theme tokens (UI
@@ -421,6 +448,45 @@ impl State {
         self.rebuild_rows();
     }
 
+    /// Inserts a pending entry at the end (the pause point).
+    /// Dedupes by request id. Returns true when inserted.
+    pub fn push_pending(&mut self, request_id: String) -> bool {
+        if self.entries.iter().any(|entry| {
+            matches!(&entry.kind, EntryKind::Pending { request_id: id } if id == &request_id)
+        }) {
+            return false;
+        }
+        self.entries.push(Entry {
+            host_id: None,
+            kind: EntryKind::Pending { request_id },
+            completed: false,
+        });
+        self.rebuild_rows();
+        true
+    }
+
+    /// Collapses a pending entry in place to its one-line record.
+    /// Returns true when an entry collapsed.
+    pub fn collapse_pending(&mut self, request_id: &str, line: String) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| {
+            matches!(&entry.kind, EntryKind::Pending { request_id: id } if id == request_id)
+        }) else {
+            return false;
+        };
+        entry.kind = EntryKind::Note { text: line };
+        entry.completed = true;
+        self.rebuild_rows();
+        true
+    }
+
+    /// Whether a live (uncollapsed) pending entry names `request_id`.
+    #[allow(dead_code)]
+    pub fn has_pending(&self, request_id: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(&entry.kind, EntryKind::Pending { request_id: id } if id == request_id)
+        })
+    }
+
     /// Builds transcript state from domain items. Scroll-derived fields
     /// start at zero / none, matching `Default`.
     pub fn from_items(items: Vec<TranscriptItem>) -> Self {
@@ -632,7 +698,7 @@ impl State {
                 }
                 self.rebuild_rows();
             }
-            Message::Copy(_) | Message::LinkClicked(_) => {}
+            Message::Copy(_) | Message::LinkClicked(_) | Message::Pending(_) => {}
         }
     }
 
@@ -712,7 +778,26 @@ impl State {
     /// overlay is display-only: containers and the pin forward events
     /// without capturing them, so wheel and pointer input still reach
     /// the scrollable beneath.
+    #[allow(dead_code)]
     pub fn view(&self) -> Element<'_, Message> {
+        self.view_impl(None, None)
+    }
+
+    /// Like [`view`](Self::view), with inline pending cards from
+    /// `pending_state` for the visible `session`.
+    pub fn view_with_pending<'a>(
+        &'a self,
+        pending_state: &'a pending::State,
+        session: Option<&'a SessionId>,
+    ) -> Element<'a, Message> {
+        self.view_impl(Some(pending_state), session)
+    }
+
+    fn view_impl<'a>(
+        &'a self,
+        pending_state: Option<&'a pending::State>,
+        session: Option<&'a SessionId>,
+    ) -> Element<'a, Message> {
         // The stack root is unconditional so the scrollable keeps its widget state across sticky changes.
         let mut list = iced::widget::column![].width(Length::Fill);
         for (row, item) in self.rows.iter().enumerate() {
@@ -725,7 +810,13 @@ impl State {
                     row_gap_between(&self.rows[row - 1], item, &self.entries),
                 )));
             }
-            list = list.push(render_row(item, &self.entries, self.settings));
+            list = list.push(render_row(
+                item,
+                &self.entries,
+                self.settings,
+                pending_state,
+                session,
+            ));
         }
         let base: Element<'_, Message> = iced::widget::scrollable(list)
             .id(SCROLL_ID)
@@ -901,6 +992,7 @@ fn entry_height(entry: &Entry, content_width: f32) -> f32 {
         EntryKind::Note { text } | EntryKind::Error { text } => {
             wrapped_lines(text, full_width) as f32 * LINE_HEIGHT
         }
+        EntryKind::Pending { .. } => PENDING_CARD_HEIGHT,
     }
 }
 
@@ -960,9 +1052,11 @@ fn render_row<'a>(
     row: &'a Row,
     entries: &'a [Entry],
     settings: markdown::Settings,
+    pending_state: Option<&'a pending::State>,
+    session: Option<&'a SessionId>,
 ) -> Element<'a, Message> {
     match row {
-        Row::Single(index) => render_entry(&entries[*index], settings),
+        Row::Single(index) => render_entry(&entries[*index], settings, pending_state, session),
         Row::Group {
             first,
             last,
@@ -978,7 +1072,7 @@ fn render_row<'a>(
             .width(Length::Fill);
             if *expanded {
                 for entry in entries.iter().take(*last + 1).skip(*first) {
-                    column = column.push(render_entry(entry, settings));
+                    column = column.push(render_entry(entry, settings, pending_state, session));
                 }
             }
             column.into()
@@ -989,7 +1083,12 @@ fn render_row<'a>(
 /// Renders one entry, distinct by kind. Body text is borrowed, never
 /// cloned, except the owned copies message payloads carry (Elm messages
 /// own their data): Copy buttons clone the text they will write.
-fn render_entry<'a>(entry: &'a Entry, settings: markdown::Settings) -> Element<'a, Message> {
+fn render_entry<'a>(
+    entry: &'a Entry,
+    settings: markdown::Settings,
+    pending_state: Option<&'a pending::State>,
+    session: Option<&'a SessionId>,
+) -> Element<'a, Message> {
     match &entry.kind {
         EntryKind::User { text } => kit::prompt_bubble(text.as_str()),
         EntryKind::Assistant { text, markdown } => {
@@ -1074,6 +1173,12 @@ fn render_entry<'a>(entry: &'a Entry, settings: markdown::Settings) -> Element<'
         )
         .width(Length::Fill)
         .into(),
+        EntryKind::Pending { request_id } => {
+            match pending_state.and_then(|state| pending_element(state, session, request_id)) {
+                Some(element) => element,
+                None => kit::static_pill("Needs your input"),
+            }
+        }
     }
 }
 
@@ -1405,6 +1510,54 @@ mod tests {
                 ..
             }) if text == "other"
         ));
+    }
+
+    #[test]
+    fn pending_entry_renders_inline_card_and_uses_card_height() {
+        use manifest_domain::{ApprovalRequest, PendingRequest, SessionId};
+        let mut pending_state = crate::pending::State::default();
+        pending_state.apply_loaded(vec![PendingRequest::Approval {
+            session: SessionId::new("s-1"),
+            request_id: String::from("r1"),
+            approval: ApprovalRequest {
+                tool: String::from("bash"),
+                subject_line: String::from("ls"),
+                choices: Vec::new(),
+            },
+        }]);
+        let mut state = State::from_items(vec![]);
+        assert!(state.push_pending(String::from("r1")));
+        let session = SessionId::new("s-1");
+        assert!(super::pending_element(&pending_state, Some(&session), "r1").is_some());
+        assert!(
+            super::pending_element(&pending_state, Some(&SessionId::new("s-2")), "r1").is_none()
+        );
+        assert!(super::pending_element(&pending_state, Some(&session), "missing").is_none());
+        let entry = &state.entries[0];
+        assert_eq!(
+            super::entry_height(entry, 600.0),
+            super::PENDING_CARD_HEIGHT
+        );
+        // The full view builds with the inline card present.
+        let _ = state.view_with_pending(&pending_state, Some(&session));
+        let _ = state.view();
+    }
+
+    #[test]
+    fn pending_entry_inserts_dedupes_and_collapses_in_place() {
+        let mut state = State::from_items(vec![]);
+        assert!(state.push_pending(String::from("r1")));
+        assert!(!state.push_pending(String::from("r1")));
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.has_pending("r1"));
+        assert!(state.collapse_pending("r1", String::from("Approval · ls — Approved by you")));
+        assert!(!state.has_pending("r1"));
+        assert!(matches!(
+            &state.entries[0].kind,
+            EntryKind::Note { text } if text.contains("Approved by you")
+        ));
+        assert!(state.entries[0].completed);
+        assert!(!state.collapse_pending("missing", String::from("x")));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Transport tests against the scripted fake server.
 
 use manifest_domain::{
-    Connection, EngineEvent, FailedCommand, ItemStatus, PendingKind, PendingPhase, SessionEngine,
+    AnswerValue, ApprovalDecision, Connection, EngineEvent, FailedCommand, ItemStatus,
+    PendingAnswer, PendingKind, PendingPhase, PendingRequest, PendingResolution, SessionEngine,
     SessionId, SessionStatus, SpawnChoices, StreamEvent, StreamItem, TurnId, WorktreeChoice,
 };
 use manifest_mcp::{MuseEngine, ServerConfig, connect};
@@ -515,6 +516,175 @@ fn second_list_is_load_failed_not_disconnect() {
     assert!(
         failure.contains("status blew up"),
         "second call reports the server error, saw {failure:?}"
+    );
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn pending_fetch_decide_answer_then_empty() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    // Fetch: one approval + one 3-question user-input.
+    engine.fetch_pending();
+    let mut seen = recv_until(&rx, "PendingLoaded", |event| {
+        matches!(event, EngineEvent::PendingLoaded { .. })
+    });
+    let loaded = seen
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::PendingLoaded { requests } => Some(requests.clone()),
+            _ => None,
+        })
+        .expect("PendingLoaded seen above");
+    assert_eq!(loaded.len(), 2, "saw {loaded:?}");
+    match &loaded[0] {
+        PendingRequest::Approval {
+            session,
+            request_id,
+            approval,
+        } => {
+            assert_eq!(session, &SessionId::new("sess-pending"));
+            assert_eq!(request_id, "req-approval-1");
+            assert_eq!(approval.tool, "bash");
+            assert!(approval.subject_line.contains("ls -la /tmp/ws"));
+            assert_eq!(approval.choice_labels(), vec!["Allow once", "Reject"]);
+        }
+        other => panic!("first pending is the approval, saw {other:?}"),
+    }
+    match &loaded[1] {
+        PendingRequest::Question {
+            session,
+            request_id,
+            question,
+        } => {
+            assert_eq!(session, &SessionId::new("sess-pending"));
+            assert_eq!(request_id, "req-question-1");
+            assert_eq!(question.questions.len(), 3);
+            assert!(!question.questions[0].multi);
+            assert_eq!(
+                question.questions[0].options[0].description.as_deref(),
+                Some("Warm and bright")
+            );
+            // The real "None" option is a plain label with no description.
+            assert_eq!(question.questions[0].options[2].label, "None");
+            assert_eq!(question.questions[0].options[2].description, None);
+            assert!(question.questions[1].multi, "second question is multiple");
+            assert_eq!(question.questions[2].prompt, "Which file?");
+        }
+        other => panic!("second pending is the question, saw {other:?}"),
+    }
+
+    // Decide the approval as the user; it settles.
+    engine.decide(
+        SessionId::new("sess-pending"),
+        String::from("req-approval-1"),
+        ApprovalDecision::Approve,
+        None,
+    );
+    seen.extend(recv_until(&rx, "approval PendingSettled", |event| {
+        matches!(
+            event,
+            EngineEvent::PendingSettled { request_id, .. } if request_id == "req-approval-1"
+        )
+    }));
+    let settled = seen.iter().find_map(|event| match event {
+        EngineEvent::PendingSettled {
+            session,
+            request_id,
+            resolution,
+        } if request_id == "req-approval-1" => Some((session.clone(), resolution.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        settled,
+        Some((SessionId::new("sess-pending"), PendingResolution::Approved))
+    );
+
+    // Answer all three questions; it settles with a summary.
+    engine.answer(
+        SessionId::new("sess-pending"),
+        String::from("req-question-1"),
+        PendingAnswer::new(vec![
+            (
+                String::from("color"),
+                AnswerValue::Label(String::from("Red")),
+            ),
+            (
+                String::from("extras"),
+                AnswerValue::Labels(vec![String::from("Cheese")]),
+            ),
+            (String::from("file"), AnswerValue::free_text("my own file")),
+        ]),
+    );
+    seen.extend(recv_until(&rx, "question PendingSettled", |event| {
+        matches!(
+            event,
+            EngineEvent::PendingSettled { request_id, .. } if request_id == "req-question-1"
+        )
+    }));
+    let settled = seen.iter().find_map(|event| match event {
+        EngineEvent::PendingSettled {
+            request_id,
+            resolution,
+            ..
+        } if request_id == "req-question-1" => Some(resolution.clone()),
+        _ => None,
+    });
+    match settled {
+        Some(PendingResolution::Answered(summary)) => {
+            assert!(
+                summary.contains("Red"),
+                "summary names answers, saw {summary:?}"
+            );
+        }
+        other => panic!("expected Answered settlement, saw {other:?}"),
+    }
+
+    // Both settled: a fresh fetch is empty (the fake drops settled rows,
+    // and only settles when actor is "user").
+    engine.fetch_pending();
+    seen.extend(recv_until(
+        &rx,
+        "empty PendingLoaded",
+        |event| matches!(event, EngineEvent::PendingLoaded { requests } if requests.is_empty()),
+    ));
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
+    );
+    assert!(command_failure(&seen).is_none(), "saw {seen:#?}");
+    drop(engine);
+}
+
+#[test]
+fn decide_unknown_request_is_tagged_command_failed() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.decide(
+        SessionId::new("sess-pending"),
+        String::from("req-nope"),
+        ApprovalDecision::Deny,
+        Some(String::from("no thanks")),
+    );
+    let seen = recv_until(&rx, "CommandFailed", |event| {
+        matches!(event, EngineEvent::CommandFailed { .. })
+    });
+    let (command, failure) = command_failure(&seen).expect("failure seen above");
+    assert_eq!(
+        command,
+        FailedCommand::Decide(SessionId::new("sess-pending"), String::from("req-nope"))
+    );
+    assert!(
+        failure.contains("no pending approval"),
+        "failure carries the server text, saw {failure:?}"
     );
     assert!(
         failed_text(&seen).is_none(),

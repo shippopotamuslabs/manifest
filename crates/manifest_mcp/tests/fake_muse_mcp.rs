@@ -377,6 +377,73 @@ fn emit_turn_stream(stdout: &mut std::io::StdoutLock<'_>, session: &str, prompt:
     );
 }
 
+/// Pending rows the fake holds until settled: one approval and one
+/// 3-question user-input (options with descriptions, one multiple).
+fn pending_rows(settled: &std::collections::HashSet<String>) -> serde_json::Value {
+    let mut rows = Vec::new();
+    if !settled.contains("req-approval-1") {
+        rows.push(serde_json::json!({
+            "requestId": "req-approval-1",
+            "sessionId": "sess-pending",
+            "kind": "approval",
+            "receivedAt": 1700000000000_u64,
+            "ageSec": 5,
+            "payload": {
+                "approvalId": "req-approval-1",
+                "sessionId": "sess-pending",
+                "toolName": "bash",
+                "rawArgs": "{\"command\":\"ls -la /tmp/ws\"}",
+                "subject": {"kind": "command", "command": "ls -la /tmp/ws", "toolName": "bash"},
+                "availableChoices": [
+                    {"choiceId": "allow_once", "decision": "approved", "scope": "once", "label": "Allow once", "acceptsFeedback": false},
+                    {"choiceId": "abort", "decision": "abort", "scope": "once", "label": "Reject", "acceptsFeedback": true}
+                ]
+            }
+        }));
+    }
+    if !settled.contains("req-question-1") {
+        rows.push(serde_json::json!({
+            "requestId": "req-question-1",
+            "sessionId": "sess-pending",
+            "kind": "userInput",
+            "receivedAt": 1700000001000_u64,
+            "ageSec": 4,
+            "payload": {
+                "userInputId": "req-question-1",
+                "sessionId": "sess-pending",
+                "questions": [
+                    {
+                        "id": "color", "header": "Color", "question": "Pick a color",
+                        "selection": {"mode": "single"},
+                        "options": [
+                            {"label": "Red", "description": "Warm and bright"},
+                            {"label": "Blue", "description": "Cool and calm"},
+                            {"label": "None"}
+                        ]
+                    },
+                    {
+                        "id": "extras", "header": "Extras", "question": "Pick extras",
+                        "selection": {"mode": "multiple"},
+                        "options": [
+                            {"label": "Cheese", "description": "Extra cheese"},
+                            {"label": "Olives", "description": "Green olives"}
+                        ]
+                    },
+                    {
+                        "id": "file", "header": "File", "question": "Which file?",
+                        "selection": {"mode": "single"},
+                        "options": [
+                            {"label": "alpha.txt", "description": "First file"},
+                            {"label": "beta.txt", "description": "Second file"}
+                        ]
+                    }
+                ]
+            }
+        }));
+    }
+    serde_json::Value::Array(rows)
+}
+
 fn main() {
     let mode = std::env::var("FAKE_MCP_MODE").unwrap_or_else(|_| String::from("ok"));
     if mode == "exit-early" {
@@ -425,6 +492,11 @@ fn main() {
     }
 
     let mut status_calls = 0_u32;
+    let mut settled_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Recorded decide/answer calls (actor + payload), checked by the
+    // settling behaviour: a wrong actor never settles the row.
+    let mut recorded_decides: Vec<serde_json::Value> = Vec::new();
+    let mut recorded_answers: Vec<serde_json::Value> = Vec::new();
     for line in lines {
         let line = match line {
             Ok(line) => line,
@@ -572,6 +644,96 @@ fn main() {
                         false,
                     );
                     emit_turn_stream(&mut out, session, prompt);
+                    continue;
+                }
+                if tool == "muse_pending" {
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &pending_rows(&settled_pending).to_string(),
+                        false,
+                    );
+                    continue;
+                }
+                if tool == "muse_decide" {
+                    recorded_decides.push(arguments.clone());
+                    let actor = arguments.get("actor").and_then(serde_json::Value::as_str);
+                    let request_id = arguments
+                        .get("request_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let decision = arguments
+                        .get("decision")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if actor != Some("user") {
+                        tool_result(&mut out, &call_id, "actor must be user", true);
+                        continue;
+                    }
+                    if request_id != "req-approval-1"
+                        || settled_pending.contains(request_id)
+                        || (decision != "approve" && decision != "deny")
+                    {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            &format!("no pending approval {request_id}"),
+                            true,
+                        );
+                        continue;
+                    }
+                    settled_pending.insert(String::from(request_id));
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({"choiceId": "allow_once"}).to_string(),
+                        false,
+                    );
+                    continue;
+                }
+                if tool == "muse_answer" {
+                    recorded_answers.push(arguments.clone());
+                    let actor = arguments.get("actor").and_then(serde_json::Value::as_str);
+                    let request_id = arguments
+                        .get("request_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if actor != Some("user") {
+                        tool_result(&mut out, &call_id, "actor must be user", true);
+                        continue;
+                    }
+                    if request_id != "req-question-1" || settled_pending.contains(request_id) {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            &format!("no pending user-input {request_id}"),
+                            true,
+                        );
+                        continue;
+                    }
+                    // The answer must carry one entry per question.
+                    let answer_len = arguments
+                        .get("answer")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if answer_len != 3 {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            "answer must carry one entry per question",
+                            true,
+                        );
+                        continue;
+                    }
+                    settled_pending.insert(String::from(request_id));
+                    let _ = (&recorded_decides, &recorded_answers);
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({"outcome": "answered"}).to_string(),
+                        false,
+                    );
                     continue;
                 }
                 if tool == "muse_models" {

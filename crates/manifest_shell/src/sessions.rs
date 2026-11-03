@@ -12,7 +12,7 @@
 //! header. `update` changes the selection only for ids already in the
 //! list; an unknown id is a no-op.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length};
 use manifest_domain::{ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary};
@@ -105,6 +105,9 @@ pub struct State {
     pub expanded: HashSet<ProjectId>,
     /// The add-project popup situation.
     pub add_project: AddProject,
+    /// Precomputed unsettled pending counts by session, written by
+    /// the App on every pending load (UI contract §2).
+    pub pending_counts: HashMap<SessionId, u64>,
 }
 
 impl State {
@@ -153,7 +156,19 @@ impl State {
             selected,
             expanded,
             add_project: AddProject::Closed,
+            pending_counts: HashMap::new(),
         }
+    }
+
+    /// Replace the precomputed pending counts (App is the writer).
+    pub fn set_pending_counts(&mut self, counts: HashMap<SessionId, u64>) {
+        self.pending_counts = counts;
+    }
+
+    /// Pending count for one session's badge; 0 hides it.
+    #[allow(dead_code)]
+    pub fn pending_count(&self, session: &SessionId) -> u64 {
+        self.pending_counts.get(session).copied().unwrap_or(0)
     }
 
     /// Replaces the list with fresh domain rows, preserving UI state.
@@ -178,6 +193,7 @@ impl State {
                 .collect();
         }
         fresh.add_project = std::mem::take(&mut self.add_project);
+        fresh.pending_counts = std::mem::take(&mut self.pending_counts);
         *self = fresh;
     }
 
@@ -319,12 +335,20 @@ impl State {
                 Message::RemoveProject(group.project.id.clone()),
             ));
             if expanded {
-                list = list.push(indented(session_rows(&group.sessions, &self.selected)));
+                list = list.push(indented(session_rows(
+                    &group.sessions,
+                    &self.selected,
+                    &self.pending_counts,
+                )));
             }
         }
         if !self.unprojected.is_empty() {
             list = list.push(no_project_header());
-            list = list.push(indented(session_rows(&self.unprojected, &self.selected)));
+            list = list.push(indented(session_rows(
+                &self.unprojected,
+                &self.selected,
+                &self.pending_counts,
+            )));
         }
         iced::widget::scrollable(iced::widget::container(list).width(Length::Fill))
             .width(Length::Fill)
@@ -412,6 +436,7 @@ impl State {
 fn session_rows<'a>(
     sessions: &'a [SessionSummary],
     selected: &'a SessionId,
+    pending_counts: &'a HashMap<SessionId, u64>,
 ) -> Element<'a, Message> {
     let mut rows = iced::widget::column![]
         .spacing(SPACE_XXS)
@@ -425,9 +450,10 @@ fn session_rows<'a>(
         } else {
             summary.relative_time.as_str()
         };
-        rows = rows.push(kit::list_row(
+        rows = rows.push(kit::list_row_with_badge(
             &summary.title,
             trailing,
+            pending_counts.get(&summary.id).copied().unwrap_or(0),
             summary.id == *selected,
             Message::Select(summary.id.clone()),
         ));
@@ -491,6 +517,20 @@ mod tests {
     fn state() -> State {
         let got = fixture();
         State::from_projects(got.projects, got.sessions)
+    }
+
+    #[test]
+    fn pending_counts_badge_reads_precomputed_map() {
+        let mut got = state();
+        assert_eq!(got.pending_count(&got.selected), 0);
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(got.selected.clone(), 2_u64);
+        got.set_pending_counts(counts);
+        assert_eq!(got.pending_count(&got.selected), 2);
+        // Counts survive a list replace (App rewrites them on load).
+        let fixture = fixture();
+        got.replace(fixture.projects, fixture.sessions);
+        assert_eq!(got.pending_count(&got.selected), 2);
     }
 
     #[test]

@@ -344,6 +344,107 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     .into()
 }
 
+/// Icon for a selection row: filled dot/check when selected.
+pub(crate) fn selection_icon(selected: bool, multi: bool) -> lucide_icons::Icon {
+    match (multi, selected) {
+        (true, true) => lucide_icons::Icon::SquareCheck,
+        (true, false) => lucide_icons::Icon::Square,
+        (false, true) => lucide_icons::Icon::CircleDot,
+        (false, false) => lucide_icons::Icon::Circle,
+    }
+}
+
+/// Whether pager chrome shows: hidden for a single question.
+pub(crate) fn pager_visible(total: usize) -> bool {
+    total > 1
+}
+
+/// Precomputed pager label, e.g. `2 of 3`; empty when hidden.
+pub(crate) fn pager_label(index: usize, total: usize) -> String {
+    if pager_visible(total) {
+        format!("{} of {}", index + 1, total)
+    } else {
+        String::new()
+    }
+}
+
+/// Badge label for a pending count; `None` hides the badge.
+pub(crate) fn pending_badge_label(count: u64) -> Option<String> {
+    if count == 0 {
+        None
+    } else {
+        Some(format!("{count} pending"))
+    }
+}
+
+/// A radio (single) or checkbox (multi) row: selection icon, label,
+/// and a secondary description line when present.
+pub(crate) fn selection_row<'a, Message: Clone + 'a>(
+    label: &'a str,
+    description: Option<&'a str>,
+    selected: bool,
+    multi: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let mut text_col = iced::widget::column![text(label).size(FONT_SIZE_PANEL).color(title_color)]
+        .spacing(SPACE_XXS);
+    if let Some(description) = description
+        && !description.is_empty()
+    {
+        text_col = text_col.push(
+            text(description)
+                .size(FONT_SIZE_PANEL_SMALL)
+                .color(TEXT_TERTIARY),
+        );
+    }
+    let content = iced::widget::row![
+        icon(
+            selection_icon(selected, multi),
+            FONT_SIZE_PANEL,
+            title_color
+        ),
+        container(text_col).width(Length::Fill),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    button(content)
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(menu_row_style(selected))
+        .into()
+}
+
+/// A monospace block for a raw command/args line.
+pub(crate) fn code_block<'a, Message: Clone + 'a>(value: &'a str) -> Element<'a, Message> {
+    container(
+        text(value)
+            .size(FONT_SIZE_PANEL)
+            .color(TEXT_PRIMARY)
+            .font(iced::Font::MONOSPACE),
+    )
+    .width(Length::Fill)
+    .padding(SPACE_S)
+    .style(panel_style)
+    .into()
+}
+
+/// A pending-count badge pill.
+pub(crate) fn pending_badge<'a, Message: Clone + 'a>(count: u64) -> Option<Element<'a, Message>> {
+    pending_badge_label(count).map(|label| {
+        container(text(label).size(FONT_SIZE_PANEL_SMALL).color(TEXT_PRIMARY))
+            .padding([SPACE_XS, SPACE_S])
+            .style(panel_flat_pill_style)
+            .into()
+    })
+}
+
 /// A simple popup choice row: a full-width label button with a check
 /// slot at the right that shows a check icon only on the selected row.
 pub(crate) fn choice_row<'a, Message: Clone + 'a>(
@@ -565,9 +666,22 @@ fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style
 /// a faint trailing label pinned to the right edge. Selected titles
 /// read primary on surface-2; unselected titles read secondary and sit
 /// transparent until hovered.
+#[allow(dead_code)]
 pub(crate) fn list_row<'a, Message: Clone + 'a>(
     title: &'a str,
     trailing: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    list_row_with_badge(title, trailing, 0, selected, on_press)
+}
+
+/// Like [`list_row`], with a pending-count badge before the trailing
+/// label when `pending_count > 0`.
+pub(crate) fn list_row_with_badge<'a, Message: Clone + 'a>(
+    title: &'a str,
+    trailing: &'a str,
+    pending_count: u64,
     selected: bool,
     on_press: Message,
 ) -> Element<'a, Message> {
@@ -576,7 +690,7 @@ pub(crate) fn list_row<'a, Message: Clone + 'a>(
     } else {
         TEXT_SECONDARY
     };
-    let content = iced::widget::row![
+    let mut row = iced::widget::row![
         container(
             text(title)
                 .size(FONT_SIZE_PANEL)
@@ -584,13 +698,16 @@ pub(crate) fn list_row<'a, Message: Clone + 'a>(
                 .color(title_color)
         )
         .width(Length::Fill)
-        .clip(true),
-        text(trailing).size(FONT_SIZE_PANEL_SMALL).color(TEXT_FAINT),
+        .clip(true)
     ]
     .spacing(SPACE_S)
     .align_y(iced::alignment::Vertical::Center)
     .width(Length::Fill);
-    button(content)
+    if let Some(badge) = pending_badge::<Message>(pending_count) {
+        row = row.push(badge);
+    }
+    row = row.push(text(trailing).size(FONT_SIZE_PANEL_SMALL).color(TEXT_FAINT));
+    button(row)
         .width(Length::Fill)
         .padding([SPACE_XS, SPACE_S])
         .on_press(on_press)
@@ -1374,6 +1491,41 @@ mod tests {
             button_colors(ButtonKind::DangerGhost, button::Status::Disabled),
             (None, TEXT_FAINT)
         );
+    }
+
+    #[test]
+    fn pager_chrome_hidden_for_single_question() {
+        assert!(!super::pager_visible(0));
+        assert!(!super::pager_visible(1));
+        assert!(super::pager_visible(2));
+        assert_eq!(super::pager_label(0, 1), "");
+        assert_eq!(super::pager_label(1, 3), "2 of 3");
+    }
+
+    #[test]
+    fn pending_badge_label_hides_at_zero() {
+        assert_eq!(super::pending_badge_label(0), None);
+        assert_eq!(super::pending_badge_label(2).as_deref(), Some("2 pending"));
+    }
+
+    #[test]
+    fn selection_icon_distinguishes_radio_and_checkbox() {
+        assert!(matches!(
+            super::selection_icon(true, false),
+            lucide_icons::Icon::CircleDot
+        ));
+        assert!(matches!(
+            super::selection_icon(false, false),
+            lucide_icons::Icon::Circle
+        ));
+        assert!(matches!(
+            super::selection_icon(true, true),
+            lucide_icons::Icon::SquareCheck
+        ));
+        assert!(matches!(
+            super::selection_icon(false, true),
+            lucide_icons::Icon::Square
+        ));
     }
 
     #[test]
