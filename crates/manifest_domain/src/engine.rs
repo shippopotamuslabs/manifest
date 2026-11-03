@@ -651,6 +651,29 @@ pub struct SpawnChoices {
     pub permission: PermissionMode,
 }
 
+/// Which command a [`EngineEvent::CommandFailed`] failure belongs to.
+///
+/// Named so the shell consumes only the state that command owned: a
+/// steer failure must not end a running turn, and a models failure
+/// must not restore a spawn draft. Session-carrying variants name
+/// the session the command addressed, so one session's failure never
+/// releases another session's gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailedCommand {
+    /// Spawning a new session failed.
+    Spawn,
+    /// Sending a follow-up turn to this session failed.
+    Turn(SessionId),
+    /// Resuming this session failed.
+    Resume(SessionId),
+    /// Steering the running turn of this session failed.
+    Steer(SessionId),
+    /// Cancelling the running turn of this session failed.
+    Cancel(SessionId),
+    /// Listing the model catalog failed.
+    Models,
+}
+
 /// Everything an engine reports to the presentation layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
@@ -694,11 +717,18 @@ pub enum EngineEvent {
         /// Resumed session.
         session: SessionId,
     },
-    /// A spawn or send-turn command failed while the connection stays up.
+    /// A command failed while the connection stays up.
     ///
     /// Carries the boundary-composed or server-authored friendly message,
-    /// mirroring [`EngineEvent::SessionsLoadFailed`].
-    CommandFailed(String),
+    /// mirroring [`EngineEvent::SessionsLoadFailed`], tagged with the
+    /// command that failed so the shell consumes only that command's
+    /// state.
+    CommandFailed {
+        /// The command that failed.
+        command: FailedCommand,
+        /// The friendly failure message.
+        message: String,
+    },
     /// One stream event arrived.
     Stream(StreamEvent),
     /// Partial-success diagnostic: something was skipped or degraded.

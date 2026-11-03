@@ -1,8 +1,8 @@
 //! Transport tests against the scripted fake server.
 
 use manifest_domain::{
-    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionEngine, SessionId,
-    SessionStatus, SpawnChoices, StreamEvent, StreamItem, TurnId, WorktreeChoice,
+    Connection, EngineEvent, FailedCommand, ItemStatus, PendingKind, PendingPhase, SessionEngine,
+    SessionId, SessionStatus, SpawnChoices, StreamEvent, StreamItem, TurnId, WorktreeChoice,
 };
 use manifest_mcp::{MuseEngine, ServerConfig, connect};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -51,6 +51,16 @@ fn is_failed(event: &EngineEvent) -> bool {
 fn failed_text(events: &[EngineEvent]) -> Option<String> {
     events.iter().find_map(|event| match event {
         EngineEvent::ConnectionChanged(Connection::Failed(text)) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+/// The tagged command failure among `events`, when one arrived: the
+/// command it names plus its message. The tag is the durable proof
+/// the worker attributes the failure to the command that issued it.
+fn command_failure(events: &[EngineEvent]) -> Option<(FailedCommand, String)> {
+    events.iter().find_map(|event| match event {
+        EngineEvent::CommandFailed { command, message } => Some((command.clone(), message.clone())),
         _ => None,
     })
 }
@@ -313,15 +323,10 @@ fn spawn_bad_workspace_is_command_failed() {
         SpawnChoices::default(),
     );
     let seen = recv_until(&rx, "CommandFailed", |event| {
-        matches!(event, EngineEvent::CommandFailed(_))
+        matches!(event, EngineEvent::CommandFailed { .. })
     });
-    let failure = seen
-        .iter()
-        .find_map(|event| match event {
-            EngineEvent::CommandFailed(text) => Some(text.clone()),
-            _ => None,
-        })
-        .expect("failure seen above");
+    let (command, failure) = command_failure(&seen).expect("failure seen above");
+    assert_eq!(command, FailedCommand::Spawn);
     assert!(
         failure.contains("workspace does not exist: /tmp/does-not-exist/ws"),
         "failure carries the server text, saw {failure:?}"
@@ -381,15 +386,10 @@ fn spawn_untrusted_create_is_command_failed() {
         },
     );
     let seen = recv_until(&rx, "CommandFailed", |event| {
-        matches!(event, EngineEvent::CommandFailed(_))
+        matches!(event, EngineEvent::CommandFailed { .. })
     });
-    let failure = seen
-        .iter()
-        .find_map(|event| match event {
-            EngineEvent::CommandFailed(text) => Some(text.clone()),
-            _ => None,
-        })
-        .expect("failure seen above");
+    let (command, failure) = command_failure(&seen).expect("failure seen above");
+    assert_eq!(command, FailedCommand::Spawn);
     assert_eq!(
         failure,
         "Repository '/untrusted' is not trusted; worktree create, attach, and list require a trusted repository."
@@ -431,15 +431,13 @@ fn resume_in_use_reports_server_text() {
 
     engine.resume_session(SessionId::new("sess-orphan"));
     let seen = recv_until(&rx, "CommandFailed", |event| {
-        matches!(event, EngineEvent::CommandFailed(_))
+        matches!(event, EngineEvent::CommandFailed { .. })
     });
-    let failure = seen
-        .iter()
-        .find_map(|event| match event {
-            EngineEvent::CommandFailed(text) => Some(text.clone()),
-            _ => None,
-        })
-        .expect("failure seen above");
+    let (command, failure) = command_failure(&seen).expect("failure seen above");
+    assert_eq!(
+        command,
+        FailedCommand::Resume(SessionId::new("sess-orphan"))
+    );
     assert_eq!(
         failure,
         "session sess-orphan is in use by another client (sessionInUse: already attached). Muse MCP will not attach to it."

@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcCommand, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
-use manifest_domain::{Connection, EngineEvent, SessionId, SpawnChoices, TurnId};
+use manifest_domain::{Connection, EngineEvent, FailedCommand, SessionId, SpawnChoices, TurnId};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -81,9 +81,23 @@ enum Pending {
     Spawn,
     Turn(SessionId),
     Resume(SessionId),
-    Steer,
-    Cancel,
+    Steer(SessionId),
+    Cancel(SessionId),
     Models,
+}
+
+/// The [`FailedCommand`] tag for a pending request: the failure of
+/// this request belongs to exactly this command.
+fn failed_command(pending: &Pending) -> Option<FailedCommand> {
+    match pending {
+        Pending::Spawn => Some(FailedCommand::Spawn),
+        Pending::Turn(session) => Some(FailedCommand::Turn(session.clone())),
+        Pending::Resume(session) => Some(FailedCommand::Resume(session.clone())),
+        Pending::Steer(session) => Some(FailedCommand::Steer(session.clone())),
+        Pending::Cancel(session) => Some(FailedCommand::Cancel(session.clone())),
+        Pending::Models => Some(FailedCommand::Models),
+        Pending::Initialize | Pending::ListSessions => None,
+    }
 }
 
 /// Owns the child process; killing and reaping it on drop so every exit
@@ -179,7 +193,7 @@ impl Worker {
     ) -> Result<(), Error> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.pending.insert(id, Pending::Steer);
+        self.pending.insert(id, Pending::Steer(session.clone()));
         self.send_line(&wire::steer_call(
             id,
             session.as_str(),
@@ -196,7 +210,7 @@ impl Worker {
     ) -> Result<(), Error> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.pending.insert(id, Pending::Cancel);
+        self.pending.insert(id, Pending::Cancel(session.clone()));
         self.send_line(&wire::cancel_call(
             id,
             session.as_str(),
@@ -285,8 +299,8 @@ impl Worker {
             Pending::Spawn
             | Pending::Turn(_)
             | Pending::Resume(_)
-            | Pending::Steer
-            | Pending::Cancel
+            | Pending::Steer(_)
+            | Pending::Cancel(_)
             | Pending::Models => self.handle_command_reply(&pending, message),
         }
     }
@@ -338,42 +352,48 @@ impl Worker {
     /// cancel successes carry no payload worth rendering, so they emit
     /// nothing; only their failures arrive as [`EngineEvent::CommandFailed`].
     fn handle_command_reply(&mut self, pending: &Pending, message: &Value) -> bool {
+        let Some(command) = failed_command(pending) else {
+            return true;
+        };
         if let Some(error) = message.get("error") {
             let text = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Couldn't reach the Muse MCP server.");
-            return self.emit(EngineEvent::CommandFailed(text.to_string()));
+            return self.emit(EngineEvent::CommandFailed {
+                command,
+                message: text.to_string(),
+            });
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         let event = match pending {
             Pending::Spawn => match map_spawn_result(&result) {
                 Ok((session, turn)) => EngineEvent::SessionSpawned { session, turn },
-                Err(message) => EngineEvent::CommandFailed(message),
+                Err(message) => EngineEvent::CommandFailed { command, message },
             },
             Pending::Turn(commanded) => match map_turn_result(&result, commanded) {
                 Ok((session, turn)) => EngineEvent::TurnAccepted { session, turn },
-                Err(message) => EngineEvent::CommandFailed(message),
+                Err(message) => EngineEvent::CommandFailed { command, message },
             },
             Pending::Resume(commanded) => match map_resume_result(&result, commanded) {
                 Ok(session) => EngineEvent::SessionResumed { session },
-                Err(message) => EngineEvent::CommandFailed(message),
+                Err(message) => EngineEvent::CommandFailed { command, message },
             },
-            Pending::Steer => {
+            Pending::Steer(_) => {
                 match map_ack_result(&result, "Couldn't steer that turn on the Muse MCP server.") {
                     Ok(()) => return true,
-                    Err(message) => EngineEvent::CommandFailed(message),
+                    Err(message) => EngineEvent::CommandFailed { command, message },
                 }
             }
-            Pending::Cancel => {
+            Pending::Cancel(_) => {
                 match map_ack_result(&result, "Couldn't cancel that turn on the Muse MCP server.") {
                     Ok(()) => return true,
-                    Err(message) => EngineEvent::CommandFailed(message),
+                    Err(message) => EngineEvent::CommandFailed { command, message },
                 }
             }
             Pending::Models => match map_models_result(&result) {
                 Ok(models) => EngineEvent::ModelsLoaded { models },
-                Err(message) => EngineEvent::CommandFailed(message),
+                Err(message) => EngineEvent::CommandFailed { command, message },
             },
             Pending::Initialize | Pending::ListSessions => return true,
         };
@@ -512,7 +532,10 @@ pub(crate) fn run(
                 choices,
             }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Spawn,
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_spawn_call(&workspace, &prompt, &choices) {
                     let _ = worker.fail(err);
                     false
@@ -522,7 +545,10 @@ pub(crate) fn run(
             }
             WorkerMsg::Command(Command::SendTurn { session, prompt }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Turn(session.clone()),
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_turn_call(&session, &prompt) {
                     let _ = worker.fail(err);
                     false
@@ -532,7 +558,10 @@ pub(crate) fn run(
             }
             WorkerMsg::Command(Command::ResumeSession { session }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Resume(session.clone()),
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_resume_call(&session) {
                     let _ = worker.fail(err);
                     false
@@ -546,7 +575,10 @@ pub(crate) fn run(
                 turn,
             }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Steer(session.clone()),
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_steer_call(&session, &prompt, &turn) {
                     let _ = worker.fail(err);
                     false
@@ -556,7 +588,10 @@ pub(crate) fn run(
             }
             WorkerMsg::Command(Command::CancelTurn { session, turn }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Cancel(session.clone()),
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_cancel_call(&session, turn.as_ref()) {
                     let _ = worker.fail(err);
                     false
@@ -566,7 +601,10 @@ pub(crate) fn run(
             }
             WorkerMsg::Command(Command::ListModels { workspace, session }) => {
                 if !worker.connected {
-                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Models,
+                        message: not_connected_message(),
+                    })
                 } else if let Err(err) = worker.send_models_call(
                     workspace.as_deref(),
                     session.as_ref().map(SessionId::as_str),

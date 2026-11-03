@@ -76,8 +76,8 @@ pub enum ModelCatalog {
     /// The catalog arrived; the shell picks from these rows.
     Ready(Vec<ModelInfo>),
     /// The catalog request failed; carries the message. The App
-    /// constructs this when a generic `CommandFailed` arrives while
-    /// a catalog request is pending (`models_pending` in `app.rs`).
+    /// constructs this when a models-tagged `CommandFailed` arrives
+    /// while a catalog request is pending (`models_pending` in `app.rs`).
     Failed(String),
 }
 
@@ -196,16 +196,25 @@ impl State {
         state
     }
 
-    /// Clears the draft after a send, restoring the [`State::new`]
-    /// shape while preserving the App-owned
+    /// Clears the draft after a send: resets only the draft text,
+    /// its derived line/text flags, the attachments, and the
+    /// transient popups. The picker state (permission, model,
+    /// effort, catalog, usage) and the App-owned
     /// [`send_enabled`](State::send_enabled) and
-    /// [`running_visible`](State::running_visible) gates.
+    /// [`running_visible`](State::running_visible) gates survive a
+    /// send, so the user's choices and the context meter carry over
+    /// to the next draft. Derived labels are recomputed from the
+    /// preserved state.
     pub fn clear(&mut self) {
-        let send_enabled = self.send_enabled;
-        let running_visible = self.running_visible;
-        *self = State::new();
-        self.send_enabled = send_enabled;
-        self.running_visible = running_visible;
+        self.content = text_editor::Content::new();
+        self.visible_lines = 1;
+        self.has_text = false;
+        self.attachments.clear();
+        self.attach_popup = AttachPopup::Closed;
+        self.permission_menu = PermissionMenu::Closed;
+        self.model_menu = ModelMenu::Closed;
+        self.context_popover = ContextPopover::Closed;
+        self.refresh_derived();
     }
 
     /// Restores a failed send's prompt into the draft: the inverse of
@@ -765,8 +774,51 @@ mod tests {
         assert_eq!(got.visible_lines, 1);
         assert!(!got.send_enabled);
         assert!(got.running_visible);
-        assert_eq!(got.permission, PermissionMode::default());
+        // Picker choices survive a send; only the draft resets.
+        assert_eq!(got.permission, PermissionMode::Muse(MusePermission::Judge));
         assert!(got.attachments.is_empty());
+    }
+
+    #[test]
+    fn clear_preserves_picker_state_and_derived_labels() {
+        let mut got = catalog_state();
+        got.update(Message::ModelSelected(ModelChoice::Named(String::from(
+            "muse-spark",
+        ))));
+        got.update(Message::EffortSelected(EffortChoice::High));
+        got.update(Message::PermissionSelected(MusePermission::Judge));
+        got.set_usage(UsageSnapshot::parse(
+            r#"{"prompt":57064,"output":16,"total":57080,"limit":200000}"#,
+        ));
+        let label_before = got.model_effort_label.clone();
+        let context_before = got.context_label.clone();
+        let percent_before = got.context_percent;
+        type_text(&mut got, "draft text");
+        got.insert_attachment(String::from("/work/notes.md"));
+        // Reopen a menu so clear() must close it.
+        got.update(Message::ModelPressed);
+        assert_eq!(got.model_menu, ModelMenu::Open);
+        got.send_enabled = false;
+        got.running_visible = true;
+        got.clear();
+        assert_eq!(got.content.text(), "");
+        assert!(!got.has_text);
+        assert_eq!(got.visible_lines, 1);
+        assert!(got.attachments.is_empty());
+        assert_eq!(got.attach_popup, AttachPopup::Closed);
+        assert_eq!(got.permission_menu, PermissionMenu::Closed);
+        assert_eq!(got.model_menu, ModelMenu::Closed);
+        assert_eq!(got.context_popover, ContextPopover::Closed);
+        assert_eq!(got.model, ModelChoice::Named(String::from("muse-spark")));
+        assert_eq!(got.effort, EffortChoice::High);
+        assert_eq!(got.permission, PermissionMode::Muse(MusePermission::Judge));
+        assert!(matches!(got.catalog, ModelCatalog::Ready(_)));
+        assert!(got.usage.is_some());
+        assert_eq!(got.model_effort_label, label_before);
+        assert_eq!(got.context_label, context_before);
+        assert_eq!(got.context_percent, percent_before);
+        assert!(!got.send_enabled);
+        assert!(got.running_visible);
     }
 
     #[test]

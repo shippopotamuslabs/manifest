@@ -11,9 +11,9 @@ mod engine;
 mod fixture;
 
 pub use engine::{
-    Connection, EffortChoice, EngineEvent, ItemStatus, ModelChoice, ModelInfo, MusePermission,
-    PendingKind, PendingPhase, PermissionMode, SessionEngine, SpawnChoices, StreamEvent,
-    StreamItem, TurnId, UsageKind, UsageSnapshot, WorktreeChoice,
+    Connection, EffortChoice, EngineEvent, FailedCommand, ItemStatus, ModelChoice, ModelInfo,
+    MusePermission, PendingKind, PendingPhase, PermissionMode, SessionEngine, SpawnChoices,
+    StreamEvent, StreamItem, TurnId, UsageKind, UsageSnapshot, WorktreeChoice,
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,

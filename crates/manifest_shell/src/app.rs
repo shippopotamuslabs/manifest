@@ -240,7 +240,7 @@ pub struct App {
     pub select_on_load: Option<SessionId>,
     /// A spawn command is in flight and the visible transcript holds
     /// its optimistic prompt; cleared on `SessionSpawned` (which
-    /// adopts the transcript) or `CommandFailed`.
+    /// adopts the transcript) or a spawn-tagged `CommandFailed`.
     pub awaiting_spawn: bool,
     /// The in-flight spawn, set together with [`App::awaiting_spawn`]
     /// whenever a spawn is issued; `Some` means the spawn can be
@@ -257,8 +257,8 @@ pub struct App {
     /// Draft input cluster.
     pub composer: composer::State,
     /// A model-catalog request is in flight. Set on each request,
-    /// cleared on `ModelsLoaded` (or on the `CommandFailed` that marks
-    /// the catalog failed, or on disconnect).
+    /// cleared on `ModelsLoaded` (or on the models-tagged
+    /// `CommandFailed` that marks the catalog failed, or on disconnect).
     pub models_pending: bool,
     /// Checklist shown in the drawer, from the fixture.
     pub todos: Vec<TodoItem>,
@@ -1312,32 +1312,48 @@ impl App {
                             self.composer
                                 .set_catalog(composer::ModelCatalog::Ready(models));
                         }
-                        EngineEvent::CommandFailed(message) => {
-                            if self.models_pending {
-                                // The catalog request failed: attribute
-                                // it to the catalog while keeping the
-                                // transcript error below.
-                                self.models_pending = false;
-                                self.composer
-                                    .set_catalog(composer::ModelCatalog::Failed(message.clone()));
-                            }
-                            appended = self.transcript.push_error(message);
-                            if self.awaiting_spawn {
-                                if let Some(pending) = self.pending_spawn.take() {
-                                    if let Some(draft) = pending.draft {
-                                        self.new_session = Some(draft);
+                        EngineEvent::CommandFailed { command, message } => {
+                            // Every failure shows in the transcript;
+                            // state is consumed only by its own command.
+                            appended = self.transcript.push_error(message.clone());
+                            match command {
+                                manifest_domain::FailedCommand::Models => {
+                                    if self.models_pending {
+                                        self.models_pending = false;
+                                        self.composer
+                                            .set_catalog(composer::ModelCatalog::Failed(message));
                                     }
-                                    self.composer.restore(pending.prompt);
                                 }
-                            } else {
-                                // Failures release resume gates so the next select retries.
-                                self.resuming.clear();
+                                manifest_domain::FailedCommand::Spawn => {
+                                    if self.awaiting_spawn
+                                        && let Some(pending) = self.pending_spawn.take()
+                                    {
+                                        if let Some(draft) = pending.draft {
+                                            self.new_session = Some(draft);
+                                        }
+                                        self.composer.restore(pending.prompt);
+                                    }
+                                    self.awaiting_spawn = false;
+                                }
+                                manifest_domain::FailedCommand::Resume(session) => {
+                                    // Only this session's gate releases,
+                                    // so the next select retries it.
+                                    self.resuming.remove(&session);
+                                }
+                                manifest_domain::FailedCommand::Turn(session) => {
+                                    // The optimistically started turn
+                                    // never began: end it for this
+                                    // session only.
+                                    self.running.remove(&session);
+                                    self.running_turns.remove(&session);
+                                }
+                                manifest_domain::FailedCommand::Steer(_)
+                                | manifest_domain::FailedCommand::Cancel(_) => {
+                                    // The turn is still running; its
+                                    // stream (TurnCompleted) is what
+                                    // clears running.
+                                }
                             }
-                            if let Some(visible) = self.visible_session.clone() {
-                                self.running.remove(&visible);
-                                self.running_turns.remove(&visible);
-                            }
-                            self.awaiting_spawn = false;
                         }
                         EngineEvent::SessionSpawned { session, turn } => {
                             self.running.insert(session.clone());
@@ -2606,9 +2622,10 @@ mod tests {
         assert!(app.running.contains(&first));
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
-                "nope",
-            ))),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Turn(first.clone()),
+                message: String::from("nope"),
+            }),
         );
         assert!(!app.running.contains(&first));
         assert!(matches!(
@@ -2618,6 +2635,135 @@ mod tests {
                 crate::transcript::EntryKind::Error { text } if text == "nope"
             )
         ));
+    }
+
+    /// Delivers a tagged command failure, as the worker now emits it.
+    fn command_failed(app: &mut App, command: manifest_domain::FailedCommand, message: &str) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command,
+                message: String::from(message),
+            }),
+        );
+    }
+
+    #[test]
+    fn steer_failure_keeps_running_and_catalog() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        deliver(&mut app, models_event());
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Ready(_)
+        ));
+        assert!(!app.models_pending);
+        start_turn(&mut app, "s-1", "turn-7");
+        let first = SessionId::new("s-1");
+        assert!(app.running.contains(&first));
+        assert!(app.composer.running_visible);
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Steer(first.clone()),
+            "steer broke",
+        );
+        // The turn is still running: nothing about it is consumed.
+        assert!(app.running.contains(&first));
+        assert_eq!(
+            app.running_turns.get(&first),
+            Some(&manifest_domain::TurnId::new("turn-7"))
+        );
+        assert!(app.composer.running_visible);
+        // The ready catalog is untouched by another command's failure.
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Ready(_)
+        ));
+        assert!(!app.models_pending);
+        assert!(transcript_errors(&app).contains(&"steer broke"));
+    }
+
+    #[test]
+    fn cancel_failure_keeps_running() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        start_turn(&mut app, "s-1", "turn-7");
+        let first = SessionId::new("s-1");
+        assert!(app.running.contains(&first));
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Cancel(first.clone()),
+            "cancel broke",
+        );
+        assert!(app.running.contains(&first));
+        assert_eq!(
+            app.running_turns.get(&first),
+            Some(&manifest_domain::TurnId::new("turn-7"))
+        );
+        assert!(app.composer.running_visible);
+        assert!(transcript_errors(&app).contains(&"cancel broke"));
+    }
+
+    #[test]
+    fn turn_failure_clears_only_its_session() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        start_turn(&mut app, "s-1", "turn-1");
+        start_turn(&mut app, "s-2", "turn-2");
+        let first = SessionId::new("s-1");
+        let second = SessionId::new("s-2");
+        assert!(app.running.contains(&first));
+        assert!(app.running.contains(&second));
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Turn(first.clone()),
+            "turn broke",
+        );
+        assert!(!app.running.contains(&first));
+        assert!(!app.running_turns.contains_key(&first));
+        // The other session's turn is untouched.
+        assert!(app.running.contains(&second));
+        assert_eq!(
+            app.running_turns.get(&second),
+            Some(&manifest_domain::TurnId::new("turn-2"))
+        );
+        assert!(transcript_errors(&app).contains(&"turn broke"));
+    }
+
+    #[test]
+    fn non_spawn_failure_leaves_awaiting_spawn_intact() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        assert!(app.sessions.selected_summary().is_none());
+        type_composer_text(&mut app, "start me");
+        send_pressed(&mut app);
+        assert!(app.awaiting_spawn);
+        assert!(app.pending_spawn.is_some());
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Turn(SessionId::new("s-1")),
+            "unrelated broke",
+        );
+        // Another command's failure consumes neither the in-flight
+        // spawn nor its restorable prompt.
+        assert!(app.awaiting_spawn);
+        let pending = app.pending_spawn.as_ref().expect("spawn still pending");
+        assert_eq!(pending.prompt, "start me");
+        assert_eq!(app.composer.content.text(), "");
+        assert!(transcript_errors(&app).contains(&"unrelated broke"));
+        // A later spawn failure still restores the prompt.
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Spawn,
+            "spawn broke",
+        );
+        assert!(!app.awaiting_spawn);
+        assert!(app.pending_spawn.is_none());
+        assert_eq!(app.composer.content.text(), "start me");
+        assert!(transcript_errors(&app).contains(&"spawn broke"));
     }
 
     #[test]
@@ -3634,7 +3780,10 @@ mod tests {
         );
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Resume(SessionId::new("sess-orphan")),
+                message: message.clone(),
+            }),
         );
         assert!(transcript_errors(&app).contains(&message.as_str()));
         // The gate released: reselecting retries the resume.
@@ -3762,7 +3911,10 @@ mod tests {
         );
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Spawn,
+                message: message.clone(),
+            }),
         );
         assert!(!app.awaiting_spawn);
         let draft = app.new_session.as_ref().expect("draft restored");
@@ -3840,9 +3992,10 @@ mod tests {
         assert_eq!(fake.spawns.lock().unwrap().len(), 1);
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
-                "spawn broke",
-            ))),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Spawn,
+                message: String::from("spawn broke"),
+            }),
         );
         assert!(!app.awaiting_spawn);
         assert_eq!(app.new_session, None);
@@ -4055,7 +4208,10 @@ mod tests {
         let message = String::from("models requires workspace or session_id");
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Models,
+                message: message.clone(),
+            }),
         );
         assert!(!app.models_pending);
         assert_eq!(
@@ -4096,9 +4252,10 @@ mod tests {
         // The request fails, so the catalog stays unresolved.
         deliver(
             &mut app,
-            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
-                "models down",
-            ))),
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Models,
+                message: String::from("models down"),
+            }),
         );
         assert!(matches!(
             app.composer.catalog,

@@ -112,9 +112,9 @@ fn live_spawn_streams_a_real_turn() {
                 let tail: Vec<_> = seen.iter().rev().take(8).collect();
                 panic!("live connection failed mid-turn: {text}; last events: {tail:#?}");
             }
-            EngineEvent::CommandFailed(text) => {
+            EngineEvent::CommandFailed { message, .. } => {
                 let tail: Vec<_> = seen.iter().rev().take(8).collect();
-                panic!("live spawn failed: {text}; last events: {tail:#?}");
+                panic!("live spawn failed: {message}; last events: {tail:#?}");
             }
             EngineEvent::SessionSpawned { session, .. } => {
                 spawned = Some(session.clone());
