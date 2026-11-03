@@ -5,7 +5,7 @@
 
 use manifest_domain::{
     Connection, EngineEvent, ItemStatus, SessionEngine, SessionId, SpawnChoices, StreamEvent,
-    StreamItem,
+    StreamItem, TurnInput,
 };
 use manifest_mcp::{ServerConfig, connect};
 use std::time::Duration;
@@ -91,7 +91,11 @@ fn live_spawn_streams_a_real_turn() {
         }
     }
 
-    engine.spawn_session(workspace_text, prompt, SpawnChoices::default());
+    engine.spawn_session(
+        workspace_text,
+        TurnInput::Text(prompt),
+        SpawnChoices::default(),
+    );
 
     // Overall deadline for the whole turn; the model turn can take minutes.
     let deadline = std::time::Instant::now() + Duration::from_secs(240);
@@ -161,7 +165,9 @@ fn live_spawn_streams_a_real_turn() {
                     | StreamEvent::ItemCompleted { session, .. }
                     | StreamEvent::TurnCompleted { session, .. }
                     | StreamEvent::Usage { session, .. }
-                    | StreamEvent::Pending { session, .. } => session,
+                    | StreamEvent::Pending { session, .. }
+                    | StreamEvent::CatalogChanged { session }
+                    | StreamEvent::GoalChanged { session, .. } => session,
                 };
                 (owner != &session).then(|| event.clone())
             }

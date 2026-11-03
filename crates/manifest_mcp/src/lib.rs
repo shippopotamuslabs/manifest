@@ -3,12 +3,14 @@
 //! This crate spawns the `muse-code-mcp` server as a child process and
 //! speaks JSON-RPC 2.0 with it over newline-delimited JSON on its stdio:
 //! `initialize` declaring the `muse.stream` experimental capability,
-//! `tools/call` for `muse_status`, `muse_spawn` (workspace, prompt,
-//! worktree and model/effort/permission choices, `wait: false`),
-//! `muse_turn`, `muse_steer`, `muse_cancel`, `muse_pending`,
-//! `muse_decide`, `muse_answer` (both as `actor: "user"`), and
-//! `muse_models`
-//! (catalog listing, or session resume with the catalog discarded), and
+//! `tools/call` for `muse_status`, `muse_spawn` (workspace, prompt
+//! or skill parts, worktree and model/effort/permission choices,
+//! `wait: false`), `muse_turn` (prompt or skill parts), `muse_steer`,
+//! `muse_cancel`, `muse_raw` (`session/compact`, `goal/set`),
+//! `muse_pending`, `muse_decide`, `muse_answer` (both
+//! as `actor: "user"`), `muse_models`
+//! (catalog listing, or session resume with the catalog discarded),
+//! and `muse_skills` (skill catalog listing for one session), and
 //! `notifications/muse/event` mapped into domain
 //! [`StreamEvent`](manifest_domain::StreamEvent) values. The client is
 //! blocking and thread-based; there is no async runtime in this crate.
@@ -25,6 +27,7 @@ use std::sync::mpsc::Sender;
 
 use manifest_domain::{
     ApprovalDecision, EngineEvent, PendingAnswer, SessionEngine, SessionId, SpawnChoices, TurnId,
+    TurnInput,
 };
 
 use worker::{Command, WorkerMsg};
@@ -130,22 +133,22 @@ impl SessionEngine for MuseEngine {
             .send(WorkerMsg::Command(Command::ListSessions));
     }
 
-    fn spawn_session(&self, workspace: String, prompt: String, choices: SpawnChoices) {
+    fn spawn_session(&self, workspace: String, input: TurnInput, choices: SpawnChoices) {
         // A failed send means the worker is gone; the shell has moved on.
         let _ = self
             .worker_tx
             .send(WorkerMsg::Command(Command::SpawnSession {
                 workspace,
-                prompt,
+                input,
                 choices,
             }));
     }
 
-    fn send_turn(&self, session: SessionId, prompt: String) {
+    fn send_turn(&self, session: SessionId, input: TurnInput) {
         // A failed send means the worker is gone; the shell has moved on.
         let _ = self
             .worker_tx
-            .send(WorkerMsg::Command(Command::SendTurn { session, prompt }));
+            .send(WorkerMsg::Command(Command::SendTurn { session, input }));
     }
 
     fn resume_session(&self, session: SessionId) {
@@ -169,6 +172,20 @@ impl SessionEngine for MuseEngine {
         let _ = self
             .worker_tx
             .send(WorkerMsg::Command(Command::CancelTurn { session, turn }));
+    }
+
+    fn compact_session(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::CompactSession { session }));
+    }
+
+    fn set_goal(&self, session: SessionId, objective: String) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::SetGoal { session, objective }));
     }
 
     fn fetch_pending(&self) {
@@ -210,6 +227,13 @@ impl SessionEngine for MuseEngine {
             workspace,
             session,
         }));
+    }
+
+    fn list_skills(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::ListSkills { session }));
     }
 }
 

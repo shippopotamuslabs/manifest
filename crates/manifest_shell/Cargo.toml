@@ -13,5 +13,11 @@ manifest_domain = { path = "../manifest_domain" }
 manifest_mcp = { path = "../manifest_mcp" }
 manifest_store = { path = "../manifest_store" }
 iced = { version = "0.14", features = ["markdown"] }
+# Direct edge to the already-pinned transitive iced_core (same 0.14
+# line the `iced` facade hides behind private modules): the slash
+# highlighter names its `text::highlighter::Format`, which the facade
+# does not re-export. This adds no new crate version and no new
+# compiled code; the `highlighter` cargo feature stays off.
+iced_core = "0.14"
 lucide_icons = { package = "lucide-icons", version = "1", features = ["iced"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

@@ -14,6 +14,7 @@
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
+use manifest_domain::TodoStatus;
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
@@ -342,6 +343,17 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     .align_y(iced::alignment::Vertical::Center)
     .width(Length::Fill)
     .into()
+}
+
+/// Icon for a TODO drawer row: check-in-circle when done, play
+/// button in a circle while in progress, empty circle when pending
+/// or cancelled.
+pub(crate) fn todo_status_icon(status: TodoStatus) -> lucide_icons::Icon {
+    match status {
+        TodoStatus::Done => lucide_icons::Icon::CircleCheck,
+        TodoStatus::InProgress => lucide_icons::Icon::CirclePlay,
+        TodoStatus::Pending | TodoStatus::Cancelled => lucide_icons::Icon::Circle,
+    }
 }
 
 /// Icon for a selection row: filled dot/check when selected.
@@ -974,16 +986,40 @@ fn composer_input_style(_theme: &Theme, _status: text_editor::Status) -> text_ed
     }
 }
 
+/// Key interception for the composer input: maps a key press to an
+/// editor binding, replacing the editor defaults while installed.
+/// The composer installs one only while its slash menu is open; every
+/// other key falls back to [`text_editor::Binding::from_key_press`]
+/// inside the composer's closure, so the editor behaves exactly as
+/// before when the menu is closed.
+pub(crate) type ComposerKeys<'a, Message> =
+    Box<dyn Fn(text_editor::KeyPress) -> Option<text_editor::Binding<Message>> + 'a>;
+
 /// The multi-line composer input. Its height grows with
 /// `visible_lines` up to [`COMPOSER_MAX_LINES`]; past that cap the
 /// caller holds the height fixed and the editor scrolls internally,
 /// so later slices inherit the growth contract from this constructor.
+/// Every exact `/selector` token on every draft line highlights
+/// through [`crate::composer::SlashHighlighter`] (no-op while the
+/// settings name no valid token); `key_binding` intercepts keys
+/// before the editor consumes them, when the caller installs one.
 pub(crate) fn composer_input<'a, Message: Clone + 'a>(
     content: &'a text_editor::Content,
     visible_lines: usize,
     on_action: impl Fn(text_editor::Action) -> Message + 'a,
+    highlight: &crate::composer::SlashHighlightSettings,
+    key_binding: Option<ComposerKeys<'a, Message>>,
 ) -> Element<'a, Message> {
-    text_editor::TextEditor::new(content)
+    // Concrete widget generics: pinning the renderer lets the
+    // highlight closure below fill its (unnameable) `Format` by
+    // inference, since the expected return type is then concrete.
+    let mut editor: text_editor::TextEditor<
+        '_,
+        crate::composer::SlashHighlighter,
+        Message,
+        iced::Theme,
+        iced::Renderer,
+    > = text_editor::TextEditor::new(content)
         .placeholder("Message the agent...")
         .on_action(on_action)
         .size(FONT_SIZE_BODY)
@@ -992,7 +1028,69 @@ pub(crate) fn composer_input<'a, Message: Clone + 'a>(
         .height(Length::Fixed(
             visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
         ))
-        .style(composer_input_style)
+        .highlight_with::<crate::composer::SlashHighlighter>(
+            highlight.clone(),
+            // The highlight `Format` type is not nameable through the
+            // `iced` facade (its `core` module is hidden), so the
+            // closure below fills it by inference: `Default` plus field
+            // writes against the style pair, coerced to the `fn`
+            // pointer `highlight_with` expects.
+            |_highlight, theme| {
+                let (color, font) = crate::composer::slash_token_style(theme);
+                iced_core::text::highlighter::Format {
+                    color: Some(color),
+                    font: Some(font),
+                }
+            },
+        );
+    if let Some(keys) = key_binding {
+        editor = editor.key_binding(keys);
+    }
+    editor.style(composer_input_style).into()
+}
+
+/// One slash-menu row: a source icon, the `/selector` in strong text,
+/// and the description on one truncated line. Selected rows read as
+/// the quiet surface-2 step, mirroring [`menu_row`].
+pub(crate) fn slash_row<'a, Message: Clone + 'a>(
+    source_icon: lucide_icons::Icon,
+    selector: &'a str,
+    description: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let content = iced::widget::row![
+        icon(source_icon, FONT_SIZE_PANEL_SMALL, TEXT_TERTIARY),
+        container(
+            text(selector)
+                .size(FONT_SIZE_PANEL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(title_color),
+        )
+        .width(Length::Shrink)
+        .clip(true),
+        container(
+            text(description)
+                .size(FONT_SIZE_PANEL_SMALL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(TEXT_TERTIARY),
+        )
+        .width(Length::Fill)
+        .clip(true),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    button(content)
+        .width(Length::Fill)
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(menu_row_style(selected))
         .into()
 }
 
@@ -1506,6 +1604,27 @@ mod tests {
     fn pending_badge_label_hides_at_zero() {
         assert_eq!(super::pending_badge_label(0), None);
         assert_eq!(super::pending_badge_label(2).as_deref(), Some("2 pending"));
+    }
+
+    #[test]
+    fn todo_status_icon_maps_each_status() {
+        use manifest_domain::TodoStatus;
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::Done),
+            lucide_icons::Icon::CircleCheck
+        ));
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::InProgress),
+            lucide_icons::Icon::CirclePlay
+        ));
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::Pending),
+            lucide_icons::Icon::Circle
+        ));
+        assert!(matches!(
+            super::todo_status_icon(TodoStatus::Cancelled),
+            lucide_icons::Icon::Circle
+        ));
     }
 
     #[test]
