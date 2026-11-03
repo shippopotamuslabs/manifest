@@ -18,8 +18,8 @@ use iced::{Background, Border, Color, Element, Length, Theme};
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
     BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT, DANGER,
-    DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL,
-    FONT_SIZE_SMALL, ICON_BUTTON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
+    DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL,
+    ICON_BUTTON_SIZE, ICON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
     SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT,
     TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
@@ -171,6 +171,35 @@ pub(crate) fn pill_button<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// A pill button with a leading Lucide icon: icon and label centered
+/// in a row, reusing the pill treatments.
+pub(crate) fn icon_pill_button<'a, Message: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    label: &'a str,
+    kind: ButtonKind,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let style = match kind {
+        ButtonKind::Primary => primary_style,
+        ButtonKind::Ghost => ghost_style,
+        ButtonKind::Danger => danger_style,
+        ButtonKind::DangerGhost => danger_ghost_style,
+    };
+    let content = iced::widget::row![
+        text(char::from(icon).to_string())
+            .font(iced::Font::with_name("lucide"))
+            .size(ICON_SIZE),
+        text(label),
+    ]
+    .spacing(SPACE_XS)
+    .align_y(iced::alignment::Vertical::Center);
+    button(content)
+        .padding(SPACE_S)
+        .on_press_maybe(on_press)
+        .style(style)
+        .into()
+}
+
 /// A panel: surface-1 fill, no border, panel radius, medium padding.
 fn panel_style(_theme: &Theme) -> container::Style {
     container::Style {
@@ -263,7 +292,7 @@ fn edit_button_style(_theme: &Theme, status: button::Status) -> button::Style {
 
 /// A popup menu row: a full-width label button, a separate quiet
 /// "Edit" text button beside it (a sibling, never nested), and a
-/// check slot at the right that shows "✓" only on the selected row.
+/// check slot at the right that shows a check icon only on the selected row.
 pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     label: &'a str,
     selected: bool,
@@ -275,7 +304,15 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     } else {
         TEXT_SECONDARY
     };
-    let check = if selected { "✓" } else { "" };
+    let check: Element<'a, Message> = if selected {
+        icon(
+            lucide_icons::Icon::Check,
+            FONT_SIZE_PANEL_SMALL,
+            TEXT_SECONDARY,
+        )
+    } else {
+        text("").size(FONT_SIZE_PANEL_SMALL).into()
+    };
     iced::widget::row![
         button(
             container(
@@ -297,13 +334,9 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
             .padding([SPACE_XS, SPACE_S])
             .on_press(on_edit)
             .style(edit_button_style),
-        container(
-            text(check)
-                .size(FONT_SIZE_PANEL_SMALL)
-                .color(TEXT_SECONDARY),
-        )
-        .width(Length::Fixed(SPACE_L))
-        .align_x(iced::alignment::Horizontal::Center),
+        container(check)
+            .width(Length::Fixed(SPACE_L))
+            .align_x(iced::alignment::Horizontal::Center),
     ]
     .spacing(SPACE_XXS)
     .align_y(iced::alignment::Vertical::Center)
@@ -312,7 +345,7 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
 }
 
 /// A simple popup choice row: a full-width label button with a check
-/// slot at the right that shows "✓" only on the selected row.
+/// slot at the right that shows a check icon only on the selected row.
 pub(crate) fn choice_row<'a, Message: Clone + 'a>(
     label: &'a str,
     selected: bool,
@@ -323,7 +356,15 @@ pub(crate) fn choice_row<'a, Message: Clone + 'a>(
     } else {
         TEXT_SECONDARY
     };
-    let check = if selected { "✓" } else { "" };
+    let check: Element<'a, Message> = if selected {
+        icon(
+            lucide_icons::Icon::Check,
+            FONT_SIZE_PANEL_SMALL,
+            TEXT_SECONDARY,
+        )
+    } else {
+        text("").size(FONT_SIZE_PANEL_SMALL).into()
+    };
     let content = iced::widget::row![
         container(
             text(label)
@@ -333,9 +374,9 @@ pub(crate) fn choice_row<'a, Message: Clone + 'a>(
         )
         .width(Length::Fill)
         .clip(true),
-        text(check)
-            .size(FONT_SIZE_PANEL_SMALL)
-            .color(TEXT_SECONDARY),
+        container(check)
+            .width(Length::Fixed(SPACE_L))
+            .align_x(iced::alignment::Horizontal::Center),
     ]
     .spacing(SPACE_S)
     .align_y(iced::alignment::Vertical::Center)
@@ -354,6 +395,19 @@ pub(crate) fn choice_row<'a, Message: Clone + 'a>(
 pub(crate) fn popup_note<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a, Message> {
     container(text(label).size(FONT_SIZE_PANEL_SMALL).color(TEXT_TERTIARY))
         .padding([SPACE_XS, SPACE_S])
+        .width(Length::Fill)
+        .into()
+}
+
+/// A de-emphasized section label above a panel section.
+pub(crate) fn section_header<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(FONT_SIZE_PANEL_SMALL).color(TEXT_TERTIARY))
+        .padding(iced::Padding {
+            top: SPACE_M,
+            right: SPACE_S,
+            bottom: 0.0,
+            left: SPACE_S,
+        })
         .width(Length::Fill)
         .into()
 }
@@ -563,32 +617,47 @@ fn label_row_style(rest: Color, hot: Color) -> impl Fn(&Theme, button::Status) -
 }
 
 /// A project header row: the expand/collapse button fills the row with
-/// a small subtle "+" button for starting a new session in that project
-/// and a small subtle "×" button for removing the project from the
-/// registry, pinned to its right end. The whole header stays pressable
-/// for expand; the "+" and "×" are distinct buttons.
+/// a small subtle Plus icon button for starting a new session in that
+/// project and a small subtle X icon button for removing the project
+/// from the registry, pinned to its right end. The whole header stays
+/// pressable for expand; the Plus and X are distinct buttons.
 pub(crate) fn project_header<'a, Message: Clone + 'a>(
     label: &'a str,
+    expanded: bool,
     on_expand: Message,
     on_new: Message,
     on_remove: Message,
 ) -> Element<'a, Message> {
     iced::widget::row![
         button(
-            container(
-                text(label)
-                    .size(FONT_SIZE_PANEL)
-                    .wrapping(iced::widget::text::Wrapping::None),
-            )
-            .width(Length::Fill)
-            .clip(true),
+            iced::widget::row![
+                icon(folder_icon(expanded), FONT_SIZE_PANEL, TEXT_SECONDARY,),
+                container(
+                    text(label)
+                        .size(FONT_SIZE_PANEL)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .width(Length::Fill)
+                .clip(true),
+            ]
+            .spacing(SPACE_XS)
+            .align_y(iced::alignment::Vertical::Center)
+            .width(Length::Fill),
         )
         .width(Length::Fill)
         .padding([SPACE_XS, SPACE_S])
         .on_press(on_expand)
         .style(label_row_style(TEXT_SECONDARY, TEXT_PRIMARY)),
-        icon_button("+", IconButtonKind::Subtle, Some(on_new)),
-        icon_button("×", IconButtonKind::Subtle, Some(on_remove)),
+        icon_button(
+            lucide_icons::Icon::Plus,
+            IconButtonKind::Subtle,
+            Some(on_new),
+        ),
+        icon_button(
+            lucide_icons::Icon::X,
+            IconButtonKind::Subtle,
+            Some(on_remove)
+        ),
     ]
     .spacing(SPACE_XXS)
     .align_y(iced::alignment::Vertical::Center)
@@ -597,12 +666,24 @@ pub(crate) fn project_header<'a, Message: Clone + 'a>(
 }
 
 /// A full-width add row: same shape as the project header with a body
-/// label tone, for actions like "+ New Project".
+/// label tone, for actions like "New Project". A leading icon renders
+/// when supplied.
 pub(crate) fn action_row<'a, Message: Clone + 'a>(
     label: &'a str,
+    leading_icon: Option<lucide_icons::Icon>,
     on_press: Message,
 ) -> Element<'a, Message> {
-    button(text(label).size(FONT_SIZE_PANEL))
+    let content: Element<'a, Message> = match leading_icon {
+        Some(leading) => iced::widget::row![
+            icon(leading, FONT_SIZE_PANEL, TEXT_SECONDARY),
+            text(label).size(FONT_SIZE_PANEL),
+        ]
+        .spacing(SPACE_XS)
+        .align_y(iced::alignment::Vertical::Center)
+        .into(),
+        None => text(label).size(FONT_SIZE_PANEL).into(),
+    };
+    button(content)
         .width(Length::Fill)
         .padding([SPACE_XS, SPACE_S])
         .on_press(on_press)
@@ -619,9 +700,7 @@ pub(crate) fn group_header<'a, Message: Clone + 'a>(
     on_press: Message,
 ) -> Element<'a, Message> {
     let content = iced::widget::row![
-        text(drawer_chevron(expanded))
-            .size(FONT_SIZE_SMALL)
-            .color(TEXT_TERTIARY),
+        icon(drawer_chevron(expanded), FONT_SIZE_SMALL, TEXT_TERTIARY),
         text(headline).size(FONT_SIZE_SMALL).color(TEXT_SECONDARY),
     ]
     .spacing(SPACE_S)
@@ -653,11 +732,36 @@ pub(crate) fn scrim<'a, Message: Clone + 'a>(
         .into()
 }
 
-/// Maps the drawer situation to its chevron glyph: the drawer grows
+/// Maps the drawer situation to its chevron icon: the drawer grows
 /// upward when opened, so the collapsed peek strip shows an up chevron
 /// (expand) and the open header shows a down chevron (collapse).
-pub(crate) fn drawer_chevron(expanded: bool) -> &'static str {
-    if expanded { "▾" } else { "▴" }
+pub(crate) fn drawer_chevron(expanded: bool) -> lucide_icons::Icon {
+    if expanded {
+        lucide_icons::Icon::ChevronDown
+    } else {
+        lucide_icons::Icon::ChevronUp
+    }
+}
+
+/// Maps a project's expansion state to its folder icon: an open
+/// folder when expanded and a closed folder when collapsed.
+pub(crate) fn folder_icon(expanded: bool) -> lucide_icons::Icon {
+    if expanded {
+        lucide_icons::Icon::FolderOpen
+    } else {
+        lucide_icons::Icon::Folder
+    }
+}
+
+/// Maps the window maximize state to its icon: a square when restored
+/// (maximize affordance) and overlapping squares when maximized
+/// (restore affordance).
+pub(crate) fn maximize_icon(maximized: bool) -> lucide_icons::Icon {
+    if maximized {
+        lucide_icons::Icon::Copy
+    } else {
+        lucide_icons::Icon::Square
+    }
 }
 
 /// The shared Todos bar row: a small label, the current todo in a
@@ -674,9 +778,7 @@ fn todo_bar_row<'a, Message: 'a>(
         iced::widget::container(text(current).size(FONT_SIZE_SMALL).color(TEXT_PRIMARY),)
             .width(Length::Fill),
         text(summary).size(FONT_SIZE_SMALL).color(TEXT_TERTIARY),
-        text(drawer_chevron(expanded))
-            .size(FONT_SIZE_SMALL)
-            .color(TEXT_TERTIARY),
+        icon(drawer_chevron(expanded), FONT_SIZE_SMALL, TEXT_TERTIARY),
     ]
     .spacing(SPACE_S)
     .width(Length::Fill)
@@ -848,12 +950,25 @@ fn subtle_icon_style(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// A circular icon button: a fixed-square button with the glyph
+/// A non-button Lucide icon at a caller-named size and color.
+pub(crate) fn icon<'a, Message: 'a>(
+    icon: lucide_icons::Icon,
+    size: f32,
+    color: Color,
+) -> Element<'a, Message> {
+    text(char::from(icon).to_string())
+        .font(iced::Font::with_name("lucide"))
+        .size(size)
+        .color(color)
+        .into()
+}
+
+/// A circular icon button: a fixed-square button with the icon
 /// centered. Accent follows the primary pill; Subtle is transparent
 /// at rest since it sits on the bar surface. `on_press: None` renders
 /// disabled and emits no message.
 pub(crate) fn icon_button<'a, Message: Clone + 'a>(
-    glyph: &'a str,
+    icon: lucide_icons::Icon,
     kind: IconButtonKind,
     on_press: Option<Message>,
 ) -> Element<'a, Message> {
@@ -861,12 +976,53 @@ pub(crate) fn icon_button<'a, Message: Clone + 'a>(
         IconButtonKind::Accent => accent_icon_style,
         IconButtonKind::Subtle => subtle_icon_style,
     };
-    button(container(text(glyph).size(FONT_SIZE_HEADING)).center(Length::Fixed(ICON_BUTTON_SIZE)))
-        .width(Length::Fixed(ICON_BUTTON_SIZE))
-        .height(Length::Fixed(ICON_BUTTON_SIZE))
-        .padding(0.0)
-        .on_press_maybe(on_press)
-        .style(style)
+    button(
+        container(
+            text(char::from(icon).to_string())
+                .font(iced::Font::with_name("lucide"))
+                .size(ICON_SIZE),
+        )
+        .center(Length::Fixed(ICON_BUTTON_SIZE)),
+    )
+    .width(Length::Fixed(ICON_BUTTON_SIZE))
+    .height(Length::Fixed(ICON_BUTTON_SIZE))
+    .padding(0.0)
+    .on_press_maybe(on_press)
+    .style(style)
+    .into()
+}
+
+/// An icon button with a small tooltip shown above it on hover.
+pub(crate) fn tooltip_icon_button<'a, Message: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    kind: IconButtonKind,
+    tooltip: &'a str,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        icon_button(icon, kind, on_press),
+        container(
+            text(tooltip)
+                .size(FONT_SIZE_PANEL_SMALL)
+                .color(TEXT_PRIMARY),
+        )
+        .padding(SPACE_XS)
+        .style(popup_card_style),
+        iced::widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
+/// Fixed-height slot centering a composer icon button on one input
+/// line, so the button stays centered as the input grows.
+pub(crate) fn composer_icon_slot<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .height(Length::Fixed(
+            COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
+        ))
+        .align_y(iced::alignment::Vertical::Center)
         .into()
 }
 
@@ -1019,8 +1175,8 @@ pub(crate) fn input_bar<'a, Message: Clone + 'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonKind, IconButtonKind, button_colors, drawer_chevron, edit_button_colors,
-        icon_button_colors, menu_row_colors, row_colors,
+        ButtonKind, IconButtonKind, button_colors, drawer_chevron, edit_button_colors, folder_icon,
+        icon_button_colors, maximize_icon, menu_row_colors, row_colors,
     };
     use crate::theme::{
         ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, DANGER, SURFACE_1, SURFACE_2,
@@ -1158,8 +1314,26 @@ mod tests {
 
     #[test]
     fn drawer_chevron_points_up_when_collapsed_and_down_when_open() {
-        assert_eq!(drawer_chevron(false), "▴");
-        assert_eq!(drawer_chevron(true), "▾");
+        assert!(matches!(
+            drawer_chevron(false),
+            lucide_icons::Icon::ChevronUp
+        ));
+        assert!(matches!(
+            drawer_chevron(true),
+            lucide_icons::Icon::ChevronDown
+        ));
+    }
+
+    #[test]
+    fn folder_icon_is_closed_when_collapsed_and_open_when_expanded() {
+        assert!(matches!(folder_icon(false), lucide_icons::Icon::Folder));
+        assert!(matches!(folder_icon(true), lucide_icons::Icon::FolderOpen));
+    }
+
+    #[test]
+    fn maximize_icon_is_square_when_restored_and_copy_when_maximized() {
+        assert!(matches!(maximize_icon(false), lucide_icons::Icon::Square));
+        assert!(matches!(maximize_icon(true), lucide_icons::Icon::Copy));
     }
 
     #[test]

@@ -12,6 +12,8 @@
 //! header. `update` changes the selection only for ids already in the
 //! list; an unknown id is a no-op.
 
+use std::collections::HashSet;
+
 use iced::{Element, Length};
 use manifest_domain::{ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary};
 
@@ -53,8 +55,8 @@ pub enum Message {
     /// Record a validation failure on the open popup; no-op while closed.
     AddProjectFailed(String),
     /// Remove the project with this id: its sessions move (order
-    /// preserved) onto the end of unprojected, `expanded == id` becomes
-    /// `None`, and the selection is unchanged. Unknown id is a no-op.
+    /// preserved) onto the end of unprojected, the id leaves the
+    /// expanded set, and the selection is unchanged. Unknown id is a no-op.
     RemoveProject(ProjectId),
 }
 
@@ -99,8 +101,8 @@ pub struct State {
     /// The selected session. Always the id of a listed session when
     /// built from the fixture; see [`State::from_projects`].
     pub selected: SessionId,
-    /// The expanded project, if any.
-    pub expanded: Option<ProjectId>,
+    /// The expanded projects.
+    pub expanded: HashSet<ProjectId>,
     /// The add-project popup situation.
     pub add_project: AddProject,
 }
@@ -141,8 +143,10 @@ impl State {
             .next()
             .map(|summary| summary.id.clone())
             .unwrap_or_else(|| SessionId::new(String::new()));
-        let expanded = State::find_in(&groups, &unprojected, &selected)
-            .and_then(|summary| summary.project.clone());
+        let expanded: HashSet<ProjectId> = State::find_in(&groups, &unprojected, &selected)
+            .and_then(|summary| summary.project.clone())
+            .into_iter()
+            .collect();
         State {
             groups,
             unprojected,
@@ -157,18 +161,21 @@ impl State {
     /// Groups rebuild exactly as [`State::from_projects`] does. The
     /// current selection survives when its id still exists in the new
     /// data; otherwise the selection falls back to `from_projects`'
-    /// default (first in display order, placeholder when empty). The
-    /// expanded project becomes the (possibly preserved) selection's
-    /// project, and the add-project popup state carries over untouched.
+    /// default (first in display order, placeholder when empty). When
+    /// the selection survives, the expanded set is the previous set
+    /// intersected with the fresh group ids (the selected project is
+    /// not force-expanded); when it falls back, the expanded set is
+    /// the fresh default. The add-project popup state carries over
+    /// untouched.
     pub fn replace(&mut self, projects: Vec<ProjectSummary>, sessions: Vec<SessionSummary>) {
+        let previous_expanded = self.expanded.clone();
         let mut fresh = State::from_projects(projects, sessions);
         if fresh.find(&self.selected).is_some() {
-            let selected = self.selected.clone();
-            let expanded = fresh
-                .find(&selected)
-                .and_then(|summary| summary.project.clone());
-            fresh.selected = selected;
-            fresh.expanded = expanded;
+            fresh.selected = self.selected.clone();
+            fresh.expanded = previous_expanded
+                .into_iter()
+                .filter(|id| fresh.groups.iter().any(|group| &group.project.id == id))
+                .collect();
         }
         fresh.add_project = std::mem::take(&mut self.add_project);
         *self = fresh;
@@ -213,17 +220,15 @@ impl State {
     }
 
     /// Removes the project with this id: its sessions move (order
-    /// preserved) onto the end of unprojected, `expanded == id` becomes
-    /// `None`, and the selection is unchanged. Unknown id is a no-op.
+    /// preserved) onto the end of unprojected, the id leaves the
+    /// expanded set, and the selection is unchanged. Unknown id is a no-op.
     fn remove_project(&mut self, id: &ProjectId) {
         let Some(index) = self.groups.iter().position(|group| group.project.id == *id) else {
             return;
         };
         let group = self.groups.remove(index);
         self.unprojected.extend(group.sessions);
-        if self.expanded.as_ref() == Some(id) {
-            self.expanded = None;
-        }
+        self.expanded.remove(id);
     }
 
     /// Folds a message into the list state.
@@ -233,24 +238,21 @@ impl State {
                 let project = self.find(&id).map(|summary| summary.project.clone());
                 if let Some(project) = project {
                     self.selected = id;
-                    if project.is_some() {
-                        self.expanded = project;
+                    if let Some(project_id) = project {
+                        self.expanded.insert(project_id);
                     }
                 }
             }
             Message::ExpandProject(id) => {
                 let known = self.groups.iter().any(|group| group.project.id == id);
-                if known {
-                    self.expanded = match &self.expanded {
-                        Some(current) if *current == id => None,
-                        _ => Some(id),
-                    };
+                if known && !self.expanded.remove(&id) {
+                    self.expanded.insert(id);
                 }
             }
             Message::NewSession(id) => {
                 // Expansion only; the App enters draft mode on top.
                 if self.groups.iter().any(|group| group.project.id == id) {
-                    self.expanded = Some(id);
+                    self.expanded.insert(id);
                 }
             }
             Message::OpenAddProject => {
@@ -297,18 +299,26 @@ impl State {
     /// Renders the panel: the add row, one collapsible section per
     /// project, then the always-visible "No project" rows.
     pub fn view(&self) -> Element<'_, Message> {
-        let mut list =
-            iced::widget::column![kit::action_row("+ New Project", Message::OpenAddProject),]
-                .spacing(SPACE_S)
-                .width(Length::Fill);
+        let mut list = iced::widget::column![kit::action_row(
+            "New Project",
+            Some(lucide_icons::Icon::FolderPlus),
+            Message::OpenAddProject,
+        ),]
+        .spacing(SPACE_S)
+        .width(Length::Fill);
+        if !self.groups.is_empty() {
+            list = list.push(kit::section_header("Projects"));
+        }
         for group in &self.groups {
+            let expanded = self.expanded.contains(&group.project.id);
             list = list.push(kit::project_header(
                 group.project.name.as_str(),
+                expanded,
                 Message::ExpandProject(group.project.id.clone()),
                 Message::NewSession(group.project.id.clone()),
                 Message::RemoveProject(group.project.id.clone()),
             ));
-            if self.expanded.as_ref() == Some(&group.project.id) {
+            if expanded {
                 list = list.push(indented(session_rows(&group.sessions, &self.selected)));
             }
         }
@@ -353,9 +363,10 @@ impl State {
                     Message::DirectoryChanged,
                 ))
                 .width(Length::Fill),
-                kit::pill_button(
+                kit::tooltip_icon_button(
+                    lucide_icons::Icon::FolderOpen,
+                    kit::IconButtonKind::Subtle,
                     "Choose folder...",
-                    kit::ButtonKind::Ghost,
                     Some(Message::PickDirectory),
                 ),
             ]
@@ -378,7 +389,12 @@ impl State {
                     kit::ButtonKind::Ghost,
                     Some(Message::CloseAddProject),
                 ),
-                kit::pill_button("Add project", kit::ButtonKind::Primary, on_press),
+                kit::icon_pill_button(
+                    lucide_icons::Icon::FolderPlus,
+                    "Add project",
+                    kit::ButtonKind::Primary,
+                    on_press,
+                ),
             ]
             .spacing(SPACE_S),
         ]
@@ -430,7 +446,7 @@ fn indented(content: Element<'_, Message>) -> Element<'_, Message> {
 }
 
 /// The static header above project-less sessions, padded to match
-/// the project headers without being pressable. It carries no "+":
+/// the project headers without being pressable. It carries no Plus icon button:
 /// a new session needs a project workspace to spawn in.
 fn no_project_header() -> Element<'static, Message> {
     iced::widget::container(
@@ -493,7 +509,11 @@ mod tests {
         let got = state();
         let fixture = fixture();
         assert_eq!(got.selected, fixture.sessions[0].id);
-        assert_eq!(got.expanded, Some(ProjectId::new("project-checkout-api")));
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-checkout-api"))
+        );
+        assert_eq!(got.expanded.len(), 1);
     }
 
     #[test]
@@ -505,11 +525,25 @@ mod tests {
         got.update(Message::ExpandProject(ProjectId::new(
             "project-storefront-web",
         )));
-        assert_eq!(got.expanded, None);
+        assert!(
+            !got.expanded
+                .contains(&ProjectId::new("project-storefront-web"))
+        );
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-checkout-api"))
+        );
         let target = got.groups[1].sessions[0].id.clone();
         got.update(Message::Select(target.clone()));
         assert_eq!(got.selected, target);
-        assert_eq!(got.expanded, Some(ProjectId::new("project-storefront-web")));
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-storefront-web"))
+        );
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-checkout-api"))
+        );
     }
 
     #[test]
@@ -533,16 +567,30 @@ mod tests {
     }
 
     #[test]
-    fn expand_project_switches_and_retoggles_to_none() {
+    fn expand_project_adds_and_retoggle_removes_only_it() {
         let mut got = state();
         got.update(Message::ExpandProject(ProjectId::new(
             "project-storefront-web",
         )));
-        assert_eq!(got.expanded, Some(ProjectId::new("project-storefront-web")));
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-storefront-web"))
+        );
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-checkout-api"))
+        );
         got.update(Message::ExpandProject(ProjectId::new(
             "project-storefront-web",
         )));
-        assert_eq!(got.expanded, None);
+        assert!(
+            !got.expanded
+                .contains(&ProjectId::new("project-storefront-web"))
+        );
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-checkout-api"))
+        );
     }
 
     #[test]
@@ -559,11 +607,15 @@ mod tests {
         got.update(Message::ExpandProject(ProjectId::new(
             "project-checkout-api",
         )));
-        assert_eq!(got.expanded, None);
+        assert!(got.expanded.is_empty());
         got.update(Message::NewSession(ProjectId::new(
             "project-storefront-web",
         )));
-        assert_eq!(got.expanded, Some(ProjectId::new("project-storefront-web")));
+        assert!(
+            got.expanded
+                .contains(&ProjectId::new("project-storefront-web"))
+        );
+        assert_eq!(got.expanded.len(), 1);
     }
 
     #[test]
@@ -800,9 +852,10 @@ mod tests {
         );
         got.update(Message::ExpandProject(ProjectId::new("p-b")));
         got.update(Message::RemoveProject(ProjectId::new("p-a")));
-        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+        assert!(!got.expanded.contains(&ProjectId::new("p-a")));
         got.update(Message::RemoveProject(ProjectId::new("p-b")));
-        assert_eq!(got.expanded, None);
+        assert!(got.expanded.is_empty());
     }
 
     #[test]
@@ -854,13 +907,13 @@ mod tests {
             vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
         );
         got.update(Message::Select(SessionId::new("s-2")));
-        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
         got.replace(
             vec![project("p-b", "b"), project("p-a", "a")],
             vec![row("s-2", Some("p-b")), row("s-3", Some("p-a"))],
         );
         assert_eq!(got.selected, SessionId::new("s-2"));
-        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
         assert_eq!(got.groups.len(), 2);
     }
 
@@ -872,7 +925,8 @@ mod tests {
         );
         got.replace(vec![project("p-b", "b")], vec![row("s-9", Some("p-b"))]);
         assert_eq!(got.selected, SessionId::new("s-9"));
-        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+        assert_eq!(got.expanded.len(), 1);
     }
 
     #[test]
@@ -882,7 +936,66 @@ mod tests {
         assert!(got.groups.is_empty());
         assert!(got.unprojected.is_empty());
         assert!(got.selected_summary().is_none());
-        assert_eq!(got.expanded, None);
+        assert!(got.expanded.is_empty());
+    }
+
+    #[test]
+    fn expanding_two_projects_keeps_both_and_collapsing_one_leaves_other() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a"), project("p-b", "b")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
+        );
+        // Boot expands only p-a.
+        assert!(got.expanded.contains(&ProjectId::new("p-a")));
+        assert!(!got.expanded.contains(&ProjectId::new("p-b")));
+        got.update(Message::ExpandProject(ProjectId::new("p-b")));
+        assert!(got.expanded.contains(&ProjectId::new("p-a")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+        got.update(Message::ExpandProject(ProjectId::new("p-a")));
+        assert!(!got.expanded.contains(&ProjectId::new("p-a")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+    }
+
+    #[test]
+    fn selecting_session_in_another_project_adds_it_without_collapsing_first() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a"), project("p-b", "b")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
+        );
+        assert!(got.expanded.contains(&ProjectId::new("p-a")));
+        got.update(Message::Select(SessionId::new("s-2")));
+        assert_eq!(got.selected, SessionId::new("s-2"));
+        assert!(got.expanded.contains(&ProjectId::new("p-a")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+    }
+
+    #[test]
+    fn replace_with_surviving_selection_preserves_multiple_and_drops_removed() {
+        let mut got = State::from_projects(
+            vec![
+                project("p-a", "a"),
+                project("p-b", "b"),
+                project("p-c", "c"),
+            ],
+            vec![
+                row("s-1", Some("p-a")),
+                row("s-2", Some("p-b")),
+                row("s-3", Some("p-c")),
+            ],
+        );
+        got.update(Message::ExpandProject(ProjectId::new("p-b")));
+        got.update(Message::ExpandProject(ProjectId::new("p-c")));
+        assert_eq!(got.expanded.len(), 3);
+        // Selection (s-1) survives; p-c is gone from the fresh groups.
+        got.replace(
+            vec![project("p-b", "b"), project("p-a", "a")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
+        );
+        assert_eq!(got.selected, SessionId::new("s-1"));
+        assert!(got.expanded.contains(&ProjectId::new("p-a")));
+        assert!(got.expanded.contains(&ProjectId::new("p-b")));
+        assert!(!got.expanded.contains(&ProjectId::new("p-c")));
+        assert_eq!(got.expanded.len(), 2);
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub const FONT_SIZE_SMALL: f32 = 15.0;
 pub const FONT_SIZE_BODY: f32 = 18.0;
 pub const FONT_SIZE_HEADING: f32 = 20.0;
 pub const FONT_SIZE_TITLE: f32 = 25.0;
+// Lucide icon glyph size; single rescale point for all kit icons.
+pub const ICON_SIZE: f32 = 20.0;
 
 // Modal dim over the workspace while a popup is open.
 pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
@@ -112,6 +114,33 @@ pub const EFFORT_POPUP_WIDTH: f32 = 210.0;
 // card sits just above the "model · effort" pill without reflowing
 // the composer beneath it.
 pub const MODEL_MENU_BOTTOM_OFFSET: f32 = SPACE_M + (SPACE_S * 2.0 + FONT_SIZE_BODY) + SPACE_S;
+// Fixed width of the floating attach popup. The card only carries
+// icon-and-short-label rows ("Files", "Photos") plus a one-line note,
+// so it stays narrower than the permission and model cards.
+pub const ATTACH_POPUP_WIDTH: f32 = 260.0;
+// Fixed width of the floating context popup. It is on the same scale
+// as the model card (MODEL_POPUP_WIDTH): it carries the context meter
+// plus its one-line breakdown.
+pub const CONTEXT_POPUP_WIDTH: f32 = 340.0;
+
+/// Bottom offset of the floating attach menu from the window's bottom
+/// edge for a composer showing `visible_lines` input lines. The attach
+/// trigger (Plus) sits in the input bar, which is above the sub-bar,
+/// so the card must float higher than the model/permission cards:
+/// their [`MODEL_MENU_BOTTOM_OFFSET`] (bottom padding, sub-bar height,
+/// and the gap above the sub-bar), plus the input-bar height — the
+/// input itself (`visible_lines` line heights plus its top and bottom
+/// padding, as `kit::composer_input` computes it) plus the input bar's
+/// own top and bottom padding (`SPACE_XS` each side, from
+/// `kit::input_bar`) — plus a `SPACE_S` gap between the input bar and
+/// the floating card.
+pub fn attach_menu_bottom_offset(visible_lines: usize) -> f32 {
+    MODEL_MENU_BOTTOM_OFFSET
+        + (visible_lines as f32 * COMPOSER_LINE_HEIGHT
+            + 2.0 * COMPOSER_INPUT_PADDING
+            + 2.0 * SPACE_XS)
+        + SPACE_S
+}
 // Fixed max height of the scrollable catalog list inside the model
 // card, so a long catalog never grows the popup unbounded.
 pub const MODEL_LIST_MAX_HEIGHT: f32 = 240.0;
@@ -154,7 +183,10 @@ pub fn manifest_theme() -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::with_alpha;
+    use super::{
+        COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT, MODEL_MENU_BOTTOM_OFFSET, SPACE_S, SPACE_XS,
+        attach_menu_bottom_offset, with_alpha,
+    };
     use iced::Color;
 
     #[test]
@@ -165,5 +197,20 @@ mod tests {
         assert_eq!(derived.g, base.g);
         assert_eq!(derived.b, base.b);
         assert_eq!(derived.a, 0.15);
+    }
+
+    #[test]
+    fn attach_offset_floats_above_the_input_bar() {
+        let input_bar = |lines: usize| {
+            lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING + 2.0 * SPACE_XS
+        };
+        assert_eq!(
+            attach_menu_bottom_offset(1),
+            MODEL_MENU_BOTTOM_OFFSET + input_bar(1) + SPACE_S
+        );
+        assert_eq!(
+            attach_menu_bottom_offset(3),
+            MODEL_MENU_BOTTOM_OFFSET + input_bar(3) + SPACE_S
+        );
     }
 }

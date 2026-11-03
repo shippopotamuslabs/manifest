@@ -19,7 +19,7 @@ use crate::kit;
 use crate::theme::{
     DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, MODEL_MENU_BOTTOM_OFFSET,
     PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE,
+    TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE, attach_menu_bottom_offset,
 };
 use crate::{composer, sessions, transcript};
 
@@ -75,6 +75,10 @@ pub enum Message {
     ResizeWindow(iced::window::Direction),
     /// The runtime reported the latest window id at boot (or none).
     WindowIdentified(Option<iced::window::Id>),
+    /// A window resize happened; the maximized state should be rechecked.
+    WindowResized,
+    /// The runtime reported the window's maximized state.
+    WindowMaximizedChecked(bool),
     /// Starts dragging the (undecorated) window.
     DragWindow,
     /// Minimizes the window.
@@ -150,7 +154,7 @@ pub enum DraftWorktreeMode {
 }
 
 /// A session being composed before it exists: entered from a project's
-/// "+" button, resolved into a real session on the next send.
+/// Plus icon button, resolved into a real session on the next send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSessionDraft {
     /// Folder the spawned session will run in, from the project.
@@ -250,7 +254,7 @@ pub struct App {
     /// resumes and the send button.
     pub resuming: HashSet<SessionId>,
     /// A new session being composed in a project's workspace; set by
-    /// the project's "+" button, cleared on send (which spawns it) or
+    /// the project's Plus icon button, cleared on send (which spawns it) or
     /// on session select. While set, the visible transcript is the
     /// draft's, and list syncs must not steal it.
     pub new_session: Option<NewSessionDraft>,
@@ -274,6 +278,8 @@ pub struct App {
     pub current_todo: Option<String>,
     /// The window id from boot, for the title-bar window controls.
     pub window_id: Option<iced::window::Id>,
+    /// Whether the window is maximized; drives the maximize icon.
+    pub window_maximized: bool,
     /// The named connection situation the top bar renders.
     pub connection: Connection,
     /// Counts connection attempts; engine-stream items carry the attempt
@@ -340,6 +346,7 @@ impl App {
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: PanelDrag::Idle,
             window_id: None,
+            window_maximized: false,
             connection: Connection::Disconnected,
             connection_attempt: 0,
             engine: None,
@@ -730,7 +737,7 @@ impl App {
             self.sessions.update(sessions::Message::CloseAddProject);
             let assigned = manifest_domain::assign_projects(&list, self.current_sessions());
             self.sessions.replace(list, assigned);
-            self.sessions.expanded = Some(existing);
+            self.sessions.expanded.insert(existing);
             return Task::none();
         }
         let id = ProjectId::for_workspace(&directory);
@@ -746,7 +753,7 @@ impl App {
         let assigned = manifest_domain::assign_projects(&self.projects, self.current_sessions());
         let snapshot = self.projects.clone();
         self.sessions.replace(snapshot, assigned);
-        self.sessions.expanded = Some(id);
+        self.sessions.expanded.insert(id);
         self.sessions.update(sessions::Message::CloseAddProject);
         self.save_projects_task()
     }
@@ -1208,6 +1215,17 @@ impl App {
             },
             Message::WindowIdentified(id) => {
                 self.window_id = id;
+                match id {
+                    Some(id) => iced::window::is_maximized(id).map(Message::WindowMaximizedChecked),
+                    None => Task::none(),
+                }
+            }
+            Message::WindowResized => match self.window_id {
+                Some(id) => iced::window::is_maximized(id).map(Message::WindowMaximizedChecked),
+                None => Task::none(),
+            },
+            Message::WindowMaximizedChecked(maximized) => {
+                self.window_maximized = maximized;
                 Task::none()
             }
             Message::DragWindow => match self.window_id {
@@ -1444,7 +1462,8 @@ impl App {
             &self.connection,
         )
         .map(move |(attempt, input)| Message::Engine { attempt, input });
-        iced::Subscription::batch([drag, engine])
+        let window = iced::event::listen_with(window_event);
+        iced::Subscription::batch([drag, engine, window])
     }
 
     /// Renders the title bar over a content row splitting the fixed-width
@@ -1539,6 +1558,16 @@ impl App {
                 self.panel_width,
             ));
         }
+        if let Some(menu) = self.composer.attach_menu_overlay() {
+            stack = stack.push(attach_menu_overlay_layer(
+                menu.map(Message::Composer),
+                self.panel_width,
+                self.composer.visible_lines,
+            ));
+        }
+        if let Some(popup) = self.composer.context_popover_overlay() {
+            stack = stack.push(context_popover_overlay_layer(popup.map(Message::Composer)));
+        }
         if let Some(popup) = self.sessions.add_project_view() {
             stack = stack.push(kit::scrim(popup.map(Message::Sessions)));
         }
@@ -1560,6 +1589,19 @@ fn drag_region<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Mess
         .on_press(Message::DragWindow)
         .on_double_click(Message::ToggleMaximizeWindow)
         .into()
+}
+
+/// Maps window resize events to [`Message::WindowResized`] so the
+/// maximized state is rechecked; everything else maps to nothing.
+fn window_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::Resized(_)) => Some(Message::WindowResized),
+        _ => None,
+    }
 }
 
 /// Maps runtime events to panel-drag messages for [`App::subscription`]:
@@ -1649,6 +1691,92 @@ fn permission_menu_overlay_layer<'a>(
         ]
         .width(Length::Fill)
         .height(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The floating attach menu layer: a transparent click-away catcher
+/// covering the window behind the card, and the card itself anchored
+/// bottom-left. The card's left edge lines up with the main column's
+/// left edge: the side panel, the divider hit width, and the main
+/// container's padding (the Plus button's column). Its bottom edge
+/// floats just above the composer input bar — the attach trigger's
+/// bar, which sits above the sub-bar — via
+/// [`attach_menu_bottom_offset`] for the composer's visible line
+/// count. The catcher carries no fill, so nothing beneath the card
+/// dims, and a press anywhere outside the card dismisses the menu
+/// without reflowing anything beneath it.
+fn attach_menu_overlay_layer<'a>(
+    menu: Element<'a, Message>,
+    panel_width: f32,
+    visible_lines: usize,
+) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::AttachDismissed));
+    let card = iced::widget::row![
+        iced::widget::Space::new().width(Length::Fixed(panel_width + DIVIDER_HIT_WIDTH + SPACE_M)),
+        iced::widget::column![
+            iced::widget::container(menu)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Left)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new()
+                .height(Length::Fixed(attach_menu_bottom_offset(visible_lines))),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The floating context popup layer: a transparent click-away
+/// catcher covering the window behind the card, and the card itself
+/// anchored bottom-right. The card's right edge lines up with the
+/// main column's right edge (the window edge minus the main padding),
+/// and its bottom edge floats just above the context meter pill in
+/// the composer sub-bar, with the same offset as the model card —
+/// the context trigger sits in that sub-bar, so no input-bar height
+/// enters the anchor. The catcher carries no fill, so nothing beneath
+/// the card dims, and a press anywhere outside the card dismisses the
+/// popup without reflowing anything beneath it.
+fn context_popover_overlay_layer<'a>(popup: Element<'a, Message>) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::ContextDismissed));
+    let card = iced::widget::row![
+        iced::widget::column![
+            iced::widget::container(popup)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new().height(Length::Fixed(MODEL_MENU_BOTTOM_OFFSET)),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+        iced::widget::Space::new().width(Length::Fixed(SPACE_M)),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -1778,17 +1906,17 @@ fn topbar(state: &App) -> Element<'_, Message> {
             }
             controls
                 .push(kit::icon_button(
-                    "−",
+                    lucide_icons::Icon::Minus,
                     kit::IconButtonKind::Subtle,
                     Some(Message::MinimizeWindow),
                 ))
                 .push(kit::icon_button(
-                    "□",
+                    kit::maximize_icon(state.window_maximized),
                     kit::IconButtonKind::Subtle,
                     Some(Message::ToggleMaximizeWindow),
                 ))
                 .push(kit::icon_button(
-                    "✕",
+                    lucide_icons::Icon::X,
                     kit::IconButtonKind::Subtle,
                     Some(Message::CloseWindow),
                 ))
@@ -1965,6 +2093,25 @@ mod tests {
         assert_eq!(got.sessions.selected, target);
         assert_eq!(got.panel_width, PANEL_WIDTH_DEFAULT);
         assert_eq!(got.panel_drag, PanelDrag::Idle);
+    }
+
+    #[test]
+    fn window_maximized_checked_stores_value() {
+        let mut got = App::boot();
+        assert!(!got.window_maximized);
+        let _ = got.update(Message::WindowMaximizedChecked(true));
+        assert!(got.window_maximized);
+        let _ = got.update(Message::WindowMaximizedChecked(false));
+        assert!(!got.window_maximized);
+    }
+
+    #[test]
+    fn window_resized_without_id_is_noop() {
+        let mut got = App::boot();
+        assert_eq!(got.window_id, None);
+        let _ = got.update(Message::WindowResized);
+        assert_eq!(got.window_id, None);
+        assert!(!got.window_maximized);
     }
 
     #[test]
@@ -2987,7 +3134,7 @@ mod tests {
         loaded(app, &["s-1", "s-2"]);
     }
 
-    /// Presses the first listed project's "+" button through the root
+    /// Presses the first listed project's Plus icon button through the root
     /// reducer.
     fn new_session_pressed(app: &mut App) {
         let project = app
@@ -3022,9 +3169,10 @@ mod tests {
                 permission: manifest_domain::PermissionMode::default(),
             })
         );
-        assert_eq!(
-            app.sessions.expanded,
-            Some(manifest_domain::ProjectId::for_workspace("/live/workspace"))
+        assert!(
+            app.sessions
+                .expanded
+                .contains(&(manifest_domain::ProjectId::for_workspace("/live/workspace")))
         );
         // The s-1 transcript parks; the draft shows empty.
         assert!(app.transcript.entries.is_empty());
@@ -3120,9 +3268,10 @@ mod tests {
         session.project = Some(manifest_domain::ProjectId::new("project-live"));
         app.sessions.replace(vec![live_project()], vec![session]);
         new_session_pressed(&mut app);
-        assert_eq!(
-            app.sessions.expanded,
-            Some(manifest_domain::ProjectId::new("project-live"))
+        assert!(
+            app.sessions
+                .expanded
+                .contains(&(manifest_domain::ProjectId::new("project-live")))
         );
         assert_eq!(app.new_session, None);
     }
@@ -3138,9 +3287,10 @@ mod tests {
         assert!(app.awaiting_spawn);
         new_session_pressed(&mut app);
         assert_eq!(app.new_session, None);
-        assert_eq!(
-            app.sessions.expanded,
-            Some(manifest_domain::ProjectId::for_workspace("/live/workspace"))
+        assert!(
+            app.sessions
+                .expanded
+                .contains(&(manifest_domain::ProjectId::for_workspace("/live/workspace")))
         );
     }
 
@@ -3151,9 +3301,10 @@ mod tests {
             manifest_domain::ProjectId::new("project-checkout-api"),
         )));
         assert_eq!(app.new_session, None);
-        assert_eq!(
-            app.sessions.expanded,
-            Some(manifest_domain::ProjectId::new("project-checkout-api"))
+        assert!(
+            app.sessions
+                .expanded
+                .contains(&(manifest_domain::ProjectId::new("project-checkout-api")))
         );
     }
 
@@ -3396,9 +3547,10 @@ mod tests {
         assert_eq!(app.sessions.groups[0].project.name, "Custom");
         assert_eq!(app.sessions.groups[0].sessions.len(), 1);
         assert_eq!(app.sessions.groups[0].sessions[0].id, SessionId::new("s-1"));
-        assert_eq!(
-            app.sessions.expanded,
-            Some(manifest_domain::ProjectId::for_workspace(&dir))
+        assert!(
+            app.sessions
+                .expanded
+                .contains(&(manifest_domain::ProjectId::for_workspace(&dir)))
         );
         cleanup_registry(&path);
         cleanup_registry(&workspace);
@@ -3424,7 +3576,7 @@ mod tests {
         assert_eq!(app.projects, vec![existing.clone()]);
         assert_eq!(app.sessions.groups.len(), 1);
         assert_eq!(app.sessions.groups[0].project.name, "Old");
-        assert_eq!(app.sessions.expanded, Some(existing.id));
+        assert!(app.sessions.expanded.contains(&(existing.id)));
         cleanup_registry(&path);
     }
 
@@ -4478,5 +4630,39 @@ mod tests {
         let _ = app.update(Message::Composer(composer::Message::AttachPicked(None)));
         assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
         assert_eq!(app.composer.attachments.len(), 1);
+    }
+
+    #[test]
+    fn context_dismissed_through_root_closes_context_popover() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        // Dismissing a closed popover is harmless.
+        let _ = app.update(Message::Composer(composer::Message::ContextDismissed));
+        assert_eq!(
+            app.composer.context_popover,
+            composer::ContextPopover::Closed
+        );
+        let _ = app.update(Message::Composer(composer::Message::ContextPressed));
+        assert_eq!(app.composer.context_popover, composer::ContextPopover::Open);
+        let _ = app.update(Message::Composer(composer::Message::ContextDismissed));
+        assert_eq!(
+            app.composer.context_popover,
+            composer::ContextPopover::Closed
+        );
+    }
+
+    #[test]
+    fn attach_dismissed_through_root_closes_attach_menu() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        // Dismissing a closed menu is harmless.
+        let _ = app.update(Message::Composer(composer::Message::AttachDismissed));
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
+        let _ = app.update(Message::Composer(composer::Message::AttachPressed));
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Open);
+        let _ = app.update(Message::Composer(composer::Message::AttachDismissed));
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
     }
 }
