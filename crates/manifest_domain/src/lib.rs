@@ -7,9 +7,11 @@
 //! I/O, owns no framework types, and depends on nothing
 //! (distinct from external `agent_core`, shippopotamuslabs/agent_core).
 
+mod branch;
 mod engine;
 mod fixture;
 
+pub use branch::{parse_gitdir_pointer, parse_head, resolve_git_dir};
 pub use engine::{
     AnswerValue, ApprovalChoiceSummary, ApprovalDecision, ApprovalRequest, Connection,
     EffortChoice, EngineEvent, FREE_TEXT_LIMIT, FailedCommand, ItemStatus, ModelChoice, ModelInfo,

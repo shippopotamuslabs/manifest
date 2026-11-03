@@ -1287,6 +1287,7 @@ mod tests {
             tool: String::from(tool),
             headline: headline.map(String::from),
             args_json: String::new(),
+            todos: None,
             status,
             output: output.map(String::from),
             failure: failure.map(String::from),
