@@ -1372,6 +1372,8 @@ pub enum FailedCommand {
     Compact(SessionId),
     /// Setting this session's goal failed.
     Goal(SessionId),
+    /// Fetching this session's stored history failed.
+    History(SessionId),
     /// Fetching pending approvals/questions failed.
     ///
     /// The fetch is global (`muse_pending` takes no session), so
@@ -1444,6 +1446,15 @@ pub enum EngineEvent {
         /// Resumed session.
         session: SessionId,
     },
+    /// A stored-history fetch succeeded; the shell seeds the
+    /// session's transcript from these items in host order.
+    HistoryLoaded {
+        /// Session the history belongs to.
+        session: SessionId,
+        /// Stored items, oldest first; system items ride along and
+        /// the shell drops them while seeding.
+        items: Vec<StreamItem>,
+    },
     /// A command failed while the connection stays up.
     ///
     /// Carries the boundary-composed or server-authored friendly message,
@@ -1512,6 +1523,14 @@ pub trait SessionEngine: Send + Sync {
     /// disconnected fail fast with [`EngineEvent::CommandFailed`]
     /// rather than queueing.
     fn resume_session(&self, session: SessionId);
+    /// Fetch `session`'s stored transcript history.
+    ///
+    /// Non-blocking; success arrives as
+    /// [`EngineEvent::HistoryLoaded`], failure as
+    /// [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::History`]. Engines without history support
+    /// keep the default, which drops the call.
+    fn load_history(&self, _session: SessionId) {}
     /// Inject `prompt` into the running `turn` of `session`.
     ///
     /// Non-blocking; failure (idle session, unknown turn) arrives as

@@ -20,8 +20,9 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::map::{
-    map_ack_result, map_models_result, map_pending_result, map_resume_result, map_skills_result,
-    map_spawn_result, map_status_result, map_stream_event, map_turn_result,
+    history_truncation_diagnostic, map_ack_result, map_history_result, map_models_result,
+    map_pending_result, map_resume_result, map_skills_result, map_spawn_result, map_status_result,
+    map_stream_event, map_turn_result,
 };
 use crate::{ServerConfig, wire};
 
@@ -75,6 +76,8 @@ pub(crate) enum Command {
     },
     /// List the host skill catalog: `muse_skills` for one session.
     ListSkills { session: SessionId },
+    /// Fetch the session's stored history: `muse_raw` with `session/read`.
+    LoadHistory { session: SessionId },
     /// Fetch pending approvals/questions: `muse_pending`.
     FetchPending,
     /// Decide a pending approval: `muse_decide` as `actor: "user"`.
@@ -117,6 +120,7 @@ enum Pending {
     Goal(SessionId),
     Models,
     Skills(SessionId),
+    History(SessionId),
     Fetch,
     Decide {
         session: SessionId,
@@ -144,6 +148,7 @@ fn failed_command(pending: &Pending) -> Option<FailedCommand> {
         Pending::Goal(session) => Some(FailedCommand::Goal(session.clone())),
         Pending::Models => Some(FailedCommand::Models),
         Pending::Skills(session) => Some(FailedCommand::Skills(session.clone())),
+        Pending::History(session) => Some(FailedCommand::History(session.clone())),
         Pending::Fetch => Some(FailedCommand::PendingFetch),
         Pending::Decide {
             session,
@@ -364,6 +369,15 @@ impl Worker {
         self.send_line(&wire::skills_call(id, session.as_str()))
     }
 
+    /// Issue a `session/read` round trip through `muse_raw` with a
+    /// fresh id.
+    fn send_history_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::History(session.clone()));
+        self.send_line(&wire::history_call(id, session.as_str()))
+    }
+
     /// Handle one stdout line. `Ok(true)` keeps looping, `Ok(false)`
     /// shuts the worker down.
     fn handle_line(&mut self, line: &str) -> bool {
@@ -439,6 +453,7 @@ impl Worker {
             | Pending::Goal(_)
             | Pending::Models
             | Pending::Skills(_)
+            | Pending::History(_)
             | Pending::Fetch
             | Pending::Decide { .. }
             | Pending::Answer { .. } => self.handle_command_reply(&pending, message),
@@ -485,8 +500,8 @@ impl Worker {
     }
 
     /// Handle the reply to a `muse_spawn`, `muse_turn`, `muse_steer`,
-    /// `muse_cancel`, `muse_raw` (compact, goal), `muse_models`, or
-    /// resume call.
+    /// `muse_cancel`, `muse_raw` (compact, goal, history),
+    /// `muse_models`, or resume call.
     ///
     /// The connection stays up: every outcome is a value the shell
     /// renders, mirroring [`Worker::handle_status_reply`]. Steer and
@@ -508,6 +523,9 @@ impl Worker {
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         let event = match pending {
+            // History carries partial-success diagnostics alongside
+            // the loaded event, so it folds in its own reply handler.
+            Pending::History(session) => return self.handle_history_reply(session, message),
             Pending::Spawn => match map_spawn_result(&result) {
                 Ok((session, turn)) => EngineEvent::SessionSpawned { session, turn },
                 Err(message) => EngineEvent::CommandFailed { command, message },
@@ -618,6 +636,39 @@ impl Worker {
             Pending::Initialize | Pending::ListSessions => return true,
         };
         self.emit(event)
+    }
+
+    /// Handle the reply to a `session/read` round trip. The
+    /// connection stays up: failures arrive as
+    /// `CommandFailed(History)` for the shell's transcript. Partial
+    /// success rides as values first (one diagnostic per
+    /// degradation, mirroring [`Worker::handle_status_reply`]), then
+    /// the loaded event the shell seeds from.
+    fn handle_history_reply(&mut self, session: &SessionId, message: &Value) -> bool {
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        match map_history_result(&result) {
+            Ok(page) => {
+                for diagnostic in page.diagnostics {
+                    if !self.emit(EngineEvent::Diagnostic(diagnostic)) {
+                        return false;
+                    }
+                }
+                if let Some(reason) = page.none_reason
+                    && let Some(diagnostic) = history_truncation_diagnostic(&reason)
+                    && !self.emit(EngineEvent::Diagnostic(diagnostic))
+                {
+                    return false;
+                }
+                self.emit(EngineEvent::HistoryLoaded {
+                    session: session.clone(),
+                    items: page.items,
+                })
+            }
+            Err(message) => self.emit(EngineEvent::CommandFailed {
+                command: FailedCommand::History(session.clone()),
+                message,
+            }),
+        }
     }
 
     /// Handle the reply to a `muse_status` call. The connection stays up.
@@ -918,6 +969,19 @@ pub(crate) fn run(
                         message: not_connected_message(),
                     })
                 } else if let Err(err) = worker.send_skills_call(&session) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::LoadHistory { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::History(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_history_call(&session) {
                     let _ = worker.fail(err);
                     false
                 } else {

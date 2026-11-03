@@ -296,6 +296,22 @@ pub(crate) fn goal_call(id: u64, session_id: &str, objective: &str) -> String {
     )
 }
 
+/// A `tools/call` request reading `session_id`'s stored history
+/// through `muse_raw`.
+///
+/// The host method is `session/read` with `sessionId` and
+/// `excludeItems: false` (a read, so no `commandId`). The result
+/// carries the `history` object (`mode`, `items` or `snapshot`, and
+/// an optional `noneReason`) the mapper folds into seed items.
+pub(crate) fn history_call(id: u64, session_id: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "session/read",
+        json!({"sessionId": session_id, "excludeItems": false}),
+    )
+}
+
 /// A `tools/call` request invoking `muse_cancel` with the given numeric id.
 ///
 /// Argument names follow the server's `muse_cancel` input schema:
@@ -817,6 +833,26 @@ mod tests {
             .and_then(Value::as_str)
             .expect("commandId present");
         assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn history_call_sends_session_read_without_command_id() {
+        let value: Value = serde_json::from_str(&history_call(8, "sess-1")).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_raw")));
+        assert_eq!(
+            value.pointer("/params/arguments/session_id"),
+            Some(&json!("sess-1"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("session/read"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert_eq!(params.get("excludeItems"), Some(&json!(false)));
+        assert!(params.get("commandId").is_none());
     }
 
     #[test]
