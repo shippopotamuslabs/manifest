@@ -69,6 +69,16 @@ impl State {
         self.has_text = false;
     }
 
+    /// Restores a failed send's prompt into the draft: the inverse of
+    /// [`State::clear`], recomputing the derived values from the text
+    /// while preserving the App-owned
+    /// [`send_enabled`](State::send_enabled) gate.
+    pub fn restore(&mut self, text: String) {
+        self.content = text_editor::Content::with_text(&text);
+        self.has_text = !self.content.text().is_empty();
+        self.visible_lines = self.content.line_count().clamp(1, COMPOSER_MAX_LINES);
+    }
+
     /// Folds a message into the composer state. Editing actions apply
     /// to the content, then the derived values are recomputed and
     /// stored; the button presses are no-ops here because the App
@@ -205,6 +215,23 @@ mod tests {
         assert_eq!(got.content.text(), "");
         assert!(!got.has_text);
         assert_eq!(got.visible_lines, 1);
+    }
+
+    #[test]
+    fn restore_sets_text_and_derived_state_preserving_send_enabled() {
+        let mut got = State::new();
+        got.send_enabled = false;
+        got.restore(String::from("hello\nworld"));
+        assert_eq!(got.content.text(), "hello\nworld");
+        assert!(got.has_text);
+        assert_eq!(got.visible_lines, 2);
+        assert!(!got.send_enabled);
+        got.send_enabled = true;
+        got.restore(String::new());
+        assert_eq!(got.content.text(), "");
+        assert!(!got.has_text);
+        assert_eq!(got.visible_lines, 1);
+        assert!(got.send_enabled);
     }
 
     #[test]

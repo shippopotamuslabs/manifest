@@ -16,13 +16,19 @@ use app::App;
 use theme::manifest_theme;
 
 /// Production boot: connects to the real server through the engine
-/// subscription, then asks the runtime for the latest window id so the
-/// title-bar controls know which window they drive.
+/// subscription, loads the persisted project registry, then asks the
+/// runtime for the latest window id so the title-bar controls know
+/// which window they drive.
 fn boot() -> (App, iced::Task<app::Message>) {
-    (
-        App::live(manifest_mcp::ServerConfig::from_env()),
+    let app = App::live(
+        manifest_mcp::ServerConfig::from_env(),
+        manifest_store::ProjectStore::from_env(),
+    );
+    let task = iced::Task::batch([
         iced::window::latest().map(app::Message::WindowIdentified),
-    )
+        app.project_load_task(),
+    ]);
+    (app, task)
 }
 
 fn main() -> iced::Result {
