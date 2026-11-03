@@ -10,7 +10,9 @@ use iced::{Element, Length};
 use manifest_domain::TranscriptItem;
 
 use crate::kit;
-use crate::theme::{FONT_SIZE_BODY, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY, TEXT_TERTIARY};
+use crate::theme::{
+    DANGER, FONT_SIZE_BODY, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY, TEXT_TERTIARY,
+};
 
 /// The text widgets' relative 1.3 line spacing. Confirmed against the
 /// live build in LOGICAL px: a one-line bubble measures ~55 logical px
@@ -22,6 +24,17 @@ const LINE_HEIGHT: f32 = FONT_SIZE_BODY * 1.3;
 /// ~0.45em at `FONT_SIZE_BODY`; tune against the live build if the
 /// sticky timing ever drifts from the real text.
 const ESTIMATED_CHAR_WIDTH: f32 = FONT_SIZE_BODY * 0.46;
+
+/// Id of the transcript scrollable, so error appends can snap it to
+/// the end via [`scroll_to_end`].
+const SCROLL_ID: &str = "manifest-transcript";
+
+/// Snaps the transcript scrollable to its end so a freshly appended
+/// error is visible below the fold. Callers map the task into their
+/// own message type.
+pub fn scroll_to_end() -> iced::Task<Message> {
+    iced::widget::operation::snap_to_end(SCROLL_ID)
+}
 
 /// Transcript state: the visible items plus scroll-derived sticky data.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +64,22 @@ pub enum Message {
 }
 
 impl State {
+    /// Appends an error item, unless the last item is already the
+    /// same error (a flapping refresh must not stack duplicates).
+    /// Returns true when an item was appended, false when deduped.
+    pub fn push_error(&mut self, text: String) -> bool {
+        let duplicate = matches!(
+            self.items.last(),
+            Some(TranscriptItem::ErrorNote { text: last }) if last == &text
+        );
+        if !duplicate {
+            self.items.push(TranscriptItem::ErrorNote { text });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Builds transcript state from domain items. Scroll-derived fields
     /// start at zero / none, matching `Default`.
     pub fn from_items(items: Vec<TranscriptItem>) -> Self {
@@ -161,6 +190,7 @@ impl State {
             list = list.push(render_item(item));
         }
         let base: Element<'_, Message> = iced::widget::scrollable(list)
+            .id(SCROLL_ID)
             .width(Length::Fill)
             .height(Length::Fill)
             .on_scroll(Message::Scrolled)
@@ -233,6 +263,7 @@ fn item_height(item: &TranscriptItem, content_width: f32) -> f32 {
         TranscriptItem::UserTurn { text } => (text.as_str(), true),
         TranscriptItem::AssistantTurn { text } => (text.as_str(), false),
         TranscriptItem::ToolNote { text } => (text.as_str(), false),
+        TranscriptItem::ErrorNote { text } => (text.as_str(), false),
     };
     let text_width = if is_user {
         content_width - 2.0 * SPACE_XL
@@ -293,6 +324,13 @@ fn render_item<'a>(item: &'a TranscriptItem) -> Element<'a, Message> {
             iced::widget::text(text.as_str())
                 .size(FONT_SIZE_BODY)
                 .color(TEXT_TERTIARY),
+        )
+        .width(Length::Fill)
+        .into(),
+        TranscriptItem::ErrorNote { text } => iced::widget::container(
+            iced::widget::text(text.as_str())
+                .size(FONT_SIZE_BODY)
+                .color(DANGER),
         )
         .width(Length::Fill)
         .into(),
@@ -468,5 +506,21 @@ mod tests {
         assert_eq!(state.sticky, None);
         assert_eq!(state.sticky_push, 0.0);
         assert_eq!(state.sticky_height, 0.0);
+    }
+
+    #[test]
+    fn push_error_dedupes_consecutive_duplicates() {
+        let mut state = State::from_items(vec![]);
+        assert!(state.push_error(String::from("boom")));
+        assert!(!state.push_error(String::from("boom")));
+        assert_eq!(state.items.len(), 1);
+        assert!(state.push_error(String::from("other")));
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(
+            state.items.last(),
+            Some(&TranscriptItem::ErrorNote {
+                text: String::from("other"),
+            })
+        );
     }
 }

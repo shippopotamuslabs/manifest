@@ -49,6 +49,13 @@ repo, pinned in this repo as a submodule at `contracts/gospel/`.
 Read the gospels there; bump the pin deliberately, and never edit
 the submodule's contents from this repo.
 
+The muse-code-mcp server is bundled the same way: pinned as a
+submodule at `bundled/muse-code-mcp`, installed by
+`scripts/install.sh` so the release binary needs no separate
+server on `PATH`. Server changes land in that repo under MFST
+S-tickets; bump the pin deliberately, and never edit its contents
+from this repo.
+
 - Architecture follows
   `contracts/gospel/RUST-ARCHITECTURE-GOSPEL.md`: dependencies
   point inward, framework types stay at the edges, and the crate
