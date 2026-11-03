@@ -11,10 +11,10 @@ mod engine;
 mod fixture;
 
 pub use engine::{
-    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionEngine, StreamEvent,
-    StreamItem, TurnId, UsageKind,
+    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionEngine, SpawnChoices,
+    StreamEvent, StreamItem, TurnId, UsageKind, WorktreeChoice,
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,
-    TranscriptItem, fixture,
+    TranscriptItem, assign_projects, fixture, seed_projects, workspace_name,
 };

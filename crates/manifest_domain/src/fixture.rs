@@ -31,6 +31,8 @@ pub enum SessionStatus {
     Running,
     /// The agent paused for the user to approve or answer.
     AwaitingApproval,
+    /// The server has the record but no live host; resumes on next use.
+    Orphaned,
 }
 
 /// Opaque handle for one project.
@@ -43,6 +45,21 @@ impl ProjectId {
     /// Build a project id from its stored handle.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    /// Build the project handle for a workspace.
+    ///
+    /// The single owner of the `workspace:` handle format: every
+    /// workspace-derived project id is built here.
+    pub fn for_workspace(workspace: &str) -> Self {
+        Self(format!("workspace:{workspace}"))
+    }
+
+    /// Borrow the stored handle for comparisons.
+    ///
+    /// Callers still compare and match by the whole handle.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -69,6 +86,8 @@ pub struct SessionSummary {
     pub status: SessionStatus,
     /// Owning project, if the session belongs to one.
     pub project: Option<ProjectId>,
+    /// Folder the session runs in as the server reported it; empty in the fixture.
+    pub workspace: String,
     /// Precomputed relative-time label for the row's right edge, e.g. '20h'.
     pub relative_time: String,
     /// Cumulative stream delta events whose send failed for this session (0 in the fixture; live values come from muse_status).
@@ -136,6 +155,7 @@ pub fn fixture() -> Fixture {
                 title: String::from("Fix checkout sync retries"),
                 status: SessionStatus::Running,
                 project: Some(ProjectId::new("project-checkout-api")),
+                workspace: String::new(),
                 relative_time: String::from("20h"),
                 stream_dropped_deltas: 0,
             },
@@ -144,6 +164,7 @@ pub fn fixture() -> Fixture {
                 title: String::from("Clean up old migration scripts"),
                 status: SessionStatus::Idle,
                 project: Some(ProjectId::new("project-checkout-api")),
+                workspace: String::new(),
                 relative_time: String::from("1d"),
                 stream_dropped_deltas: 0,
             },
@@ -152,6 +173,7 @@ pub fn fixture() -> Fixture {
                 title: String::from("Review new settings screen copy"),
                 status: SessionStatus::AwaitingApproval,
                 project: Some(ProjectId::new("project-storefront-web")),
+                workspace: String::new(),
                 relative_time: String::from("2d"),
                 stream_dropped_deltas: 0,
             },
@@ -160,6 +182,7 @@ pub fn fixture() -> Fixture {
                 title: String::from("Audit empty-cart states"),
                 status: SessionStatus::Idle,
                 project: Some(ProjectId::new("project-storefront-web")),
+                workspace: String::new(),
                 relative_time: String::from("4d"),
                 stream_dropped_deltas: 0,
             },
@@ -168,6 +191,7 @@ pub fn fixture() -> Fixture {
                 title: String::from("Cron expression help"),
                 status: SessionStatus::Idle,
                 project: None,
+                workspace: String::new(),
                 relative_time: String::from("6d"),
                 stream_dropped_deltas: 0,
             },
@@ -270,6 +294,92 @@ pub fn fixture() -> Fixture {
     }
 }
 
+/// Short human name for a workspace: its last non-empty `/`-segment.
+///
+/// Trailing slashes are ignored; empty or all-slash input falls back
+/// to the input unchanged.
+pub fn workspace_name(workspace: &str) -> &str {
+    workspace
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(workspace)
+}
+
+/// Trim trailing slashes for workspace comparison.
+fn trimmed_workspace(workspace: &str) -> &str {
+    workspace.trim_end_matches('/')
+}
+
+/// Group sessions onto projects by workspace.
+///
+/// For each session with a non-empty workspace, `project` becomes the
+/// listed project whose workspace matches (exact strings compared
+/// after trimming trailing `/`; a project with `None` or empty
+/// workspace never matches), else `None`, and the title recomposes as
+/// `{name} · {short}` where `name` is the matched project name else
+/// [`workspace_name`] of the session workspace and `short` is the
+/// first 8 chars (not bytes) of the session id. Sessions with an
+/// empty workspace are returned untouched. Input session order is
+/// preserved.
+pub fn assign_projects(
+    projects: &[ProjectSummary],
+    sessions: Vec<SessionSummary>,
+) -> Vec<SessionSummary> {
+    sessions
+        .into_iter()
+        .map(|mut session| {
+            if session.workspace.is_empty() {
+                return session;
+            }
+            let matched = projects.iter().find(|project| match &project.workspace {
+                Some(workspace) if !workspace.is_empty() => {
+                    trimmed_workspace(workspace) == trimmed_workspace(&session.workspace)
+                }
+                _ => false,
+            });
+            let short: String = session.id.as_str().chars().take(8).collect();
+            match matched {
+                Some(project) => {
+                    session.title = format!("{} · {short}", project.name);
+                    session.project = Some(project.id.clone());
+                }
+                None => {
+                    session.title = format!("{} · {short}", workspace_name(&session.workspace));
+                    session.project = None;
+                }
+            }
+            session
+        })
+        .collect()
+}
+
+/// Derive one project per distinct session workspace, in first-seen order.
+///
+/// Workspaces compare after trimming trailing `/` (as in
+/// [`assign_projects`]), so `/w` and `/w/` seed one project; the
+/// project keeps the first-seen workspace string verbatim for its
+/// id, [`workspace_name`] name, and workspace.
+/// Sessions with empty workspaces contribute no project.
+pub fn seed_projects(sessions: &[SessionSummary]) -> Vec<ProjectSummary> {
+    let mut seen: Vec<&str> = Vec::new();
+    for session in sessions {
+        if session.workspace.is_empty() {
+            continue;
+        }
+        let trimmed = trimmed_workspace(&session.workspace);
+        if !seen.iter().any(|prior| trimmed_workspace(prior) == trimmed) {
+            seen.push(session.workspace.as_str());
+        }
+    }
+    seen.into_iter()
+        .map(|workspace| ProjectSummary {
+            id: ProjectId::for_workspace(workspace),
+            name: workspace_name(workspace).to_string(),
+            workspace: Some(workspace.to_string()),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +425,140 @@ mod tests {
         assert!(got.todos.len() >= 3);
         assert!(got.todos.iter().any(|t| t.done));
         assert!(got.todos.iter().any(|t| !t.done));
+    }
+
+    #[test]
+    fn workspace_name_takes_last_non_empty_segment() {
+        assert_eq!(workspace_name("/home/dev/beta"), "beta");
+        assert_eq!(workspace_name("/home/dev/beta/"), "beta");
+        assert_eq!(workspace_name("name"), "name");
+        assert_eq!(workspace_name(""), "");
+        assert_eq!(workspace_name("/"), "/");
+    }
+
+    #[test]
+    fn project_id_for_workspace_owns_handle_format() {
+        assert_eq!(
+            ProjectId::for_workspace("/home/dev/beta"),
+            ProjectId::new("workspace:/home/dev/beta")
+        );
+        assert_eq!(
+            ProjectId::for_workspace("/home/dev/beta").as_str(),
+            "workspace:/home/dev/beta"
+        );
+    }
+
+    fn helper_session(id: &str, workspace: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
+            title: String::from("stale"),
+            status: SessionStatus::Idle,
+            project: None,
+            workspace: String::from(workspace),
+            relative_time: String::from("now"),
+            stream_dropped_deltas: 0,
+        }
+    }
+
+    fn helper_project(name: &str, workspace: Option<&str>) -> ProjectSummary {
+        ProjectSummary {
+            id: ProjectId::new(format!("project-{name}")),
+            name: String::from(name),
+            workspace: workspace.map(String::from),
+        }
+    }
+
+    #[test]
+    fn assign_matches_trims_slashes_and_recomposes_titles() {
+        let projects = vec![
+            helper_project("beta", Some("/home/dev/beta/")),
+            helper_project("mystery", None),
+            helper_project("empty", Some("")),
+        ];
+        let got = assign_projects(
+            &projects,
+            vec![
+                helper_session("sess-run-1", "/home/dev/beta"),
+                helper_session("sess-fresh-2", "/home/dev/gamma"),
+                helper_session("ééééééééXYZ", "/w/long-name"),
+                helper_session("untouched", ""),
+            ],
+        );
+        assert_eq!(
+            got[0].project,
+            Some(ProjectId::new("project-beta")),
+            "trailing-slash project workspace still matches"
+        );
+        assert_eq!(got[0].title, "beta · sess-run");
+        assert_eq!(got[1].project, None);
+        assert_eq!(got[1].title, "gamma · sess-fre");
+        assert_eq!(got[2].title, "long-name · éééééééé");
+        // Empty workspaces pass through untouched.
+        assert_eq!(got[3].title, "stale");
+        assert_eq!(got[3].project, None);
+        // Input order preserved.
+        let ids: Vec<_> = got.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["sess-run-1", "sess-fresh-2", "ééééééééXYZ", "untouched"]
+        );
+    }
+
+    #[test]
+    fn seed_projects_dedups_first_seen_in_order() {
+        let sessions = vec![
+            helper_session("s1", "/home/dev/beta"),
+            helper_session("s2", "/home/dev/alpha"),
+            helper_session("s3", "/home/dev/beta"),
+            helper_session("s4", ""),
+        ];
+        let got = seed_projects(&sessions);
+        assert_eq!(
+            got.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            vec![&String::from("beta"), &String::from("alpha")]
+        );
+        assert_eq!(got[0].id, ProjectId::for_workspace("/home/dev/beta"));
+        assert_eq!(got[0].workspace, Some(String::from("/home/dev/beta")));
+    }
+
+    #[test]
+    fn seed_projects_dedups_trailing_slash_variants() {
+        let sessions = vec![
+            helper_session("s1", "/w"),
+            helper_session("s2", "/w/"),
+            helper_session("s3", "/w//"),
+        ];
+        let got = seed_projects(&sessions);
+        assert_eq!(got.len(), 1, "trailing slashes seed one project");
+        assert_eq!(got[0].workspace, Some(String::from("/w")));
+        assert_eq!(got[0].id, ProjectId::for_workspace("/w"));
+        assert_eq!(got[0].name, "w");
+        // assign_projects still groups the slashed session under it.
+        let assigned = assign_projects(&got, sessions);
+        assert!(
+            assigned
+                .iter()
+                .all(|s| s.project == Some(ProjectId::for_workspace("/w")))
+        );
+    }
+
+    #[test]
+    fn seed_then_assign_round_trips_grouping() {
+        let sessions = vec![
+            helper_session("sess-run-1", "/home/dev/beta"),
+            helper_session("sess-idle-2", "/home/dev/alpha"),
+        ];
+        let projects = seed_projects(&sessions);
+        let got = assign_projects(&projects, sessions);
+        assert_eq!(
+            got[0].project,
+            Some(ProjectId::for_workspace("/home/dev/beta"))
+        );
+        assert_eq!(got[0].title, "beta · sess-run");
+        assert_eq!(
+            got[1].project,
+            Some(ProjectId::for_workspace("/home/dev/alpha"))
+        );
+        assert_eq!(got[1].title, "alpha · sess-idl");
     }
 }

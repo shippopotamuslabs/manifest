@@ -5,7 +5,7 @@
 //! engines later). These types carry everything an engine reports to the
 //! presentation layer and perform no I/O.
 
-use crate::fixture::{ProjectSummary, SessionId, SessionSummary};
+use crate::fixture::{SessionId, SessionSummary};
 
 /// Opaque handle for one agent turn.
 ///
@@ -261,15 +261,41 @@ pub enum StreamEvent {
     },
 }
 
+/// How to place a spawned session's working directory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WorktreeChoice {
+    /// Spawn directly in the given workspace.
+    #[default]
+    Off,
+    /// Create a worktree for the session, optionally from a base.
+    Create {
+        /// Base to create the worktree from, when set.
+        base: Option<String>,
+    },
+    /// Use an existing worktree at this path.
+    Existing {
+        /// Path of the existing worktree.
+        path: String,
+    },
+}
+
+/// Extra choices for a session spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpawnChoices {
+    /// How to place the session's working directory.
+    pub worktree: WorktreeChoice,
+}
+
 /// Everything an engine reports to the presentation layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
     /// The engine connection state changed.
     ConnectionChanged(Connection),
     /// A session-list refresh succeeded.
+    ///
+    /// Grouping onto projects is the shell's job via
+    /// [`crate::assign_projects`].
     SessionsLoaded {
-        /// Projects for the left panel, in display order.
-        projects: Vec<ProjectSummary>,
         /// Sessions for the left panel, in display order.
         sessions: Vec<SessionSummary>,
     },
@@ -290,6 +316,11 @@ pub enum EngineEvent {
         session: SessionId,
         /// Accepted turn, when the server returned one.
         turn: Option<TurnId>,
+    },
+    /// A session resume succeeded; its stream refreshes next.
+    SessionResumed {
+        /// Resumed session.
+        session: SessionId,
     },
     /// A spawn or send-turn command failed while the connection stays up.
     ///
@@ -321,7 +352,7 @@ pub trait SessionEngine: Send + Sync {
     /// [`EngineEvent::CommandFailed`]. Commands submitted while
     /// disconnected fail fast with [`EngineEvent::CommandFailed`]
     /// rather than queueing.
-    fn spawn_session(&self, workspace: String, prompt: String);
+    fn spawn_session(&self, workspace: String, prompt: String, choices: SpawnChoices);
     /// Send a follow-up turn to `session`.
     ///
     /// Non-blocking; success arrives as [`EngineEvent::TurnAccepted`],
@@ -329,6 +360,14 @@ pub trait SessionEngine: Send + Sync {
     /// while disconnected fail fast with [`EngineEvent::CommandFailed`]
     /// rather than queueing.
     fn send_turn(&self, session: SessionId, prompt: String);
+    /// Resume `session` on the server.
+    ///
+    /// Non-blocking; success arrives as
+    /// [`EngineEvent::SessionResumed`], failure as
+    /// [`EngineEvent::CommandFailed`]. Commands submitted while
+    /// disconnected fail fast with [`EngineEvent::CommandFailed`]
+    /// rather than queueing.
+    fn resume_session(&self, session: SessionId);
 }
 
 #[cfg(test)]
