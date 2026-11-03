@@ -90,6 +90,11 @@ pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 pub const COMPOSER_MAX_LINES: usize = 5;
 pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
+// Context ring geometry: the clickable usage ring at the sub-bar's
+// right end. A fixed square with a thin track circle plus a progress
+// arc; kit reads both tokens, call sites name no value.
+pub const CONTEXT_RING_SIZE: f32 = 18.0;
+pub const CONTEXT_RING_STROKE: f32 = 2.0;
 // Composer input text padding: triple the bar's tight step, so the text
 // breathes inside the bar. Kit reads this token; call sites name no value.
 pub const COMPOSER_INPUT_PADDING: f32 = 12.0;

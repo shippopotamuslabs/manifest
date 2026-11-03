@@ -12,7 +12,7 @@ path = "src/main.rs"
 manifest_domain = { path = "../manifest_domain" }
 manifest_mcp = { path = "../manifest_mcp" }
 manifest_store = { path = "../manifest_store" }
-iced = { version = "0.14", features = ["markdown"] }
+iced = { version = "0.14", features = ["markdown", "canvas"] }
 # Direct edge to the already-pinned transitive iced_core (same 0.14
 # line the `iced` facade hides behind private modules): the slash
 # highlighter names its `text::highlighter::Format`, which the facade
