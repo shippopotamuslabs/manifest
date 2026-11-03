@@ -9,16 +9,17 @@ use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length, Task};
 use manifest_domain::{
-    Connection, EngineEvent, Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus,
-    SessionSummary, SpawnChoices, StreamEvent, TodoItem, WorktreeChoice,
+    Connection, EffortChoice, EngineEvent, Fixture, ModelChoice, PermissionMode, ProjectId,
+    ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent, TodoItem,
+    TurnId, UsageSnapshot, WorktreeChoice,
 };
 
 use crate::engine;
 use crate::kit;
 use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
-    PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
-    WINDOW_RESIZE_HANDLE,
+    DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_SMALL, FONT_SIZE_TITLE, MODEL_MENU_BOTTOM_OFFSET,
+    PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN, SPACE_M, SPACE_S, TEXT_PRIMARY,
+    TEXT_SECONDARY, TEXT_TERTIARY, WINDOW_RESIZE_HANDLE,
 };
 use crate::{composer, sessions, transcript};
 
@@ -162,12 +163,19 @@ pub struct NewSessionDraft {
     pub worktree_base: String,
     /// Folder for existing mode.
     pub worktree_path: String,
+    /// The model the spawned session runs on.
+    pub model: ModelChoice,
+    /// The reasoning effort the spawned session runs with.
+    pub effort: EffortChoice,
+    /// The permission posture the spawned session runs with.
+    pub permission: PermissionMode,
 }
 
 impl NewSessionDraft {
     /// Maps the draft's worktree fields to engine spawn choices: `Off`
     /// spawns in place, `Create` trims the base (`None` when blank),
-    /// `Existing` carries the trimmed path.
+    /// `Existing` carries the trimmed path. The composer picker state
+    /// rides along so the first send spawns with the shown choices.
     pub fn choices(&self) -> SpawnChoices {
         let worktree = match self.worktree_mode {
             DraftWorktreeMode::Off => WorktreeChoice::Off,
@@ -185,7 +193,12 @@ impl NewSessionDraft {
                 path: self.worktree_path.trim().to_string(),
             },
         };
-        SpawnChoices { worktree }
+        SpawnChoices {
+            worktree,
+            model: self.model.clone(),
+            effort: self.effort,
+            permission: self.permission,
+        }
     }
 }
 
@@ -217,6 +230,12 @@ pub struct App {
     pub visible_session: Option<SessionId>,
     /// Sessions with a turn in flight.
     pub running: HashSet<SessionId>,
+    /// The running turn per session, when the server named it. Steer
+    /// and Stop address this turn; the entry clears with the turn.
+    pub running_turns: HashMap<SessionId, TurnId>,
+    /// Latest usage snapshot per session; the composer's meter reads
+    /// the visible session's entry.
+    pub usage: HashMap<SessionId, UsageSnapshot>,
     /// A spawned session awaiting its first list load to select it.
     pub select_on_load: Option<SessionId>,
     /// A spawn command is in flight and the visible transcript holds
@@ -237,6 +256,10 @@ pub struct App {
     pub new_session: Option<NewSessionDraft>,
     /// Draft input cluster.
     pub composer: composer::State,
+    /// A model-catalog request is in flight. Set on each request,
+    /// cleared on `ModelsLoaded` (or on the `CommandFailed` that marks
+    /// the catalog failed, or on disconnect).
+    pub models_pending: bool,
     /// Checklist shown in the drawer, from the fixture.
     pub todos: Vec<TodoItem>,
     /// Whether the TODO drawer is a peek strip or open.
@@ -301,12 +324,15 @@ impl App {
             transcripts: HashMap::new(),
             visible_session: None,
             running: HashSet::new(),
+            running_turns: HashMap::new(),
+            usage: HashMap::new(),
             select_on_load: None,
             awaiting_spawn: false,
             pending_spawn: None,
             resuming: HashSet::new(),
             new_session: None,
             composer: composer::State::new(),
+            models_pending: false,
             todos: fixture.todos,
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
@@ -387,6 +413,7 @@ impl App {
                 self.transcript = transcript::State::default();
             }
             self.visible_session = None;
+            self.sync_composer_usage();
             return;
         }
         if self.visible_session.as_ref() == Some(&selected) {
@@ -397,6 +424,7 @@ impl App {
                 .insert(owner, std::mem::take(&mut self.transcript));
         }
         self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
+        self.sync_composer_usage();
     }
 
     /// Enters new-session draft mode for the named project: parks the
@@ -427,13 +455,35 @@ impl App {
                 .insert(owner, std::mem::take(&mut self.transcript));
         }
         self.transcript = transcript::State::default();
+        // The draft spawns with the shown picker state.
+        let composer = &self.composer;
         self.new_session = Some(NewSessionDraft {
             workspace,
             title,
             worktree_mode: DraftWorktreeMode::Off,
             worktree_base: String::new(),
             worktree_path: String::new(),
+            model: composer.model.clone(),
+            effort: composer.effort,
+            permission: composer.permission,
         });
+        // The draft names the host the catalog lists from: request it
+        // now while the catalog is still unresolved and no request is
+        // in flight. A bare request would fail while no host is live,
+        // so the shell never sends one.
+        if !matches!(self.composer.catalog, composer::ModelCatalog::Ready(_))
+            && !self.models_pending
+            && self.connection == Connection::Connected
+        {
+            let workspace = self
+                .new_session
+                .as_ref()
+                .map(|draft| draft.workspace.clone());
+            if let (Some(workspace), Some(engine)) = (workspace, &self.engine) {
+                engine.list_models(Some(workspace), None);
+                self.models_pending = true;
+            }
+        }
     }
 
     /// Whether the id names a session in the current list.
@@ -457,22 +507,67 @@ impl App {
     }
 
     /// Recomputes whether the composer send button is live. The
-    /// single writer of [`composer::State::send_enabled`] outside
+    /// single writer of [`composer::State::send_enabled`] and
+    /// [`composer::State::running_visible`] outside
     /// [`composer::State::new`]: send needs a server config, a live
-    /// connection with a handle, no spawn in flight, and no turn or
-    /// resume in flight on the listed selection (when one is listed).
+    /// connection with a handle, no spawn in flight, and no resume in
+    /// flight on the listed selection (when one is listed). A running
+    /// selection no longer gates the button: Send becomes Steer there,
+    /// and the Stop control appears.
     fn refresh_send_gate(&mut self) {
-        let selected_running = self.sessions.selected_summary().is_some_and(|summary| {
-            self.running.contains(&summary.id) || self.resuming.contains(&summary.id)
-        });
-        // A draft is a spawn, not a follow-up: the selected session's
-        // running state does not gate it.
-        let gated_by_selection = selected_running && self.new_session.is_none();
+        let selected = self
+            .sessions
+            .selected_summary()
+            .map(|summary| summary.id.clone());
+        let running_visible = self.new_session.is_none()
+            && selected
+                .as_ref()
+                .is_some_and(|id| self.running.contains(id));
+        let gated_by_resume = !running_visible
+            && selected
+                .as_ref()
+                .is_some_and(|id| self.resuming.contains(id));
+        self.composer.running_visible = running_visible;
         self.composer.send_enabled = self.engine_config.is_some()
             && self.connection == Connection::Connected
             && self.engine.is_some()
             && !self.awaiting_spawn
-            && !gated_by_selection;
+            && !gated_by_resume;
+    }
+
+    /// Requests the model catalog for the selected session when the
+    /// catalog is still loading and no request is in flight. Called on
+    /// session-list loads: cold start has no host until a session (or a
+    /// draft workspace) names one, so a bare request would fail. The
+    /// single writer of [`App::models_pending`] beside the draft entry
+    /// point and the event arms.
+    fn request_models_for_selection(&mut self) {
+        if !matches!(self.composer.catalog, composer::ModelCatalog::Loading)
+            || self.models_pending
+            || self.connection != Connection::Connected
+        {
+            return;
+        }
+        let selected = self
+            .sessions
+            .selected_summary()
+            .map(|summary| summary.id.clone());
+        if let (Some(session), Some(engine)) = (selected, &self.engine) {
+            engine.list_models(None, Some(session));
+            self.models_pending = true;
+        }
+    }
+
+    /// Points the composer's usage meter at the visible session's
+    /// snapshot. Called after usage events and transcript syncs; the
+    /// composer stores the strings, so the view formats nothing.
+    fn sync_composer_usage(&mut self) {
+        let snapshot = self
+            .visible_session
+            .as_ref()
+            .and_then(|session| self.usage.get(session))
+            .cloned();
+        self.composer.set_usage(snapshot);
     }
 
     /// Sessions in display order: grouped rows then unprojected, cloned.
@@ -732,18 +827,21 @@ impl App {
     /// nothing; while not connected the visible transcript gains a
     /// friendly note and the draft stays; a new-session draft spawns
     /// into its project workspace; a listed selection sends a
-    /// follow-up turn unless one is already in flight; otherwise the
-    /// draft spawns a session in the process working directory.
+    /// follow-up turn unless one is already in flight (steering the
+    /// running turn there instead); otherwise the draft spawns a
+    /// session in the process working directory with the shown picker
+    /// state. Every send carries the composed prompt: the draft text
+    /// with attached path refs appended as ref lines.
     /// Sends echo the prompt optimistically, clear the draft, and
     /// snap the transcript to the end.
     fn send_from_composer(&mut self) -> Task<Message> {
         if self.engine_config.is_none() {
             return Task::none();
         }
-        let text = self.composer.content.text();
-        if text.trim().is_empty() {
+        if self.composer.content.text().trim().is_empty() {
             return Task::none();
         }
+        let prompt = self.composer.composed_prompt();
         if self.connection != Connection::Connected || self.engine.is_none() {
             let appended = self.transcript.push_error(not_connected_message());
             return scroll_transcript_to_end(appended);
@@ -762,17 +860,28 @@ impl App {
             }
             let draft = self.new_session.take().expect("draft checked above");
             let workspace = draft.workspace.clone();
-            return self.spawn_session(Some(draft), workspace, text, choices);
+            return self.spawn_session(Some(draft), workspace, prompt, choices);
         }
         if let Some(summary) = self.sessions.selected_summary() {
             let session = summary.id.clone();
             if self.running.contains(&session) {
-                return Task::none();
+                // Steer: the visible session is mid-turn, so the draft
+                // joins it instead of starting a new one.
+                let Some(turn) = self.running_turns.get(&session).cloned() else {
+                    let appended = self.transcript.push_error(no_running_turn_message());
+                    return scroll_transcript_to_end(appended);
+                };
+                if let Some(engine) = self.engine.clone() {
+                    engine.steer_session(session, prompt.clone(), turn);
+                }
+                self.transcript.push_user(prompt);
+                self.composer.clear();
+                return transcript::scroll_to_end().map(Message::Transcript);
             }
             if let Some(engine) = self.engine.clone() {
-                engine.send_turn(session.clone(), text.clone());
+                engine.send_turn(session.clone(), prompt.clone());
             }
-            self.transcript.push_user(text);
+            self.transcript.push_user(prompt);
             self.running.insert(session);
             self.composer.clear();
             return transcript::scroll_to_end().map(Message::Transcript);
@@ -786,17 +895,52 @@ impl App {
                 return scroll_transcript_to_end(appended);
             }
         };
-        self.spawn_session(None, workspace, text, SpawnChoices::default())
+        // No listed selection: spawn in the working directory, but with
+        // the shown picker state, not the server defaults.
+        let choices = SpawnChoices {
+            worktree: WorktreeChoice::Off,
+            model: self.composer.model.clone(),
+            effort: self.composer.effort,
+            permission: self.composer.permission,
+        };
+        self.spawn_session(None, workspace, prompt, choices)
+    }
+
+    /// Stops the running turn of the selected session: cancels it on
+    /// the engine with the tracked turn id. A no-op without a running
+    /// selection; the Stop control only shows while one runs.
+    fn stop_running_turn(&mut self) -> Task<Message> {
+        if self.new_session.is_some() {
+            return Task::none();
+        }
+        let Some(summary) = self.sessions.selected_summary() else {
+            return Task::none();
+        };
+        if !self.running.contains(&summary.id) {
+            return Task::none();
+        }
+        if let Some(engine) = self.engine.clone() {
+            engine.cancel_turn(
+                summary.id.clone(),
+                self.running_turns.get(&summary.id).cloned(),
+            );
+        }
+        Task::none()
     }
 
     /// Folds one stream event into the owning session's transcript:
     /// the visible state when the event names it, else the stored one.
     /// Returns whether the visible transcript gained an entry, so the
-    /// scroll can snap to the end. Deltas never scroll.
+    /// scroll can snap to the end. Deltas never scroll. Turn lifecycles
+    /// track the running turn id; usage reports refresh the meter.
     fn apply_stream_event(&mut self, event: StreamEvent) -> bool {
         match event {
-            StreamEvent::TurnStarted { session, .. } => {
-                self.running.insert(session);
+            StreamEvent::TurnStarted { session, turn, .. } => {
+                self.running.insert(session.clone());
+                if let Some(turn) = turn {
+                    self.running_turns.insert(session, turn);
+                }
+                self.refresh_send_gate();
                 false
             }
             StreamEvent::ItemStarted { session, item, .. } => {
@@ -838,6 +982,8 @@ impl App {
                 ..
             } => {
                 self.running.remove(&session);
+                self.running_turns.remove(&session);
+                self.refresh_send_gate();
                 let mut appended = false;
                 if dropped_deltas > 0 {
                     let message = dropped_deltas_message(dropped_deltas);
@@ -854,8 +1000,21 @@ impl App {
                 }
                 appended
             }
-            // Usage reports stay out of the transcript in this slice.
-            StreamEvent::Usage { .. } => false,
+            StreamEvent::Usage {
+                session,
+                usage_json,
+                ..
+            } => {
+                // The meter reads the parse, never raw JSON: unknown
+                // payloads leave the previous snapshot in place.
+                if let Some(snapshot) = UsageSnapshot::parse(&usage_json) {
+                    self.usage.insert(session.clone(), snapshot);
+                    if self.is_visible(&session) {
+                        self.sync_composer_usage();
+                    }
+                }
+                false
+            }
             StreamEvent::Pending { .. } => {
                 if self.connection == Connection::Connected
                     && let Some(engine) = &self.engine
@@ -963,8 +1122,51 @@ impl App {
                 self.refresh_send_gate();
                 task
             }
+            Message::Composer(composer::Message::StopPressed) => {
+                let task = self.stop_running_turn();
+                self.refresh_send_gate();
+                task
+            }
+            Message::Composer(composer::Message::AttachFilesPressed) => {
+                if self.engine_config.is_some() {
+                    Task::perform(
+                        async {
+                            rfd::AsyncFileDialog::new()
+                                .pick_file()
+                                .await
+                                .map(|handle| handle.path().display().to_string())
+                        },
+                        |picked| Message::Composer(composer::Message::AttachPicked(picked)),
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Composer(composer::Message::AttachPicked(picked)) => {
+                if let Some(path) = picked {
+                    self.composer.insert_attachment(path);
+                } else {
+                    self.composer.attach_popup = composer::AttachPopup::Closed;
+                }
+                self.refresh_send_gate();
+                Task::none()
+            }
             Message::Composer(child) => {
+                // The menus edit the draft's spawn choices while one is
+                // open, so the first send spawns with the shown picks.
+                let syncs_draft = matches!(
+                    child,
+                    composer::Message::PermissionSelected(_)
+                        | composer::Message::ModelSelected(_)
+                        | composer::Message::ModelEditPressed(_)
+                        | composer::Message::EffortSelected(_)
+                );
                 self.composer.update(child);
+                if syncs_draft && let Some(draft) = &mut self.new_session {
+                    draft.model = self.composer.model.clone();
+                    draft.effort = self.composer.effort;
+                    draft.permission = self.composer.permission;
+                }
                 self.refresh_send_gate();
                 Task::none()
             }
@@ -1044,11 +1246,23 @@ impl App {
                             self.connection = next;
                             if self.connection == Connection::Connected {
                                 if let Some(engine) = &self.engine {
+                                    // The catalog request needs a host
+                                    // context, which only a loaded
+                                    // session (or draft workspace)
+                                    // names: it follows the list load,
+                                    // never the bare connection.
                                     engine.list_sessions();
                                 }
                             } else if matches!(self.connection, Connection::Failed(_)) {
                                 self.engine = None;
                                 self.running.clear();
+                                self.running_turns.clear();
+                            }
+                            if self.connection != Connection::Connected {
+                                // An in-flight catalog request dies with
+                                // the connection; the next list load
+                                // re-requests it with fresh context.
+                                self.models_pending = false;
                             }
                         }
                         EngineEvent::SessionsLoaded { sessions } => {
@@ -1080,11 +1294,33 @@ impl App {
                                 self.select_on_load = None;
                             }
                             self.sync_visible_transcript();
+                            // Status reconciles: snapshots for unlisted
+                            // sessions drop with their rows.
+                            let listed: std::collections::HashSet<SessionId> =
+                                self.current_sessions().into_iter().map(|s| s.id).collect();
+                            self.usage.retain(|id, _| listed.contains(id));
+                            // Cold start names no host until a session is
+                            // listed: request the catalog now, with the
+                            // selected session as its context.
+                            self.request_models_for_selection();
                         }
                         EngineEvent::SessionsLoadFailed(message) => {
                             appended = self.transcript.push_error(message);
                         }
+                        EngineEvent::ModelsLoaded { models } => {
+                            self.models_pending = false;
+                            self.composer
+                                .set_catalog(composer::ModelCatalog::Ready(models));
+                        }
                         EngineEvent::CommandFailed(message) => {
+                            if self.models_pending {
+                                // The catalog request failed: attribute
+                                // it to the catalog while keeping the
+                                // transcript error below.
+                                self.models_pending = false;
+                                self.composer
+                                    .set_catalog(composer::ModelCatalog::Failed(message.clone()));
+                            }
                             appended = self.transcript.push_error(message);
                             if self.awaiting_spawn {
                                 if let Some(pending) = self.pending_spawn.take() {
@@ -1099,11 +1335,15 @@ impl App {
                             }
                             if let Some(visible) = self.visible_session.clone() {
                                 self.running.remove(&visible);
+                                self.running_turns.remove(&visible);
                             }
                             self.awaiting_spawn = false;
                         }
-                        EngineEvent::SessionSpawned { session, .. } => {
+                        EngineEvent::SessionSpawned { session, turn } => {
                             self.running.insert(session.clone());
+                            if let Some(turn) = turn {
+                                self.running_turns.insert(session.clone(), turn);
+                            }
                             self.select_on_load = Some(session.clone());
                             if self.awaiting_spawn {
                                 // The visible transcript holds this
@@ -1116,6 +1356,7 @@ impl App {
                                 self.visible_session = Some(session);
                                 self.awaiting_spawn = false;
                                 self.pending_spawn = None;
+                                self.sync_composer_usage();
                             } else {
                                 self.sync_visible_transcript();
                             }
@@ -1123,8 +1364,12 @@ impl App {
                                 engine.list_sessions();
                             }
                         }
-                        EngineEvent::TurnAccepted { session, .. } => {
-                            self.running.insert(session);
+                        EngineEvent::TurnAccepted { session, turn } => {
+                            self.running.insert(session.clone());
+                            if let Some(turn) = turn {
+                                self.running_turns.insert(session, turn);
+                            }
+                            self.refresh_send_gate();
                         }
                         EngineEvent::SessionResumed { session } => {
                             self.resuming.remove(&session);
@@ -1153,10 +1398,13 @@ impl App {
             Message::Reconnect => {
                 if self.engine_config.is_some() {
                     // Dropping the handle shuts the old worker down; the
-                    // subscription restarts under the new attempt.
+                    // subscription restarts under the new attempt. Any
+                    // in-flight catalog request dies with it; the next
+                    // list load re-requests with fresh context.
                     self.engine = None;
                     self.connection = Connection::Connecting;
                     self.connection_attempt += 1;
+                    self.models_pending = false;
                 }
                 self.refresh_send_gate();
                 Task::none()
@@ -1266,6 +1514,15 @@ impl App {
             iced::alignment::Horizontal::Right,
             iced::alignment::Vertical::Bottom,
         ));
+        if let Some(menu) = self.composer.model_menu_overlay() {
+            stack = stack.push(model_menu_overlay_layer(menu.map(Message::Composer)));
+        }
+        if let Some(menu) = self.composer.permission_menu_overlay() {
+            stack = stack.push(permission_menu_overlay_layer(
+                menu.map(Message::Composer),
+                self.panel_width,
+            ));
+        }
         if let Some(popup) = self.sessions.add_project_view() {
             stack = stack.push(kit::scrim(popup.map(Message::Sessions)));
         }
@@ -1306,6 +1563,85 @@ fn drag_event(
         }
         _ => None,
     }
+}
+
+/// The floating model menu layer: a transparent click-away catcher
+/// covering the window behind the card, and the card itself anchored
+/// bottom-right. The card's right edge lines up with the main column's
+/// right edge (the window edge minus the main padding), and its bottom
+/// edge floats just above the composer sub-bar. The catcher carries no
+/// fill, so nothing beneath the card dims, and a press anywhere outside
+/// the card dismisses the menu without reflowing anything beneath it.
+fn model_menu_overlay_layer<'a>(menu: Element<'a, Message>) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::ModelDismissed));
+    let card = iced::widget::row![
+        iced::widget::column![
+            iced::widget::container(menu)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new().height(Length::Fixed(MODEL_MENU_BOTTOM_OFFSET)),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+        iced::widget::Space::new().width(Length::Fixed(SPACE_M)),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The floating permission menu layer: a transparent click-away
+/// catcher covering the window behind the card, and the card itself
+/// anchored bottom-left. The card's left edge lines up with the main
+/// column's left edge: the side panel, the divider hit width, and the
+/// main container's padding. Its bottom edge floats just above the
+/// composer sub-bar with the same offset as the model card. The
+/// catcher carries no fill, so nothing beneath the card dims, and a
+/// press anywhere outside the card dismisses the menu without
+/// reflowing anything beneath it.
+fn permission_menu_overlay_layer<'a>(
+    menu: Element<'a, Message>,
+    panel_width: f32,
+) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::PermissionDismissed));
+    let card = iced::widget::row![
+        iced::widget::Space::new().width(Length::Fixed(panel_width + DIVIDER_HIT_WIDTH + SPACE_M)),
+        iced::widget::column![
+            iced::widget::container(menu)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Left)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new().height(Length::Fixed(MODEL_MENU_BOTTOM_OFFSET)),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// One window corner resize handle: a small press target pinned to a
@@ -1353,6 +1689,15 @@ fn validate_project_dir(directory: String, name: String) -> Result<(String, Stri
 /// connected yet. Matches the worker's wording for the same refusal.
 fn not_connected_message() -> String {
     String::from("The Muse MCP server isn't connected yet. Try again once it connects.")
+}
+
+/// User-facing note when steering finds no tracked turn id: the
+/// session runs, but the server never named its turn, so there is
+/// nothing to steer into. A value, never silence.
+fn no_running_turn_message() -> String {
+    String::from(
+        "That session is still starting its turn, so there is nothing to steer yet. Try again in a moment.",
+    )
 }
 
 /// Snaps the transcript to the end when an entry was appended, else
@@ -1784,12 +2129,23 @@ mod tests {
     /// would serve them, and records spawn/send arguments, without
     /// spawning anything. The counters are shared, so clones observe
     /// the same calls.
+    /// One recorded steer call: session, prompt, and steered turn.
+    type SteerCall = (manifest_domain::SessionId, String, manifest_domain::TurnId);
+    /// One recorded cancel call: session and the canceled turn, if known.
+    type CancelCall = (manifest_domain::SessionId, Option<manifest_domain::TurnId>);
+    /// One recorded catalog call: workspace and session context.
+    type ModelsCall = (Option<String>, Option<manifest_domain::SessionId>);
+
     #[derive(Clone)]
     struct FakeEngine {
         calls: std::sync::Arc<std::sync::Mutex<usize>>,
-        spawns: std::sync::Arc<std::sync::Mutex<Vec<(String, String, manifest_domain::SpawnChoices)>>>,
+        spawns:
+            std::sync::Arc<std::sync::Mutex<Vec<(String, String, manifest_domain::SpawnChoices)>>>,
         turns: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
         resumes: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        steers: std::sync::Arc<std::sync::Mutex<Vec<SteerCall>>>,
+        cancels: std::sync::Arc<std::sync::Mutex<Vec<CancelCall>>>,
+        models: std::sync::Arc<std::sync::Mutex<Vec<ModelsCall>>>,
     }
 
     impl manifest_domain::SessionEngine for FakeEngine {
@@ -1816,17 +2172,50 @@ mod tests {
         fn resume_session(&self, session: manifest_domain::SessionId) {
             self.resumes.lock().unwrap().push(session);
         }
+
+        fn steer_session(
+            &self,
+            session: manifest_domain::SessionId,
+            prompt: String,
+            turn: manifest_domain::TurnId,
+        ) {
+            self.steers.lock().unwrap().push((session, prompt, turn));
+        }
+
+        fn cancel_turn(
+            &self,
+            session: manifest_domain::SessionId,
+            turn: Option<manifest_domain::TurnId>,
+        ) {
+            self.cancels.lock().unwrap().push((session, turn));
+        }
+
+        fn list_models(
+            &self,
+            workspace: Option<String>,
+            session: Option<manifest_domain::SessionId>,
+        ) {
+            self.models.lock().unwrap().push((workspace, session));
+        }
+    }
+
+    /// A fresh fake engine with empty call logs.
+    fn fake_engine() -> FakeEngine {
+        FakeEngine {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            steers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cancels: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     /// Production boot with the handle already delivered, as the
     /// subscription's first item would.
     fn live_app() -> (App, FakeEngine) {
-        let fake = FakeEngine {
-            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
-            spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+        let fake = fake_engine();
         let mut app = App::live(manifest_mcp::ServerConfig::new("fake"), None);
         let attempt = app.connection_attempt;
         let _ = app.update(Message::Engine {
@@ -2331,7 +2720,9 @@ mod tests {
         assert_eq!(app.composer.content.text(), "");
         assert!(!app.composer.has_text);
         assert!(app.running.contains(&SessionId::new("s-1")));
-        assert!(!app.composer.send_enabled);
+        // Steer mode: Send stays live while the session runs.
+        assert!(app.composer.send_enabled);
+        assert!(app.composer.running_visible);
     }
 
     #[test]
@@ -2480,6 +2871,9 @@ mod tests {
                 worktree_mode: DraftWorktreeMode::Off,
                 worktree_base: String::new(),
                 worktree_path: String::new(),
+                model: manifest_domain::ModelChoice::Default,
+                effort: manifest_domain::EffortChoice::Default,
+                permission: manifest_domain::PermissionMode::default(),
             })
         );
         assert_eq!(
@@ -2560,10 +2954,13 @@ mod tests {
                 view_cursor: None,
             },
         );
-        assert!(!app.composer.send_enabled);
+        // Steer mode: the gate stays live while the selection runs.
+        assert!(app.composer.send_enabled);
+        assert!(app.composer.running_visible);
         new_session_pressed(&mut app);
         assert!(app.new_session.is_some());
         assert!(app.composer.send_enabled);
+        assert!(!app.composer.running_visible);
     }
 
     #[test]
@@ -2641,12 +3038,7 @@ mod tests {
 
     /// Production boot with a registry store, handle already delivered.
     fn live_app_with_store(path: std::path::PathBuf) -> (App, FakeEngine) {
-        let fake = FakeEngine {
-            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
-            spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+        let fake = fake_engine();
         let mut app = App::live(
             manifest_mcp::ServerConfig::new("fake"),
             Some(manifest_store::ProjectStore::new(path)),
@@ -3288,6 +3680,7 @@ mod tests {
                     worktree: manifest_domain::WorktreeChoice::Existing {
                         path: String::from("/tmp/wt-x"),
                     },
+                    ..Default::default()
                 }
             )]
         );
@@ -3308,6 +3701,7 @@ mod tests {
                     worktree: manifest_domain::WorktreeChoice::Create {
                         base: Some(String::from("main")),
                     },
+                    ..Default::default()
                 }
             )]
         );
@@ -3326,6 +3720,7 @@ mod tests {
                 String::from("build it"),
                 manifest_domain::SpawnChoices {
                     worktree: manifest_domain::WorktreeChoice::Create { base: None },
+                    ..Default::default()
                 }
             )]
         );
@@ -3389,6 +3784,7 @@ mod tests {
                         worktree: manifest_domain::WorktreeChoice::Existing {
                             path: String::from("/tmp/wt-x"),
                         },
+                        ..Default::default()
                     }
                 ),
                 (
@@ -3397,6 +3793,40 @@ mod tests {
                     manifest_domain::SpawnChoices::default()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn cwd_spawn_carries_composer_picks() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        assert!(app.sessions.selected_summary().is_none());
+        let _ = app.update(Message::Composer(composer::Message::ModelSelected(
+            manifest_domain::ModelChoice::Named(String::from("muse-spark")),
+        )));
+        let _ = app.update(Message::Composer(composer::Message::EffortSelected(
+            manifest_domain::EffortChoice::High,
+        )));
+        let _ = app.update(Message::Composer(composer::Message::PermissionSelected(
+            manifest_domain::MusePermission::Judge,
+        )));
+        type_composer_text(&mut app, "start me");
+        send_pressed(&mut app);
+        let workspace = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                workspace,
+                String::from("start me"),
+                manifest_domain::SpawnChoices {
+                    worktree: manifest_domain::WorktreeChoice::Off,
+                    model: manifest_domain::ModelChoice::Named(String::from("muse-spark")),
+                    effort: manifest_domain::EffortChoice::High,
+                    permission: manifest_domain::PermissionMode::Muse(
+                        manifest_domain::MusePermission::Judge
+                    ),
+                }
+            )]
         );
     }
 
@@ -3431,5 +3861,465 @@ mod tests {
         let _ = app.update(Message::DraftWorktreePathChanged(String::from("/tmp/wt-x")));
         assert_eq!(app.new_session, None);
         assert_eq!(app.composer.content.text(), "hi");
+    }
+
+    /// Starts a turn on the selected session with a named turn id.
+    fn start_turn(app: &mut App, session: &str, turn: &str) {
+        stream(
+            app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new(session),
+                turn: Some(manifest_domain::TurnId::new(turn)),
+                view_cursor: None,
+            },
+        );
+    }
+
+    #[test]
+    fn steer_sends_prompt_to_running_turn() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        start_turn(&mut app, "s-1", "turn-7");
+        assert!(app.composer.running_visible);
+        type_composer_text(&mut app, "go faster");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.steers.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("go faster"),
+                manifest_domain::TurnId::new("turn-7")
+            )]
+        );
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert_eq!(user_entries(&app), vec!["go faster"]);
+        assert_eq!(app.composer.content.text(), "");
+    }
+
+    #[test]
+    fn steer_without_turn_id_notes_error_and_keeps_draft() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        // Running with no named turn: the server never sent one.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        type_composer_text(&mut app, "nudge");
+        send_pressed(&mut app);
+        assert!(fake.steers.lock().unwrap().is_empty());
+        assert!(fake.turns.lock().unwrap().is_empty());
+        assert_eq!(app.composer.content.text(), "nudge");
+        assert!(transcript_errors(&app).contains(
+            &"That session is still starting its turn, so there is nothing to steer yet. Try again in a moment."
+        ));
+    }
+
+    #[test]
+    fn stop_cancels_running_turn_with_tracked_id() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        start_turn(&mut app, "s-1", "turn-7");
+        let _ = app.update(Message::Composer(composer::Message::StopPressed));
+        assert_eq!(
+            *fake.cancels.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                Some(manifest_domain::TurnId::new("turn-7"))
+            )]
+        );
+        assert!(app.running.contains(&SessionId::new("s-1")));
+    }
+
+    #[test]
+    fn stop_without_running_session_records_nothing() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.update(Message::Composer(composer::Message::StopPressed));
+        assert!(fake.cancels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn turn_completed_clears_turn_id_and_steer_mode() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        start_turn(&mut app, "s-1", "turn-7");
+        assert!(app.composer.running_visible);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: Some(manifest_domain::TurnId::new("turn-7")),
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert!(!app.running.contains(&SessionId::new("s-1")));
+        assert!(app.running_turns.is_empty());
+        assert!(!app.composer.running_visible);
+    }
+
+    #[test]
+    fn turn_accepted_tracks_turn_id_for_steer() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        type_composer_text(&mut app, "hello");
+        send_pressed(&mut app);
+        assert_eq!(fake.turns.lock().unwrap().len(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::TurnAccepted {
+                session: SessionId::new("s-1"),
+                turn: Some(manifest_domain::TurnId::new("turn-9")),
+            }),
+        );
+        type_composer_text(&mut app, "adjust");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.steers.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("adjust"),
+                manifest_domain::TurnId::new("turn-9")
+            )]
+        );
+    }
+
+    /// A one-row catalog event, as the worker would map it.
+    fn models_event() -> engine::Input {
+        engine::Input::event(manifest_domain::EngineEvent::ModelsLoaded {
+            models: vec![manifest_domain::ModelInfo {
+                id: String::from("muse-spark"),
+                display_label: String::from("Muse Spark"),
+                is_default: true,
+                is_active: false,
+            }],
+        })
+    }
+
+    #[test]
+    fn connected_sends_no_bare_catalog_request() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        // Cold start names no host: the bare request would fail, so the
+        // shell sends none until a session (or draft workspace) names one.
+        assert!(fake.models.lock().unwrap().is_empty());
+        assert!(!app.models_pending);
+        assert_eq!(app.composer.catalog, composer::ModelCatalog::Loading);
+    }
+
+    #[test]
+    fn sessions_loaded_requests_catalog_with_selected_session() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(
+            *fake.models.lock().unwrap(),
+            vec![(None, Some(SessionId::new("s-1")))]
+        );
+        assert!(app.models_pending);
+        // A second load while the request is in flight sends no duplicate.
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(fake.models.lock().unwrap().len(), 1);
+        deliver(&mut app, models_event());
+        assert!(!app.models_pending);
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Ready(_)
+        ));
+        // The catalog arrives without changing the selection.
+        assert_eq!(app.composer.model_effort_label, "Default · Default");
+        // A later load with a ready catalog requests nothing further.
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(fake.models.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn catalog_failure_marks_catalog_failed_and_keeps_transcript_error() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.models_pending);
+        let message = String::from("models requires workspace or session_id");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+        );
+        assert!(!app.models_pending);
+        assert_eq!(
+            app.composer.catalog,
+            composer::ModelCatalog::Failed(message.clone())
+        );
+        assert!(transcript_errors(&app).contains(&message.as_str()));
+        // The menu still names the default choice without a catalog.
+        assert_eq!(app.composer.model_effort_label, "Default · Default");
+        assert_eq!(fake.models.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_connection_clears_pending_catalog_request() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.models_pending);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Failed(String::from("down")),
+            )),
+        );
+        assert!(!app.models_pending);
+    }
+
+    #[test]
+    fn draft_entry_requests_catalog_with_draft_workspace() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        // The list load requested with the selected session.
+        assert_eq!(
+            *fake.models.lock().unwrap(),
+            vec![(None, Some(SessionId::new("s-1")))]
+        );
+        // The request fails, so the catalog stays unresolved.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
+                "models down",
+            ))),
+        );
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Failed(_)
+        ));
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        // Entering the draft retries with the draft workspace.
+        assert_eq!(
+            *fake.models.lock().unwrap(),
+            vec![
+                (None, Some(SessionId::new("s-1"))),
+                (Some(String::from("/live/workspace")), None),
+            ]
+        );
+        assert!(app.models_pending);
+    }
+
+    #[test]
+    fn draft_entry_with_ready_catalog_requests_nothing() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        deliver(&mut app, models_event());
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        // The catalog is ready: entering the draft requests nothing.
+        assert_eq!(fake.models.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn menu_picks_sync_into_open_draft_choices() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        new_session_pressed(&mut app);
+        assert!(app.new_session.is_some());
+        let _ = app.update(Message::Composer(composer::Message::PermissionSelected(
+            manifest_domain::MusePermission::Judge,
+        )));
+        let _ = app.update(Message::Composer(composer::Message::ModelSelected(
+            manifest_domain::ModelChoice::Named(String::from("muse-spark")),
+        )));
+        let _ = app.update(Message::Composer(composer::Message::EffortSelected(
+            manifest_domain::EffortChoice::High,
+        )));
+        let draft = app.new_session.as_ref().expect("open draft");
+        assert_eq!(
+            draft.permission,
+            manifest_domain::PermissionMode::Muse(manifest_domain::MusePermission::Judge)
+        );
+        assert_eq!(
+            draft.model,
+            manifest_domain::ModelChoice::Named(String::from("muse-spark"))
+        );
+        assert_eq!(draft.effort, manifest_domain::EffortChoice::High);
+        type_composer_text(&mut app, "fresh idea");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                String::from("/live/workspace"),
+                String::from("fresh idea"),
+                manifest_domain::SpawnChoices {
+                    worktree: manifest_domain::WorktreeChoice::Off,
+                    model: manifest_domain::ModelChoice::Named(String::from("muse-spark")),
+                    effort: manifest_domain::EffortChoice::High,
+                    permission: manifest_domain::PermissionMode::Muse(
+                        manifest_domain::MusePermission::Judge
+                    ),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn usage_event_updates_visible_meter_only() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(app.composer.context_label, "Context —");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-2"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 42}"#),
+            },
+        );
+        // Background usage stores without touching the visible meter.
+        assert_eq!(app.composer.context_label, "Context —");
+        assert_eq!(app.usage.len(), 1);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 7}"#),
+            },
+        );
+        assert_eq!(app.composer.context_label, "7 tokens");
+        // Unknown payloads leave the snapshot in place.
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::Changed,
+                usage_json: String::from("nope"),
+            },
+        );
+        assert_eq!(app.composer.context_label, "7 tokens");
+    }
+
+    #[test]
+    fn sessions_loaded_prunes_usage_of_unlisted_sessions() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::Usage {
+                session: SessionId::new("s-2"),
+                turn: None,
+                view_cursor: None,
+                kind: manifest_domain::UsageKind::TokenUsage,
+                usage_json: String::from(r#"{"total": 9}"#),
+            },
+        );
+        assert_eq!(app.usage.len(), 1);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.usage.is_empty());
+    }
+
+    #[test]
+    fn draft_send_appends_attachment_refs_to_prompt() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_with_workspace(&mut app);
+        new_session_pressed(&mut app);
+        app.composer
+            .insert_attachment(String::from("/work/notes.md"));
+        type_composer_text(&mut app, "fresh idea");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                String::from("/live/workspace"),
+                String::from("fresh idea\n[ref: /work/notes.md]"),
+                manifest_domain::SpawnChoices::default()
+            )]
+        );
+        assert_eq!(
+            user_entries(&app),
+            vec!["fresh idea\n[ref: /work/notes.md]"]
+        );
+        // Sending clears the attachments with the draft.
+        assert!(app.composer.attachments.is_empty());
+    }
+
+    #[test]
+    fn follow_up_send_appends_attachment_refs_to_prompt() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        app.composer
+            .insert_attachment(String::from("/work/notes.md"));
+        type_composer_text(&mut app, "hello");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.turns.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("hello\n[ref: /work/notes.md]")
+            )]
+        );
+    }
+
+    #[test]
+    fn steer_send_appends_attachment_refs_to_prompt() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        start_turn(&mut app, "s-1", "turn-7");
+        app.composer
+            .insert_attachment(String::from("/work/notes.md"));
+        type_composer_text(&mut app, "go faster");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.steers.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("go faster\n[ref: /work/notes.md]"),
+                manifest_domain::TurnId::new("turn-7")
+            )]
+        );
+    }
+
+    #[test]
+    fn attach_picked_inserts_path_and_dismissed_closes() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        let _ = app.update(Message::Composer(composer::Message::AttachPressed));
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Open);
+        let _ = app.update(Message::Composer(composer::Message::AttachPicked(Some(
+            String::from("/work/notes.md"),
+        ))));
+        assert_eq!(
+            app.composer.attachments,
+            vec![String::from("/work/notes.md")]
+        );
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
+        let _ = app.update(Message::Composer(composer::Message::AttachPressed));
+        let _ = app.update(Message::Composer(composer::Message::AttachPicked(None)));
+        assert_eq!(app.composer.attach_popup, composer::AttachPopup::Closed);
+        assert_eq!(app.composer.attachments.len(), 1);
     }
 }

@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use iced::futures::StreamExt;
-use manifest_domain::{Connection, EngineEvent, SessionEngine, SessionId, SpawnChoices, StreamEvent};
+use manifest_domain::{
+    Connection, EngineEvent, SessionEngine, SessionId, SpawnChoices, StreamEvent,
+};
 
 /// Folds `next` into `into` when both are item deltas for the same
 /// session, item, and field: the delta texts concatenate and the first
@@ -79,6 +81,24 @@ impl EngineHandle {
     /// Sends a follow-up turn; success arrives as `TurnAccepted`.
     pub fn send_turn(&self, session: SessionId, prompt: String) {
         self.inner.send_turn(session, prompt);
+    }
+
+    /// Steers the running turn; failures arrive as `CommandFailed`.
+    pub fn steer_session(&self, session: SessionId, prompt: String, turn: manifest_domain::TurnId) {
+        self.inner.steer_session(session, prompt, turn);
+    }
+
+    /// Cancels the running turn; failures arrive as `CommandFailed`.
+    pub fn cancel_turn(&self, session: SessionId, turn: Option<manifest_domain::TurnId>) {
+        self.inner.cancel_turn(session, turn);
+    }
+
+    /// Requests a model-catalog refresh for the given host context;
+    /// results arrive as `ModelsLoaded`. The caller passes a workspace,
+    /// a session id, or both: the server fails a bare request while no
+    /// host is live.
+    pub fn list_models(&self, workspace: Option<String>, session: Option<SessionId>) {
+        self.inner.list_models(workspace, session);
     }
 
     /// Resumes a session; success arrives as `SessionResumed`.

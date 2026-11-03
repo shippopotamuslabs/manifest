@@ -7,27 +7,32 @@
 //!
 //! Surfaces are borderless: panels, rows, chips, and buttons keep
 //! their rounded corners but carry no border width, so state reads
-//! through flat background fills alone. The single-line text field
-//! is the one exception — its border marks where typing lands,
-//! an affordance rather than a card edge.
+//! through flat background fills alone. Two exceptions: the
+//! single-line text field, whose border marks where typing lands,
+//! and the floating popup cards, whose thin border lifts them off
+//! the surfaces they overlay.
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_LINE_HEIGHT, DIVIDER_HIT_WIDTH,
-    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL,
-    ICON_BUTTON_SIZE, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
-    SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
-    TEXT_TERTIARY,
+    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT, DANGER,
+    DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL,
+    FONT_SIZE_SMALL, ICON_BUTTON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
+    SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
-/// The two pill-button treatments.
+/// The pill-button treatments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ButtonKind {
     Primary,
     Ghost,
+    /// Filled danger treatment: the palette error red as the fill.
+    Danger,
+    /// Ghost treatment whose label stays in the palette error red.
+    DangerGhost,
 }
 
 /// Pure data mapping behind the pill-button styles: background and text
@@ -61,6 +66,31 @@ pub(crate) fn button_colors(kind: ButtonKind, status: button::Status) -> (Option
             };
             (background, text)
         }
+        ButtonKind::Danger => {
+            let background = match status {
+                button::Status::Active | button::Status::Hovered | button::Status::Pressed => {
+                    DANGER
+                }
+                button::Status::Disabled => SURFACE_2,
+            };
+            let text = match status {
+                button::Status::Disabled => TEXT_FAINT,
+                _ => BG_BASE,
+            };
+            (Some(background), text)
+        }
+        ButtonKind::DangerGhost => {
+            let background = match status {
+                button::Status::Hovered => Some(SURFACE_1),
+                button::Status::Pressed => Some(SURFACE_2),
+                button::Status::Active | button::Status::Disabled => None,
+            };
+            let text = match status {
+                button::Status::Disabled => TEXT_FAINT,
+                _ => DANGER,
+            };
+            (background, text)
+        }
     }
 }
 
@@ -75,6 +105,34 @@ fn primary_style(_theme: &Theme, status: button::Status) -> button::Style {
     };
     button::Style {
         background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
+        ..button::Style::default()
+    }
+}
+
+/// Status-aware style for [`ButtonKind::Danger`].
+fn danger_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = button_colors(ButtonKind::Danger, status);
+    // The danger mapping always yields a background; the fallback keeps
+    // styling total without a panic path.
+    let background = match background {
+        Some(color) => color,
+        None => SURFACE_2,
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().width(0.0).rounded(RADIUS_PILL),
+        ..button::Style::default()
+    }
+}
+
+/// Status-aware style for [`ButtonKind::DangerGhost`].
+fn danger_ghost_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = button_colors(ButtonKind::DangerGhost, status);
+    button::Style {
+        background: background.map(Background::Color),
         text_color,
         border: Border::default().width(0.0).rounded(RADIUS_PILL),
         ..button::Style::default()
@@ -103,6 +161,8 @@ pub(crate) fn pill_button<'a, Message: Clone + 'a>(
     let style = match kind {
         ButtonKind::Primary => primary_style,
         ButtonKind::Ghost => ghost_style,
+        ButtonKind::Danger => danger_style,
+        ButtonKind::DangerGhost => danger_ghost_style,
     };
     button(text(label))
         .padding(SPACE_S)
@@ -127,6 +187,182 @@ pub(crate) fn panel<'a, Message: Clone + 'a>(
     container(content)
         .padding(SPACE_M)
         .style(panel_style)
+        .into()
+}
+
+/// Status-aware style for [`popup_card`]: a surface-1 step distinct
+/// from the transcript background, panel radius, and a thin 1px
+/// border so the floating card reads apart from the input bar and
+/// any same-tone surface it overlays.
+fn popup_card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE_1)),
+        border: Border::default()
+            .color(BORDER_DEFAULT)
+            .width(1.0)
+            .rounded(RADIUS_PANEL),
+        ..container::Style::default()
+    }
+}
+
+/// A compact popup card at a fixed width: surface-1 fill, panel
+/// radius, small padding. Callers right-align it in their layout.
+pub(crate) fn popup_card<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+) -> Element<'a, Message> {
+    container(content)
+        .padding(SPACE_S)
+        .width(Length::Fixed(width))
+        .style(popup_card_style)
+        .into()
+}
+
+/// Pure data mapping behind the popup menu rows: a selected row is a
+/// quiet surface-2 step with primary text; an unselected row is
+/// transparent at rest and surface-1 on hover. Kept as data (not
+/// `Style`) so the mapping is unit-testable without widgets.
+pub(crate) fn menu_row_colors(selected: bool, status: button::Status) -> (Option<Color>, Color) {
+    row_colors(selected, status)
+}
+
+/// Pure data mapping behind the quiet "Edit" text action on a menu
+/// row: transparent at rest, a surface-2 step on hover, tertiary text
+/// warming to primary under the pointer.
+pub(crate) fn edit_button_colors(status: button::Status) -> (Option<Color>, Color) {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => (Some(SURFACE_2), TEXT_PRIMARY),
+        button::Status::Active => (None, TEXT_TERTIARY),
+        button::Status::Disabled => (None, TEXT_FAINT),
+    }
+}
+
+/// Status-aware style for popup menu and choice rows.
+fn menu_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme: &Theme, status: button::Status| {
+        let (background, text_color) = menu_row_colors(selected, status);
+        button::Style {
+            background: background.map(Background::Color),
+            text_color,
+            border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Status-aware style for the quiet "Edit" text action.
+fn edit_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = edit_button_colors(status);
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border::default().width(0.0).rounded(RADIUS_PANEL),
+        ..button::Style::default()
+    }
+}
+
+/// A popup menu row: a full-width label button, a separate quiet
+/// "Edit" text button beside it (a sibling, never nested), and a
+/// check slot at the right that shows "✓" only on the selected row.
+pub(crate) fn menu_row<'a, Message: Clone + 'a>(
+    label: &'a str,
+    selected: bool,
+    on_press: Message,
+    on_edit: Message,
+) -> Element<'a, Message> {
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let check = if selected { "✓" } else { "" };
+    iced::widget::row![
+        button(
+            container(
+                text(label)
+                    .size(FONT_SIZE_PANEL)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(title_color),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(MENU_ROW_HEIGHT))
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(menu_row_style(selected)),
+        button(text("Edit").size(FONT_SIZE_PANEL_SMALL))
+            .height(Length::Fixed(MENU_ROW_HEIGHT))
+            .padding([SPACE_XS, SPACE_S])
+            .on_press(on_edit)
+            .style(edit_button_style),
+        container(
+            text(check)
+                .size(FONT_SIZE_PANEL_SMALL)
+                .color(TEXT_SECONDARY),
+        )
+        .width(Length::Fixed(SPACE_L))
+        .align_x(iced::alignment::Horizontal::Center),
+    ]
+    .spacing(SPACE_XXS)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+/// A simple popup choice row: a full-width label button with a check
+/// slot at the right that shows "✓" only on the selected row.
+pub(crate) fn choice_row<'a, Message: Clone + 'a>(
+    label: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let title_color = if selected {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    let check = if selected { "✓" } else { "" };
+    let content = iced::widget::row![
+        container(
+            text(label)
+                .size(FONT_SIZE_PANEL)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(title_color),
+        )
+        .width(Length::Fill)
+        .clip(true),
+        text(check)
+            .size(FONT_SIZE_PANEL_SMALL)
+            .color(TEXT_SECONDARY),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    button(content)
+        .width(Length::Fill)
+        .height(Length::Fixed(MENU_ROW_HEIGHT))
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_press)
+        .style(menu_row_style(selected))
+        .into()
+}
+
+/// A quiet one-line note inside a popup card, for loading and
+/// unavailable states: small tertiary text, never a button.
+pub(crate) fn popup_note<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(FONT_SIZE_PANEL_SMALL).color(TEXT_TERTIARY))
+        .padding([SPACE_XS, SPACE_S])
+        .width(Length::Fill)
+        .into()
+}
+
+/// A popup section header: small tertiary text above a card's rows.
+pub(crate) fn popup_header<'a, Message: Clone + 'a>(label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(FONT_SIZE_PANEL_SMALL).color(TEXT_TERTIARY))
+        .padding([SPACE_XS, SPACE_S])
+        .width(Length::Fill)
         .into()
 }
 
@@ -533,9 +769,9 @@ pub(crate) fn composer_input<'a, Message: Clone + 'a>(
         .on_action(on_action)
         .size(FONT_SIZE_BODY)
         .line_height(COMPOSER_LINE_HEIGHT / FONT_SIZE_BODY)
-        .padding(SPACE_XS)
+        .padding(COMPOSER_INPUT_PADDING)
         .height(Length::Fixed(
-            visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * SPACE_XS,
+            visible_lines as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
         ))
         .style(composer_input_style)
         .into()
@@ -783,11 +1019,12 @@ pub(crate) fn input_bar<'a, Message: Clone + 'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonKind, IconButtonKind, button_colors, drawer_chevron, icon_button_colors, row_colors,
+        ButtonKind, IconButtonKind, button_colors, drawer_chevron, edit_button_colors,
+        icon_button_colors, menu_row_colors, row_colors,
     };
     use crate::theme::{
-        ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, SURFACE_1, SURFACE_2, TEXT_FAINT,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, DANGER, SURFACE_1, SURFACE_2,
+        TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
     };
     use iced::widget::button;
 
@@ -876,9 +1113,93 @@ mod tests {
     }
 
     #[test]
+    fn menu_row_colors_select_with_a_quiet_surface_step() {
+        assert_eq!(
+            menu_row_colors(true, button::Status::Active),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            menu_row_colors(true, button::Status::Hovered),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            menu_row_colors(false, button::Status::Active),
+            (None, TEXT_SECONDARY)
+        );
+        assert_eq!(
+            menu_row_colors(false, button::Status::Hovered),
+            (Some(SURFACE_1), TEXT_SECONDARY)
+        );
+        assert_eq!(
+            menu_row_colors(false, button::Status::Disabled),
+            (None, TEXT_SECONDARY)
+        );
+    }
+
+    #[test]
+    fn edit_button_colors_stay_quiet() {
+        assert_eq!(
+            edit_button_colors(button::Status::Active),
+            (None, TEXT_TERTIARY)
+        );
+        assert_eq!(
+            edit_button_colors(button::Status::Hovered),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            edit_button_colors(button::Status::Pressed),
+            (Some(SURFACE_2), TEXT_PRIMARY)
+        );
+        assert_eq!(
+            edit_button_colors(button::Status::Disabled),
+            (None, TEXT_FAINT)
+        );
+    }
+
+    #[test]
     fn drawer_chevron_points_up_when_collapsed_and_down_when_open() {
         assert_eq!(drawer_chevron(false), "▴");
         assert_eq!(drawer_chevron(true), "▾");
+    }
+
+    #[test]
+    fn danger_colors_fill_with_the_theme_danger_token() {
+        assert_eq!(
+            button_colors(ButtonKind::Danger, button::Status::Active),
+            (Some(DANGER), BG_BASE)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::Danger, button::Status::Hovered),
+            (Some(DANGER), BG_BASE)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::Danger, button::Status::Pressed),
+            (Some(DANGER), BG_BASE)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::Danger, button::Status::Disabled),
+            (Some(SURFACE_2), TEXT_FAINT)
+        );
+    }
+
+    #[test]
+    fn danger_ghost_colors_keep_danger_text_on_ghost_backgrounds() {
+        assert_eq!(
+            button_colors(ButtonKind::DangerGhost, button::Status::Active),
+            (None, DANGER)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::DangerGhost, button::Status::Hovered),
+            (Some(SURFACE_1), DANGER)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::DangerGhost, button::Status::Pressed),
+            (Some(SURFACE_2), DANGER)
+        );
+        assert_eq!(
+            button_colors(ButtonKind::DangerGhost, button::Status::Disabled),
+            (None, TEXT_FAINT)
+        );
     }
 
     #[test]

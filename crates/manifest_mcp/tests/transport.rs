@@ -346,6 +346,7 @@ fn spawn_with_existing_worktree_succeeds_and_streams() {
             worktree: WorktreeChoice::Existing {
                 path: String::from("/tmp/wt-1"),
             },
+            ..Default::default()
         },
     );
     let seen = recv_until(&rx, "SessionSpawned", |event| {
@@ -376,6 +377,7 @@ fn spawn_untrusted_create_is_command_failed() {
         String::from("Read note.txt"),
         SpawnChoices {
             worktree: WorktreeChoice::Create { base: None },
+            ..Default::default()
         },
     );
     let seen = recv_until(&rx, "CommandFailed", |event| {

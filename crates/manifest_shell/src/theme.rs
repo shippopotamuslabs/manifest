@@ -88,8 +88,36 @@ pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 pub const COMPOSER_MAX_LINES: usize = 5;
 pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
+// Composer input text padding: twice the bar's tight step, so the text
+// breathes inside the bar. Kit reads this token; call sites name no value.
+pub const COMPOSER_INPUT_PADDING: f32 = 8.0;
 // Fixed width of the add-project popup.
 pub const POPUP_WIDTH: f32 = 480.0;
+// Fixed width of the floating permission popup. The widest row is the
+// "Yolo" pill beside its one-line description ("Runs tools without
+// asking. The sandbox stays on.") at FONT_SIZE_SMALL: the short pill,
+// the row spacing, and that description fit on one line inside the
+// card padding at the same scale as POPUP_WIDTH.
+pub const PERMISSION_POPUP_WIDTH: f32 = 480.0;
+// Fixed widths of the composer model picker cards: the model card is
+// narrow and anchored at the right edge, and the effort card sits to
+// its left at a smaller width.
+pub const MODEL_POPUP_WIDTH: f32 = 340.0;
+pub const EFFORT_POPUP_WIDTH: f32 = 210.0;
+// Bottom offset of the floating model menu from the window's bottom
+// edge: the main column's bottom padding (SPACE_M) below the composer,
+// plus the sub-bar pill height (its SPACE_S top and bottom padding plus
+// one body text line), plus a SPACE_S gap between the sub-bar and the
+// floating card. The App anchors the overlay with this token so the
+// card sits just above the "model · effort" pill without reflowing
+// the composer beneath it.
+pub const MODEL_MENU_BOTTOM_OFFSET: f32 = SPACE_M + (SPACE_S * 2.0 + FONT_SIZE_BODY) + SPACE_S;
+// Fixed max height of the scrollable catalog list inside the model
+// card, so a long catalog never grows the popup unbounded.
+pub const MODEL_LIST_MAX_HEIGHT: f32 = 240.0;
+// Fixed height of a popup menu row (model and effort rows), so the
+// catalog list height can be derived from its row count.
+pub const MENU_ROW_HEIGHT: f32 = 28.0;
 // Draggable side-panel geometry: default width with hard bounds, plus
 // the invisible grab width of the divider hit zone.
 pub const PANEL_WIDTH_DEFAULT: f32 = 260.0;
