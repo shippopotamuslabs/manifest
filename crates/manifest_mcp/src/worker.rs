@@ -12,11 +12,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcCommand, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
-use manifest_domain::{Connection, EngineEvent, SessionId};
+use manifest_domain::{Connection, EngineEvent, SessionId, SpawnChoices};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::map::{map_spawn_result, map_status_result, map_stream_event, map_turn_result};
+use crate::map::{
+    map_resume_result, map_spawn_result, map_status_result, map_stream_event, map_turn_result,
+};
 use crate::{ServerConfig, wire};
 
 /// Message when a spawn or turn command arrives before the connection.
@@ -30,9 +32,15 @@ pub(crate) enum Command {
     /// Request a `muse_status` round trip (or queue one until connected).
     ListSessions,
     /// Spawn a session: `muse_spawn` with `wait: false`.
-    SpawnSession { workspace: String, prompt: String },
+    SpawnSession {
+        workspace: String,
+        prompt: String,
+        choices: SpawnChoices,
+    },
     /// Send a follow-up turn: `muse_turn` with `wait: false`.
     SendTurn { session: SessionId, prompt: String },
+    /// Resume a session: `muse_models` by session id (catalog discarded).
+    ResumeSession { session: SessionId },
     /// Shut down: kill the child and exit without emitting.
     Shutdown,
 }
@@ -53,6 +61,7 @@ enum Pending {
     ListSessions,
     Spawn,
     Turn(SessionId),
+    Resume(SessionId),
 }
 
 /// Owns the child process; killing and reaping it on drop so every exit
@@ -111,11 +120,24 @@ impl Worker {
     }
 
     /// Issue a `muse_spawn` round trip with a fresh id.
-    fn send_spawn_call(&mut self, workspace: &str, prompt: &str) -> Result<(), Error> {
+    fn send_spawn_call(
+        &mut self,
+        workspace: &str,
+        prompt: &str,
+        choices: &SpawnChoices,
+    ) -> Result<(), Error> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::Spawn);
-        self.send_line(&wire::spawn_call(id, workspace, prompt))
+        self.send_line(&wire::spawn_call(id, workspace, prompt, choices))
+    }
+
+    /// Issue a `muse_models` session-resume round trip with a fresh id.
+    fn send_resume_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Resume(session.clone()));
+        self.send_line(&wire::resume_call(id, session.as_str()))
     }
 
     /// Issue a `muse_turn` round trip with a fresh id.
@@ -192,7 +214,9 @@ impl Worker {
         match pending {
             Pending::Initialize => self.handle_initialize_reply(message),
             Pending::ListSessions => self.handle_status_reply(message),
-            Pending::Spawn | Pending::Turn(_) => self.handle_command_reply(&pending, message),
+            Pending::Spawn | Pending::Turn(_) | Pending::Resume(_) => {
+                self.handle_command_reply(&pending, message)
+            }
         }
     }
 
@@ -235,7 +259,7 @@ impl Worker {
         true
     }
 
-    /// Handle the reply to a `muse_spawn` or `muse_turn` call.
+    /// Handle the reply to a `muse_spawn`, `muse_turn`, or resume call.
     ///
     /// The connection stays up: every outcome is a value the shell
     /// renders, mirroring [`Worker::handle_status_reply`].
@@ -255,6 +279,10 @@ impl Worker {
             },
             Pending::Turn(commanded) => match map_turn_result(&result, commanded) {
                 Ok((session, turn)) => EngineEvent::TurnAccepted { session, turn },
+                Err(message) => EngineEvent::CommandFailed(message),
+            },
+            Pending::Resume(commanded) => match map_resume_result(&result, commanded) {
+                Ok(session) => EngineEvent::SessionResumed { session },
                 Err(message) => EngineEvent::CommandFailed(message),
             },
             Pending::Initialize | Pending::ListSessions => return true,
@@ -388,10 +416,14 @@ pub(crate) fn run(
                     true
                 }
             }
-            WorkerMsg::Command(Command::SpawnSession { workspace, prompt }) => {
+            WorkerMsg::Command(Command::SpawnSession {
+                workspace,
+                prompt,
+                choices,
+            }) => {
                 if !worker.connected {
                     worker.emit(EngineEvent::CommandFailed(not_connected_message()))
-                } else if let Err(err) = worker.send_spawn_call(&workspace, &prompt) {
+                } else if let Err(err) = worker.send_spawn_call(&workspace, &prompt, &choices) {
                     let _ = worker.fail(err);
                     false
                 } else {
@@ -402,6 +434,16 @@ pub(crate) fn run(
                 if !worker.connected {
                     worker.emit(EngineEvent::CommandFailed(not_connected_message()))
                 } else if let Err(err) = worker.send_turn_call(&session, &prompt) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::ResumeSession { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                } else if let Err(err) = worker.send_resume_call(&session) {
                     let _ = worker.fail(err);
                     false
                 } else {

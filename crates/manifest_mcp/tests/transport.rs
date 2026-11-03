@@ -1,8 +1,8 @@
 //! Transport tests against the scripted fake server.
 
 use manifest_domain::{
-    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, ProjectId, SessionEngine,
-    SessionId, SessionStatus, StreamEvent, StreamItem, TurnId,
+    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionEngine, SessionId,
+    SessionStatus, SpawnChoices, StreamEvent, StreamItem, TurnId, WorktreeChoice,
 };
 use manifest_mcp::{MuseEngine, ServerConfig, connect};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -142,21 +142,10 @@ fn connects_and_lists_sessions() {
     );
 
     let loaded = seen.iter().find_map(|event| match event {
-        EngineEvent::SessionsLoaded { projects, sessions } => Some((projects, sessions)),
+        EngineEvent::SessionsLoaded { sessions } => Some(sessions),
         _ => None,
     });
-    let (projects, sessions) = loaded.expect("SessionsLoaded seen above");
-    assert_eq!(
-        projects.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
-        vec![String::from("checkout-api"), String::from("storefront-web")],
-    );
-    assert_eq!(
-        projects.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
-        vec![
-            ProjectId::new("workspace:/home/dev/checkout-api"),
-            ProjectId::new("workspace:/home/dev/storefront-web"),
-        ],
-    );
+    let sessions = loaded.expect("SessionsLoaded seen above");
     let ids: Vec<SessionId> = sessions.iter().map(|s| s.id.clone()).collect();
     assert_eq!(
         ids,
@@ -173,16 +162,18 @@ fn connects_and_lists_sessions() {
         vec![
             SessionStatus::Running,
             SessionStatus::Idle,
-            SessionStatus::Idle,
+            SessionStatus::Orphaned,
             SessionStatus::AwaitingApproval,
         ],
     );
-    assert_eq!(sessions[0].title, "checkout-api · sess-run");
+    // Titles are short ids now; grouping is the shell's job.
+    assert_eq!(sessions[0].title, "sess-run");
     assert_eq!(sessions[0].stream_dropped_deltas, 3);
-    assert_eq!(
-        sessions[0].project,
-        Some(ProjectId::new("workspace:/home/dev/checkout-api"))
-    );
+    assert_eq!(sessions[0].workspace, "/home/dev/checkout-api");
+    assert_eq!(sessions[0].project, None);
+    assert_eq!(sessions[2].status, SessionStatus::Orphaned);
+    assert_eq!(sessions[2].workspace, "/home/dev/storefront-web");
+    assert_eq!(sessions[2].title, "sess-orp");
 
     assert!(
         !seen.iter().any(is_failed),
@@ -197,7 +188,11 @@ fn spawn_flows_into_typed_stream() {
     let engine = connect(fake_config("ok"), tx);
     let _ = connected_with_sessions(&rx);
 
-    engine.spawn_session(String::from("/tmp/ws"), String::from("Read note.txt"));
+    engine.spawn_session(
+        String::from("/tmp/ws"),
+        String::from("Read note.txt"),
+        SpawnChoices::default(),
+    );
     let mut seen = recv_until(&rx, "SessionSpawned", |event| {
         matches!(event, EngineEvent::SessionSpawned { .. })
     });
@@ -315,6 +310,7 @@ fn spawn_bad_workspace_is_command_failed() {
     engine.spawn_session(
         String::from("/tmp/does-not-exist/ws"),
         String::from("Read note.txt"),
+        SpawnChoices::default(),
     );
     let seen = recv_until(&rx, "CommandFailed", |event| {
         matches!(event, EngineEvent::CommandFailed(_))
@@ -329,6 +325,122 @@ fn spawn_bad_workspace_is_command_failed() {
     assert!(
         failure.contains("workspace does not exist: /tmp/does-not-exist/ws"),
         "failure carries the server text, saw {failure:?}"
+    );
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn spawn_with_existing_worktree_succeeds_and_streams() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.spawn_session(
+        String::from("/tmp/ws"),
+        String::from("Read note.txt"),
+        SpawnChoices {
+            worktree: WorktreeChoice::Existing {
+                path: String::from("/tmp/wt-1"),
+            },
+        },
+    );
+    let seen = recv_until(&rx, "SessionSpawned", |event| {
+        matches!(event, EngineEvent::SessionSpawned { .. })
+    });
+    let spawned = seen.iter().find_map(|event| match event {
+        EngineEvent::SessionSpawned { session, turn } => Some((session, turn)),
+        _ => None,
+    });
+    let (session, turn) = spawned.expect("SessionSpawned seen above");
+    assert_eq!(session, &SessionId::new("fake-session-1"));
+    assert_eq!(turn, &Some(TurnId::new("fake-turn-1")));
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn spawn_untrusted_create_is_command_failed() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.spawn_session(
+        String::from("/untrusted"),
+        String::from("Read note.txt"),
+        SpawnChoices {
+            worktree: WorktreeChoice::Create { base: None },
+        },
+    );
+    let seen = recv_until(&rx, "CommandFailed", |event| {
+        matches!(event, EngineEvent::CommandFailed(_))
+    });
+    let failure = seen
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::CommandFailed(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("failure seen above");
+    assert_eq!(
+        failure,
+        "Repository '/untrusted' is not trusted; worktree create, attach, and list require a trusted repository."
+    );
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn resume_orphaned_session_reports_resumed() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.resume_session(SessionId::new("sess-orphan"));
+    let seen = recv_until(&rx, "SessionResumed", |event| {
+        matches!(event, EngineEvent::SessionResumed { .. })
+    });
+    let resumed = seen.iter().find_map(|event| match event {
+        EngineEvent::SessionResumed { session } => Some(session),
+        _ => None,
+    });
+    assert_eq!(resumed, Some(&SessionId::new("sess-orphan")));
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn resume_in_use_reports_server_text() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("resume-in-use"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.resume_session(SessionId::new("sess-orphan"));
+    let seen = recv_until(&rx, "CommandFailed", |event| {
+        matches!(event, EngineEvent::CommandFailed(_))
+    });
+    let failure = seen
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::CommandFailed(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("failure seen above");
+    assert_eq!(
+        failure,
+        "session sess-orphan is in use by another client (sessionInUse: already attached). Muse MCP will not attach to it."
     );
     assert!(
         failed_text(&seen).is_none(),

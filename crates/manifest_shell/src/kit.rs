@@ -327,13 +327,15 @@ fn label_row_style(rest: Color, hot: Color) -> impl Fn(&Theme, button::Status) -
 }
 
 /// A project header row: the expand/collapse button fills the row with
-/// a small subtle "+" button pinned to its right end for starting a
-/// new session in that project. The whole header stays pressable for
-/// expand; the "+" is a distinct button.
+/// a small subtle "+" button for starting a new session in that project
+/// and a small subtle "×" button for removing the project from the
+/// registry, pinned to its right end. The whole header stays pressable
+/// for expand; the "+" and "×" are distinct buttons.
 pub(crate) fn project_header<'a, Message: Clone + 'a>(
     label: &'a str,
     on_expand: Message,
     on_new: Message,
+    on_remove: Message,
 ) -> Element<'a, Message> {
     iced::widget::row![
         button(
@@ -350,6 +352,7 @@ pub(crate) fn project_header<'a, Message: Clone + 'a>(
         .on_press(on_expand)
         .style(label_row_style(TEXT_SECONDARY, TEXT_PRIMARY)),
         icon_button("+", IconButtonKind::Subtle, Some(on_new)),
+        icon_button("×", IconButtonKind::Subtle, Some(on_remove)),
     ]
     .spacing(SPACE_XXS)
     .align_y(iced::alignment::Vertical::Center)

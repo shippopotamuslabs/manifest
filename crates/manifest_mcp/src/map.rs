@@ -1,20 +1,19 @@
 //! Crate-private mapping from wire values into domain values.
 //!
-//! The wire has no timestamps and no project objects, so project
-//! grouping is derived from each session row's workspace, and row
-//! titles pair the derived project name with the session id. Anything
-//! the wire cannot explain becomes a [`Diagnostic`] value rather than
-//! a silent drop, except `closed` sessions, which are expected
-//! filtering.
+//! The wire carries no project objects: each session row keeps its
+//! workspace and a title of the session id's first 8 chars, and
+//! grouping onto projects happens in the shell via domain
+//! [`assign_projects`](manifest_domain::assign_projects). Anything the
+//! wire cannot explain becomes a [`Diagnostic`] value rather than a
+//! silent drop, except `closed` sessions, which are expected filtering.
 
 use crate::error::Error;
 use manifest_domain::{
-    EngineEvent, ItemStatus, PendingKind, PendingPhase, ProjectId, ProjectSummary, SessionId,
-    SessionStatus, SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
+    EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionId, SessionStatus, SessionSummary,
+    StreamEvent, StreamItem, TurnId, UsageKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// One row of a `muse_status` result. Unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -30,23 +29,12 @@ struct StatusDto {
     stream_dropped_deltas: Option<u64>,
 }
 
-/// Short human name for a workspace: its last non-empty `/`-segment.
-fn project_name(workspace: &str) -> &str {
-    workspace
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(workspace)
-}
-
-/// Map raw `muse_status` rows into projects, sessions, and diagnostics.
+/// Map raw `muse_status` rows into sessions and diagnostics.
 ///
-/// Server row order is preserved in the flat sessions vec; projects
-/// appear in first-seen order.
-pub(crate) fn map_status_rows(
-    rows: &[Value],
-) -> (Vec<ProjectSummary>, Vec<SessionSummary>, Vec<String>) {
-    let mut projects = Vec::new();
-    let mut projects_by_workspace: HashMap<String, (ProjectId, String)> = HashMap::new();
+/// Server row order is preserved; project grouping happens in the
+/// shell via domain
+/// [`assign_projects`](manifest_domain::assign_projects).
+pub(crate) fn map_status_rows(rows: &[Value]) -> (Vec<SessionSummary>, Vec<String>) {
     let mut sessions = Vec::new();
     let mut diagnostics = Vec::new();
 
@@ -64,7 +52,8 @@ pub(crate) fn map_status_rows(
             continue;
         }
         let status = match dto.status.as_str() {
-            "idle" | "orphaned" => SessionStatus::Idle,
+            "idle" => SessionStatus::Idle,
+            "orphaned" => SessionStatus::Orphaned,
             "running" => SessionStatus::Running,
             other => {
                 diagnostics.push(format!(
@@ -78,32 +67,20 @@ pub(crate) fn map_status_rows(
         } else {
             status
         };
-        let (project_id, name) = projects_by_workspace
-            .entry(dto.workspace.clone())
-            .or_insert_with(|| {
-                let name = project_name(&dto.workspace).to_string();
-                let id = ProjectId::new(format!("workspace:{}", dto.workspace));
-                projects.push(ProjectSummary {
-                    id: id.clone(),
-                    name: name.clone(),
-                    workspace: Some(dto.workspace.clone()),
-                });
-                (id, name)
-            })
-            .clone();
         // First 8 chars (not bytes) so multi-byte ids truncate safely.
         let short: String = dto.session_id.chars().take(8).collect();
         sessions.push(SessionSummary {
             id: SessionId::new(&dto.session_id),
-            title: format!("{name} · {short}"),
+            title: short,
             status,
-            project: Some(project_id.clone()),
+            project: None,
+            workspace: dto.workspace.clone(),
             relative_time: String::new(),
             stream_dropped_deltas: dto.stream_dropped_deltas.unwrap_or(0),
         });
     }
 
-    (projects, sessions, diagnostics)
+    (sessions, diagnostics)
 }
 
 /// Optional string field: a present non-string value counts as absent.
@@ -421,12 +398,12 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
             )];
         }
     };
-    let (projects, sessions, diagnostics) = map_status_rows(&rows);
+    let (sessions, diagnostics) = map_status_rows(&rows);
     let mut events: Vec<EngineEvent> = diagnostics
         .into_iter()
         .map(EngineEvent::Diagnostic)
         .collect();
-    events.push(EngineEvent::SessionsLoaded { projects, sessions });
+    events.push(EngineEvent::SessionsLoaded { sessions });
     events
 }
 
@@ -492,6 +469,25 @@ pub(crate) fn map_turn_result(
     ))
 }
 
+/// Map a `muse_models` session-resume result into the resumed session.
+///
+/// The commanded session is kept: the result body is a discarded
+/// catalog, and its `isError` flag is the only signal. A
+/// server-authored `isError` body passes through as the failure text.
+pub(crate) fn map_resume_result(
+    result: &Value,
+    commanded: &SessionId,
+) -> Result<SessionId, String> {
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| {
+            String::from("Couldn't resume that session on the Muse MCP server.")
+        });
+        return Err(Error::Tool(text).to_string());
+    }
+    Ok(commanded.clone())
+}
+
 /// Text of the first `type == "text"` content item, if any.
 fn first_text_opt(result: &Value) -> Option<String> {
     result
@@ -536,16 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_maps_to_idle_and_closed_is_excluded() {
+    fn orphaned_stays_orphaned_and_closed_is_excluded() {
         let rows = vec![
             row("a", "orphaned", "/w/p", 0, None),
             row("b", "closed", "/w/p", 0, None),
         ];
-        let (projects, sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics) = map_status_rows(&rows);
         assert!(diagnostics.is_empty());
-        assert_eq!(projects.len(), 1);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].status, SessionStatus::Idle);
+        assert_eq!(sessions[0].status, SessionStatus::Orphaned);
     }
 
     /// Guards against overflow when the server reports huge pending counts.
@@ -558,7 +553,7 @@ mod tests {
             "pending_approvals": u64::MAX,
             "pending_user_inputs": u64::MAX,
         })];
-        let (_, sessions, _) = map_status_rows(&rows);
+        let (sessions, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
     }
@@ -569,7 +564,7 @@ mod tests {
             row("p1", "running", "/w/p", 2, None),
             row("weird", "exploded", "/w/p", 0, None),
         ];
-        let (_, sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
         assert_eq!(
@@ -583,7 +578,7 @@ mod tests {
     #[test]
     fn dto_errors_skip_with_diagnostic() {
         let rows = vec![json!({"status": "running"})];
-        let (_, sessions, diagnostics) = map_status_rows(&rows);
+        let (sessions, diagnostics) = map_status_rows(&rows);
         assert!(sessions.is_empty());
         assert_eq!(
             diagnostics,
@@ -594,44 +589,80 @@ mod tests {
     }
 
     #[test]
-    fn projects_group_in_first_seen_order_with_short_names() {
+    fn rows_keep_workspace_with_short_id_titles_and_no_project() {
         let rows = vec![
             row("s1", "idle", "/home/dev/beta", 0, None),
             row("s2", "idle", "/home/dev/alpha", 0, None),
             row("s3", "idle", "/home/dev/beta", 0, None),
         ];
-        let (projects, sessions, _) = map_status_rows(&rows);
-        assert_eq!(
-            projects.iter().map(|p| &p.name).collect::<Vec<_>>(),
-            [&String::from("beta"), &String::from("alpha")]
-        );
-        assert_eq!(
-            sessions[0].project,
-            Some(ProjectId::new("workspace:/home/dev/beta"))
-        );
-        assert_eq!(
-            sessions[2].project,
-            Some(ProjectId::new("workspace:/home/dev/beta"))
-        );
+        let (sessions, _) = map_status_rows(&rows);
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].workspace, String::from("/home/dev/beta"));
+        assert_eq!(sessions[0].title, String::from("s1"));
+        assert_eq!(sessions[0].project, None);
+        assert_eq!(sessions[2].workspace, String::from("/home/dev/beta"));
+        assert_eq!(sessions[2].title, String::from("s3"));
+        assert_eq!(sessions[2].project, None);
     }
 
     #[test]
-    fn projects_carry_their_workspace() {
-        let rows = vec![row("s1", "idle", "/home/dev/beta", 0, None)];
-        let (projects, _, _) = map_status_rows(&rows);
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].name, String::from("beta"));
-        assert_eq!(projects[0].workspace, Some(String::from("/home/dev/beta")));
+    fn orphaned_rows_keep_workspace() {
+        let rows = vec![row(
+            "sess-orphan",
+            "orphaned",
+            "/home/dev/storefront-web",
+            0,
+            None,
+        )];
+        let (sessions, _) = map_status_rows(&rows);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Orphaned);
+        assert_eq!(
+            sessions[0].workspace,
+            String::from("/home/dev/storefront-web")
+        );
+        assert_eq!(sessions[0].project, None);
     }
 
     #[test]
     fn title_truncates_by_chars_not_bytes() {
         let rows = vec![row("ééééééééXYZ", "idle", "/w/long-name", 0, Some(4))];
-        let (_, sessions, _) = map_status_rows(&rows);
+        let (sessions, _) = map_status_rows(&rows);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].title, "long-name · éééééééé");
+        assert_eq!(sessions[0].title, "éééééééé");
+        assert_eq!(sessions[0].workspace, String::from("/w/long-name"));
         assert_eq!(sessions[0].stream_dropped_deltas, 4);
         assert_eq!(sessions[0].relative_time, String::new());
+    }
+
+    #[test]
+    fn resume_result_keeps_commanded_session() {
+        let commanded = SessionId::new("sess-orphan");
+        let ok = json!({"content": [{"type": "text", "text": "catalog"}]});
+        assert_eq!(map_resume_result(&ok, &commanded), Ok(commanded.clone()));
+        // No isError flag at all still resumes.
+        let bare = json!({"content": []});
+        assert_eq!(map_resume_result(&bare, &commanded), Ok(commanded.clone()));
+    }
+
+    #[test]
+    fn resume_result_failures_carry_server_or_generic_text() {
+        let commanded = SessionId::new("sess-orphan");
+        let server = json!({
+            "content": [{"type": "text", "text": "session sess-orphan is in use"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_resume_result(&server, &commanded),
+            Err(String::from("session sess-orphan is in use"))
+        );
+        let empty = json!({"content": [], "isError": true});
+        assert_eq!(
+            map_resume_result(&empty, &commanded),
+            Err(String::from(
+                "Couldn't resume that session on the Muse MCP server."
+            ))
+        );
     }
 
     #[test]

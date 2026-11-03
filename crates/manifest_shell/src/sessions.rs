@@ -1,7 +1,12 @@
 //! Session list: the left panel's state, messages, and view.
 //!
-//! Sessions render grouped under their projects in fixture order,
+//! Sessions render grouped under their projects in registry order,
 //! with project-less sessions under a static "No project" header.
+//!
+//! The add-project popup is real in live mode and registers nothing in
+//! fixture mode: the App owns the OS folder picker, validates the
+//! form asynchronously, and persists the registry through
+//! manifest_store, routing the outcome back down as child messages.
 //! Selection is owned here: [`State::selected`] is the single owner of
 //! which session is selected, and the root reads it for the transcript
 //! header. `update` changes the selection only for ids already in the
@@ -12,13 +17,9 @@ use manifest_domain::{ProjectId, ProjectSummary, SessionId, SessionStatus, Sessi
 
 use crate::kit;
 use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, POPUP_WIDTH,
+    DANGER, FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, POPUP_WIDTH,
     SPACE_M, SPACE_S, SPACE_XS, SPACE_XXS, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
-
-/// Stand-in for the OS folder picker while the form is a fixture: the
-/// directory a "choose folder" press fills in.
-const FIXTURE_DIRECTORY: &str = "/home/sean/Code/billing-service";
 
 /// Messages the session list can receive, enumerated before the view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,10 +41,21 @@ pub enum Message {
     DirectoryChanged(String),
     /// A name was typed into the popup form.
     NameChanged(String),
-    /// Fill the popup directory from the fixture picker stand-in.
+    /// The App owns the OS folder picker: this is a child-level no-op
+    /// (mirroring the composer `SendPressed` split). The App intercepts
+    /// it and routes the picked path back as [`Message::DirectoryChanged`].
     PickDirectory,
-    /// Accept the popup form. Fixture form: registers nothing.
+    /// The App validates the form asynchronously: this is a child-level
+    /// no-op (same `SendPressed` split). The App intercepts it and
+    /// routes the outcome back as [`Message::AddProjectFailed`] or by
+    /// closing the popup.
     SubmitAddProject,
+    /// Record a validation failure on the open popup; no-op while closed.
+    AddProjectFailed(String),
+    /// Remove the project with this id: its sessions move (order
+    /// preserved) onto the end of unprojected, `expanded == id` becomes
+    /// `None`, and the selection is unchanged. Unknown id is a no-op.
+    RemoveProject(ProjectId),
 }
 
 /// One project's sessions in display order.
@@ -56,8 +68,9 @@ pub struct ProjectGroup {
 }
 
 /// The add-project popup has two real situations, so it is an enum,
-/// not an option of strings (UI contract §1). Fixture form: nothing
-/// registers or persists.
+/// not an option of strings (UI contract §1). The popup is real in
+/// live mode; in fixture mode it opens and closes but registers
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AddProject {
     /// No popup is showing.
@@ -71,6 +84,8 @@ pub enum AddProject {
         name: String,
         /// Whether the name was typed by hand (stops autofill).
         name_edited: bool,
+        /// Precomputed validation error shown under the form, if any.
+        error: Option<String>,
     },
 }
 
@@ -179,18 +194,35 @@ impl State {
 
     /// Shared directory rule for typed and picked directories: store
     /// the path, then autofill the name from its last segment unless
-    /// the name was typed by hand and still holds text.
+    /// the name was typed by hand and still holds text. Clears any
+    /// validation error: the user is fixing the form.
     fn set_directory(&mut self, directory: String) {
         if let AddProject::Open {
             directory: current,
             name,
             name_edited,
+            error,
         } = &mut self.add_project
         {
             *current = directory;
             if !*name_edited || name.is_empty() {
                 *name = directory_name(current).to_owned();
             }
+            *error = None;
+        }
+    }
+
+    /// Removes the project with this id: its sessions move (order
+    /// preserved) onto the end of unprojected, `expanded == id` becomes
+    /// `None`, and the selection is unchanged. Unknown id is a no-op.
+    fn remove_project(&mut self, id: &ProjectId) {
+        let Some(index) = self.groups.iter().position(|group| group.project.id == *id) else {
+            return;
+        };
+        let group = self.groups.remove(index);
+        self.unprojected.extend(group.sessions);
+        if self.expanded.as_ref() == Some(id) {
+            self.expanded = None;
         }
     }
 
@@ -226,24 +258,34 @@ impl State {
                     directory: String::new(),
                     name: String::new(),
                     name_edited: false,
+                    error: None,
                 };
             }
-            Message::CloseAddProject | Message::SubmitAddProject => {
+            Message::CloseAddProject => {
                 self.add_project = AddProject::Closed;
             }
+            // Owned by the App (OS picker / async validation): no-op here.
+            Message::PickDirectory | Message::SubmitAddProject => {}
             Message::DirectoryChanged(directory) => self.set_directory(directory),
-            Message::PickDirectory => self.set_directory(String::from(FIXTURE_DIRECTORY)),
             Message::NameChanged(name) => {
                 if let AddProject::Open {
                     name: current,
                     name_edited,
+                    error,
                     ..
                 } = &mut self.add_project
                 {
                     *current = name;
                     *name_edited = true;
+                    *error = None;
                 }
             }
+            Message::AddProjectFailed(error) => {
+                if let AddProject::Open { error: current, .. } = &mut self.add_project {
+                    *current = Some(error);
+                }
+            }
+            Message::RemoveProject(id) => self.remove_project(&id),
         }
     }
 
@@ -264,6 +306,7 @@ impl State {
                 group.project.name.as_str(),
                 Message::ExpandProject(group.project.id.clone()),
                 Message::NewSession(group.project.id.clone()),
+                Message::RemoveProject(group.project.id.clone()),
             ));
             if self.expanded.as_ref() == Some(&group.project.id) {
                 list = list.push(indented(session_rows(&group.sessions, &self.selected)));
@@ -282,7 +325,10 @@ impl State {
     /// Renders the add-project popup, or [`None`] while it is closed.
     pub fn add_project_view(&self) -> Option<Element<'_, Message>> {
         let AddProject::Open {
-            directory, name, ..
+            directory,
+            name,
+            error,
+            ..
         } = &self.add_project
         else {
             return None;
@@ -318,6 +364,12 @@ impl State {
                 .size(FONT_SIZE_SMALL)
                 .color(TEXT_SECONDARY),
             kit::text_field("Project name", name, Message::NameChanged),
+            match error {
+                Some(text) => iced::widget::text(text.as_str())
+                    .size(FONT_SIZE_SMALL)
+                    .color(DANGER),
+                None => iced::widget::text("").size(FONT_SIZE_SMALL),
+            },
             iced::widget::row![
                 iced::widget::container(iced::widget::text("").size(FONT_SIZE_BODY),)
                     .width(Length::Fill),
@@ -411,6 +463,7 @@ pub fn status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "Idle",
         SessionStatus::Running => "Running",
         SessionStatus::AwaitingApproval => "Awaiting approval",
+        SessionStatus::Orphaned => "Orphaned",
     }
 }
 
@@ -534,6 +587,7 @@ mod tests {
                 directory: String::new(),
                 name: String::new(),
                 name_edited: false,
+                error: None,
             }
         );
     }
@@ -551,6 +605,7 @@ mod tests {
                 directory: String::from("/x/y/billing-service"),
                 name: String::from("billing-service"),
                 name_edited: false,
+                error: None,
             }
         );
     }
@@ -568,6 +623,7 @@ mod tests {
                 directory: String::from("/x/y/billing-service/"),
                 name: String::from("billing-service"),
                 name_edited: false,
+                error: None,
             }
         );
     }
@@ -584,6 +640,7 @@ mod tests {
                 directory: String::from("/x/y/other"),
                 name: String::from("custom"),
                 name_edited: true,
+                error: None,
             }
         );
     }
@@ -601,33 +658,55 @@ mod tests {
                 directory: String::from("/x/y/other"),
                 name: String::from("other"),
                 name_edited: true,
+                error: None,
             }
         );
     }
 
     #[test]
-    fn pick_directory_fills_fixture_path_and_name() {
+    fn pick_directory_is_a_child_noop_owned_by_the_app() {
+        // The App owns the OS folder picker: the child never fills the
+        // form itself. The App intercepts PickDirectory and routes the
+        // picked path back as DirectoryChanged.
         let mut got = state();
         got.update(Message::OpenAddProject);
         got.update(Message::PickDirectory);
         assert_eq!(
             got.add_project,
             AddProject::Open {
-                directory: String::from(FIXTURE_DIRECTORY),
-                name: String::from("billing-service"),
+                directory: String::new(),
+                name: String::new(),
                 name_edited: false,
+                error: None,
             }
         );
     }
 
     #[test]
-    fn close_and_submit_both_close_the_popup() {
+    fn submit_is_a_child_noop_owned_by_the_app() {
+        // The App validates asynchronously: the child never closes the
+        // popup itself. The App intercepts SubmitAddProject and routes
+        // the outcome back as AddProjectFailed or CloseAddProject.
+        let mut got = state();
+        got.update(Message::OpenAddProject);
+        got.update(Message::DirectoryChanged(String::from("/x/y/z")));
+        got.update(Message::SubmitAddProject);
+        assert_eq!(
+            got.add_project,
+            AddProject::Open {
+                directory: String::from("/x/y/z"),
+                name: String::from("z"),
+                name_edited: false,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn close_closes_the_popup() {
         let mut got = state();
         got.update(Message::OpenAddProject);
         got.update(Message::CloseAddProject);
-        assert_eq!(got.add_project, AddProject::Closed);
-        got.update(Message::OpenAddProject);
-        got.update(Message::SubmitAddProject);
         assert_eq!(got.add_project, AddProject::Closed);
     }
 
@@ -637,7 +716,107 @@ mod tests {
         got.update(Message::DirectoryChanged(String::from("/x/y/z")));
         got.update(Message::NameChanged(String::from("z")));
         got.update(Message::PickDirectory);
+        got.update(Message::SubmitAddProject);
+        got.update(Message::AddProjectFailed(String::from("nope")));
         assert_eq!(got.add_project, AddProject::Closed);
+    }
+
+    #[test]
+    fn add_project_failed_sets_error_while_open() {
+        let mut got = state();
+        got.update(Message::OpenAddProject);
+        got.update(Message::AddProjectFailed(String::from(
+            "That folder couldn't be found.",
+        )));
+        assert_eq!(
+            got.add_project,
+            AddProject::Open {
+                directory: String::new(),
+                name: String::new(),
+                name_edited: false,
+                error: Some(String::from("That folder couldn't be found.")),
+            }
+        );
+    }
+
+    #[test]
+    fn typing_clears_the_error() {
+        let mut got = state();
+        got.update(Message::OpenAddProject);
+        got.update(Message::AddProjectFailed(String::from("bad")));
+        got.update(Message::DirectoryChanged(String::from("/x/y/other")));
+        assert_eq!(
+            got.add_project,
+            AddProject::Open {
+                directory: String::from("/x/y/other"),
+                name: String::from("other"),
+                name_edited: false,
+                error: None,
+            }
+        );
+        got.update(Message::AddProjectFailed(String::from("bad")));
+        got.update(Message::NameChanged(String::from("typed")));
+        assert_eq!(
+            got.add_project,
+            AddProject::Open {
+                directory: String::from("/x/y/other"),
+                name: String::from("typed"),
+                name_edited: true,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn remove_project_moves_sessions_to_unprojected_end() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a"), project("p-b", "b")],
+            vec![
+                row("s-1", Some("p-a")),
+                row("s-2", Some("p-b")),
+                row("s-3", Some("p-a")),
+                row("s-0", None),
+            ],
+        );
+        let selected = got.selected.clone();
+        got.update(Message::RemoveProject(ProjectId::new("p-a")));
+        assert_eq!(got.groups.len(), 1);
+        assert_eq!(got.groups[0].project.id, ProjectId::new("p-b"));
+        let unprojected: Vec<&str> = got
+            .unprojected
+            .iter()
+            .map(|summary| summary.id.as_str())
+            .collect();
+        assert_eq!(unprojected, vec!["s-0", "s-1", "s-3"]);
+        // Selection is unchanged even when its group is removed.
+        assert_eq!(got.selected, selected);
+    }
+
+    #[test]
+    fn remove_project_clears_expansion_only_for_the_removed_id() {
+        let mut got = State::from_projects(
+            vec![project("p-a", "a"), project("p-b", "b")],
+            vec![row("s-1", Some("p-a")), row("s-2", Some("p-b"))],
+        );
+        got.update(Message::ExpandProject(ProjectId::new("p-b")));
+        got.update(Message::RemoveProject(ProjectId::new("p-a")));
+        assert_eq!(got.expanded, Some(ProjectId::new("p-b")));
+        got.update(Message::RemoveProject(ProjectId::new("p-b")));
+        assert_eq!(got.expanded, None);
+    }
+
+    #[test]
+    fn remove_unknown_project_is_noop() {
+        let mut got = state();
+        let groups = got.groups.len();
+        let unprojected = got.unprojected.len();
+        let selected = got.selected.clone();
+        let expanded = got.expanded.clone();
+        got.update(Message::RemoveProject(ProjectId::new("no-such-project")));
+        assert_eq!(got.groups.len(), groups);
+        assert_eq!(got.unprojected.len(), unprojected);
+        assert_eq!(got.selected, selected);
+        assert_eq!(got.expanded, expanded);
     }
 
     #[test]
@@ -662,6 +841,7 @@ mod tests {
             title: String::from(id),
             status: SessionStatus::Idle,
             project: project.map(ProjectId::new),
+            workspace: String::new(),
             relative_time: String::from("now"),
             stream_dropped_deltas: 0,
         }
@@ -719,6 +899,7 @@ mod tests {
                 directory: String::from("/x/y/billing-service"),
                 name: String::from("billing-service"),
                 name_edited: false,
+                error: None,
             }
         );
     }

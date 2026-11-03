@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length, Task};
 use manifest_domain::{
-    Connection, EngineEvent, Fixture, ProjectId, SessionId, StreamEvent, TodoItem,
+    Connection, EngineEvent, Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus,
+    SessionSummary, SpawnChoices, StreamEvent, TodoItem, WorktreeChoice,
 };
 
 use crate::engine;
@@ -92,6 +93,29 @@ pub enum Message {
     /// The user pressed Retry after a connection failure; drops the old
     /// handle and starts a fresh connection attempt.
     Reconnect,
+    /// The project registry finished loading. `Ok(Present)` replaces the
+    /// registry and regroups; `Ok(Missing)` seeds from the loaded sessions
+    /// (or waits for the first load when empty); `Err` keeps the derived
+    /// fallback and shows the message. Store errors convert to strings
+    /// once here, at the boundary into the reducer.
+    ProjectsLoaded(Result<manifest_store::Loaded, String>),
+    /// A registry save finished. `Ok` needs no state change; `Err` shows
+    /// the message verbatim. Local state is never rolled back: a failed
+    /// save is partial success carried as a value.
+    ProjectsSaved(Result<(), String>),
+    /// The draft's worktree mode changed; no-op while no draft is open.
+    DraftWorktreeModeSelected(DraftWorktreeMode),
+    /// The draft's create-mode base ref changed; no-op while no draft.
+    DraftWorktreeBaseChanged(String),
+    /// The draft's existing-mode path changed; no-op while no draft.
+    DraftWorktreePathChanged(String),
+    /// The OS folder picker returned. `Some` types the path into the open
+    /// popup; `None` (dismissed) is a no-op.
+    DirectoryPicked(Option<String>),
+    /// The add-project form validation finished. `Ok` carries the
+    /// canonical directory and the trimmed name; `Err` carries the
+    /// message shown under the form.
+    AddProjectChecked(Result<(String, String), String>),
 }
 
 impl From<sessions::Message> for Message {
@@ -112,6 +136,18 @@ impl From<composer::Message> for Message {
     }
 }
 
+/// How the draft's spawned session places its working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DraftWorktreeMode {
+    /// Spawn directly in the project workspace.
+    #[default]
+    Off,
+    /// Create a worktree for the session, optionally from a base ref.
+    Create,
+    /// Use an existing worktree folder.
+    Existing,
+}
+
 /// A session being composed before it exists: entered from a project's
 /// "+" button, resolved into a real session on the next send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +156,47 @@ pub struct NewSessionDraft {
     pub workspace: String,
     /// Precomputed "project · New session" title the topbar reads.
     pub title: String,
+    /// How the spawned session places its working directory.
+    pub worktree_mode: DraftWorktreeMode,
+    /// Base ref for create mode; blank means no base.
+    pub worktree_base: String,
+    /// Folder for existing mode.
+    pub worktree_path: String,
+}
+
+impl NewSessionDraft {
+    /// Maps the draft's worktree fields to engine spawn choices: `Off`
+    /// spawns in place, `Create` trims the base (`None` when blank),
+    /// `Existing` carries the trimmed path.
+    pub fn choices(&self) -> SpawnChoices {
+        let worktree = match self.worktree_mode {
+            DraftWorktreeMode::Off => WorktreeChoice::Off,
+            DraftWorktreeMode::Create => {
+                let base = self.worktree_base.trim();
+                WorktreeChoice::Create {
+                    base: if base.is_empty() {
+                        None
+                    } else {
+                        Some(base.to_string())
+                    },
+                }
+            }
+            DraftWorktreeMode::Existing => WorktreeChoice::Existing {
+                path: self.worktree_path.trim().to_string(),
+            },
+        };
+        SpawnChoices { worktree }
+    }
+}
+
+/// A spawn in flight, kept so a failure can restore it for retry: the
+/// taken draft (when the spawn came from one) plus the failed prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSpawn {
+    /// The draft taken by the spawn, if it came from one.
+    pub draft: Option<NewSessionDraft>,
+    /// The prompt the spawn carried.
+    pub prompt: String,
 }
 
 /// Root state: the child states plus the drawer.
@@ -146,6 +223,13 @@ pub struct App {
     /// its optimistic prompt; cleared on `SessionSpawned` (which
     /// adopts the transcript) or `CommandFailed`.
     pub awaiting_spawn: bool,
+    /// The in-flight spawn, set together with [`App::awaiting_spawn`]
+    /// whenever a spawn is issued; `Some` means the spawn can be
+    /// restored on failure.
+    pub pending_spawn: Option<PendingSpawn>,
+    /// Orphaned sessions with a resume in flight; gates duplicate
+    /// resumes and the send button.
+    pub resuming: HashSet<SessionId>,
     /// A new session being composed in a project's workspace; set by
     /// the project's "+" button, cleared on send (which spawns it) or
     /// on session select. While set, the visible transcript is the
@@ -178,6 +262,21 @@ pub struct App {
     /// The server config to connect with; `None` in fixture mode, where
     /// no server is ever spawned.
     pub engine_config: Option<manifest_mcp::ServerConfig>,
+    /// The persisted project registry store; `None` in fixture mode,
+    /// where nothing is ever read from or written to disk.
+    pub project_store: Option<manifest_store::ProjectStore>,
+    /// The authoritative project registry once loaded. Empty until the
+    /// load completes; every mutation sets this to the new list before
+    /// its save task is created, so the task always saves the new list.
+    pub projects: Vec<ProjectSummary>,
+    /// Whether `projects` is authoritative. `false` (load pending or
+    /// failed, or no store) falls back to derived grouping; `true` means
+    /// the list renders from `projects`.
+    pub projects_ready: bool,
+    /// Whether the authoritative load said `Missing` while no sessions
+    /// were listed yet: the registry stays empty until the first session
+    /// load seeds it. Cleared by any explicit registry content.
+    pub projects_missing: bool,
 }
 
 impl App {
@@ -204,6 +303,8 @@ impl App {
             running: HashSet::new(),
             select_on_load: None,
             awaiting_spawn: false,
+            pending_spawn: None,
+            resuming: HashSet::new(),
             new_session: None,
             composer: composer::State::new(),
             todos: fixture.todos,
@@ -217,6 +318,10 @@ impl App {
             connection_attempt: 0,
             engine: None,
             engine_config: None,
+            project_store: None,
+            projects: Vec::new(),
+            projects_ready: false,
+            projects_missing: false,
         };
         app.refresh_send_gate();
         app
@@ -225,8 +330,12 @@ impl App {
     /// Production boot: connects to the real server. Starts empty (no
     /// sessions, no transcript entries, no todos) with the connection
     /// at `Connecting`, then connects on the first subscription tick;
-    /// sessions arrive through the engine stream.
-    pub fn live(config: manifest_mcp::ServerConfig) -> Self {
+    /// sessions arrive through the engine stream. The registry starts
+    /// empty and unauthoritative; [`App::project_load_task`] loads it.
+    pub fn live(
+        config: manifest_mcp::ServerConfig,
+        project_store: Option<manifest_store::ProjectStore>,
+    ) -> Self {
         let mut app = Self::from_fixture(manifest_domain::fixture());
         app.sessions = sessions::State::from_projects(Vec::new(), Vec::new());
         app.transcript = transcript::State::default();
@@ -235,6 +344,10 @@ impl App {
         app.current_todo = None;
         app.connection = Connection::Connecting;
         app.engine_config = Some(config);
+        app.project_store = project_store;
+        app.projects = Vec::new();
+        app.projects_ready = false;
+        app.projects_missing = false;
         app.refresh_send_gate();
         app
     }
@@ -314,7 +427,13 @@ impl App {
                 .insert(owner, std::mem::take(&mut self.transcript));
         }
         self.transcript = transcript::State::default();
-        self.new_session = Some(NewSessionDraft { workspace, title });
+        self.new_session = Some(NewSessionDraft {
+            workspace,
+            title,
+            worktree_mode: DraftWorktreeMode::Off,
+            worktree_base: String::new(),
+            worktree_path: String::new(),
+        });
     }
 
     /// Whether the id names a session in the current list.
@@ -340,13 +459,12 @@ impl App {
     /// Recomputes whether the composer send button is live. The
     /// single writer of [`composer::State::send_enabled`] outside
     /// [`composer::State::new`]: send needs a server config, a live
-    /// connection with a handle, no spawn in flight, and no turn in
-    /// flight on the listed selection (when one is listed).
+    /// connection with a handle, no spawn in flight, and no turn or
+    /// resume in flight on the listed selection (when one is listed).
     fn refresh_send_gate(&mut self) {
-        let selected_running = self
-            .sessions
-            .selected_summary()
-            .is_some_and(|summary| self.running.contains(&summary.id));
+        let selected_running = self.sessions.selected_summary().is_some_and(|summary| {
+            self.running.contains(&summary.id) || self.resuming.contains(&summary.id)
+        });
         // A draft is a spawn, not a follow-up: the selected session's
         // running state does not gate it.
         let gated_by_selection = selected_running && self.new_session.is_none();
@@ -357,14 +475,252 @@ impl App {
             && !gated_by_selection;
     }
 
+    /// Sessions in display order: grouped rows then unprojected, cloned.
+    /// The mutation base for registry updates and reseeding.
+    fn current_sessions(&self) -> Vec<SessionSummary> {
+        self.sessions
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter().cloned())
+            .chain(self.sessions.unprojected.iter().cloned())
+            .collect()
+    }
+
+    /// The project list mutations start from: the authoritative registry
+    /// once loaded, else a fresh seed from the listed sessions (which
+    /// also recovers after a failed load).
+    fn registry_projects(&self) -> Vec<ProjectSummary> {
+        if self.projects_ready {
+            self.projects.clone()
+        } else {
+            manifest_domain::seed_projects(&self.current_sessions())
+        }
+    }
+
+    /// Saves the current registry list to disk. Callers set `projects`
+    /// (and `projects_ready`) to the new list before creating the task,
+    /// so the task saves the new list. No store means no task.
+    fn save_projects_task(&self) -> Task<Message> {
+        let Some(store) = &self.project_store else {
+            return Task::none();
+        };
+        let path = store.path().to_path_buf();
+        let list = self.projects.clone();
+        Task::perform(
+            async move { manifest_store::ProjectStore::new(path).save(&list) },
+            |result| Message::ProjectsSaved(result.map_err(|error| error.to_string())),
+        )
+    }
+
+    /// Loads the persisted registry; the result arrives as
+    /// [`Message::ProjectsLoaded`]. No store means no task.
+    pub(crate) fn project_load_task(&self) -> Task<Message> {
+        let Some(store) = &self.project_store else {
+            return Task::none();
+        };
+        let path = store.path().to_path_buf();
+        Task::perform(
+            async move { manifest_store::ProjectStore::new(path).load() },
+            |result| Message::ProjectsLoaded(result.map_err(|error| error.to_string())),
+        )
+    }
+
+    /// Folds a registry load into state: replaces the registry, regroups
+    /// the listed sessions under it, and keeps the visible transcript on
+    /// the selection. Returns a save task when a `Missing` load seeds
+    /// from listed sessions, else no task.
+    fn apply_projects_loaded(
+        &mut self,
+        result: Result<manifest_store::Loaded, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(manifest_store::Loaded::Present(list)) => {
+                self.projects = list;
+                self.projects_ready = true;
+                self.projects_missing = false;
+                self.regroup_under_registry();
+                self.refresh_send_gate();
+                Task::none()
+            }
+            Ok(manifest_store::Loaded::Missing) => {
+                if self.current_sessions().is_empty() {
+                    self.projects = Vec::new();
+                    self.projects_ready = true;
+                    self.projects_missing = true;
+                    self.refresh_send_gate();
+                    Task::none()
+                } else {
+                    self.projects = manifest_domain::seed_projects(&self.current_sessions());
+                    self.projects_ready = true;
+                    self.projects_missing = false;
+                    self.regroup_under_registry();
+                    self.refresh_send_gate();
+                    self.save_projects_task()
+                }
+            }
+            Err(message) => {
+                let appended = self.transcript.push_error(message);
+                self.refresh_send_gate();
+                scroll_transcript_to_end(appended)
+            }
+        }
+    }
+
+    /// Rebuilds the list groups from the authoritative registry: assigns
+    /// the listed sessions under `projects` and replaces the list state,
+    /// then keeps the visible transcript on the selection.
+    fn regroup_under_registry(&mut self) {
+        let current = self.current_sessions();
+        let assigned = manifest_domain::assign_projects(&self.projects, current);
+        let projects = self.projects.clone();
+        self.sessions.replace(projects, assigned);
+        self.sync_visible_transcript();
+    }
+
+    /// Handles the intercepted add-project submit: fixture (or any store
+    /// less) mode closes the popup and registers nothing; live mode
+    /// validates the form asynchronously and routes the outcome back as
+    /// [`Message::AddProjectChecked`], leaving the popup open meanwhile.
+    fn submit_add_project(&mut self) -> Task<Message> {
+        let (directory, name) = match &self.sessions.add_project {
+            sessions::AddProject::Open {
+                directory, name, ..
+            } => (directory.clone(), name.clone()),
+            sessions::AddProject::Closed => return Task::none(),
+        };
+        if self.project_store.is_none() {
+            self.sessions.update(sessions::Message::CloseAddProject);
+            return Task::none();
+        }
+        if directory.trim().is_empty() || name.trim().is_empty() {
+            self.sessions
+                .update(sessions::Message::AddProjectFailed(String::from(
+                    "Choose a project directory and name.",
+                )));
+            return Task::none();
+        }
+        Task::perform(
+            async move { validate_project_dir(directory, name) },
+            Message::AddProjectChecked,
+        )
+    }
+
+    /// Folds a finished add-project validation into state. A known
+    /// workspace expands its existing group; a new one appends to the
+    /// registry, regroups, expands, and saves. A closed popup still
+    /// registers the project; only the close and expand steps no-op.
+    fn apply_add_project_checked(
+        &mut self,
+        checked: Result<(String, String), String>,
+    ) -> Task<Message> {
+        let (directory, name) = match checked {
+            Ok(valid) => valid,
+            Err(message) => {
+                self.sessions
+                    .update(sessions::Message::AddProjectFailed(message));
+                return Task::none();
+            }
+        };
+        let list = self.registry_projects();
+        if let Some(existing) = list
+            .iter()
+            .find(|project| {
+                project
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|workspace| workspace.trim() == directory.trim())
+            })
+            .map(|project| project.id.clone())
+        {
+            self.sessions.update(sessions::Message::CloseAddProject);
+            let assigned = manifest_domain::assign_projects(&list, self.current_sessions());
+            self.sessions.replace(list, assigned);
+            self.sessions.expanded = Some(existing);
+            return Task::none();
+        }
+        let id = ProjectId::for_workspace(&directory);
+        let mut projects = list;
+        projects.push(ProjectSummary {
+            id: id.clone(),
+            name,
+            workspace: Some(directory),
+        });
+        self.projects = projects;
+        self.projects_ready = true;
+        self.projects_missing = false;
+        let assigned = manifest_domain::assign_projects(&self.projects, self.current_sessions());
+        let snapshot = self.projects.clone();
+        self.sessions.replace(snapshot, assigned);
+        self.sessions.expanded = Some(id);
+        self.sessions.update(sessions::Message::CloseAddProject);
+        self.save_projects_task()
+    }
+
+    /// Handles the intercepted project removal: the child moves the rows
+    /// first, then the live path drops the project from the registry
+    /// (matching by id, and by workspace so a not-ready seed cannot
+    /// bring it back), cancels a draft in its workspace, regroups to
+    /// recompute row ownership, and saves. Fixture mode keeps the child
+    /// regroup only.
+    fn remove_project(&mut self, id: ProjectId) -> Task<Message> {
+        let removed_workspace = self
+            .sessions
+            .groups
+            .iter()
+            .find(|group| group.project.id == id)
+            .and_then(|group| group.project.workspace.clone());
+        self.sessions
+            .update(sessions::Message::RemoveProject(id.clone()));
+        if self.project_store.is_none() {
+            return Task::none();
+        }
+        let mut list = self.registry_projects();
+        let before = list.len();
+        list.retain(|project| project.id != id);
+        if let Some(workspace) = &removed_workspace {
+            list.retain(|project| project.workspace.as_deref() != Some(workspace.as_str()));
+        }
+        if list.len() == before {
+            return Task::none();
+        }
+        self.projects = list;
+        self.projects_ready = true;
+        self.projects_missing = false;
+        if self
+            .new_session
+            .as_ref()
+            .is_some_and(|draft| Some(draft.workspace.as_str()) == removed_workspace.as_deref())
+        {
+            self.new_session = None;
+        }
+        let assigned = manifest_domain::assign_projects(&self.projects, self.current_sessions());
+        let snapshot = self.projects.clone();
+        self.sessions.replace(snapshot, assigned);
+        self.sync_visible_transcript();
+        self.refresh_send_gate();
+        self.save_projects_task()
+    }
+
     /// Spawns a session in the given workspace with the draft prompt:
     /// the shared tail of the draft spawn and the no-selection cwd
     /// fallback. Echoes the prompt optimistically, clears the draft,
     /// and marks the spawn in flight until `SessionSpawned` adopts it.
-    fn spawn_session(&mut self, workspace: String, prompt: String) -> Task<Message> {
+    /// Keeps the taken draft (when the spawn came from one) and the
+    /// prompt so a failure can restore them for retry.
+    fn spawn_session(
+        &mut self,
+        draft: Option<NewSessionDraft>,
+        workspace: String,
+        prompt: String,
+        choices: SpawnChoices,
+    ) -> Task<Message> {
         if let Some(engine) = self.engine.clone() {
-            engine.spawn_session(workspace, prompt.clone());
+            engine.spawn_session(workspace, prompt.clone(), choices);
         }
+        self.pending_spawn = Some(PendingSpawn {
+            draft,
+            prompt: prompt.clone(),
+        });
         self.awaiting_spawn = true;
         self.transcript.push_user(prompt);
         self.composer.clear();
@@ -392,8 +748,21 @@ impl App {
             let appended = self.transcript.push_error(not_connected_message());
             return scroll_transcript_to_end(appended);
         }
-        if let Some(draft) = self.new_session.take() {
-            return self.spawn_session(draft.workspace, text);
+        if self.new_session.is_some() {
+            let choices = self
+                .new_session
+                .as_ref()
+                .expect("draft checked above")
+                .choices();
+            if matches!(&choices.worktree, WorktreeChoice::Existing { path } if path.is_empty()) {
+                let appended = self.transcript.push_error(String::from(
+                    "Choose an existing worktree folder, or switch the worktree choice off.",
+                ));
+                return scroll_transcript_to_end(appended);
+            }
+            let draft = self.new_session.take().expect("draft checked above");
+            let workspace = draft.workspace.clone();
+            return self.spawn_session(Some(draft), workspace, text, choices);
         }
         if let Some(summary) = self.sessions.selected_summary() {
             let session = summary.id.clone();
@@ -417,7 +786,7 @@ impl App {
                 return scroll_transcript_to_end(appended);
             }
         };
-        self.spawn_session(workspace, text)
+        self.spawn_session(None, workspace, text, SpawnChoices::default())
     }
 
     /// Folds one stream event into the owning session's transcript:
@@ -500,6 +869,26 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            // The App owns the OS picker, the async validation, and the
+            // registry: these child messages never reach the child
+            // reducer directly.
+            Message::Sessions(sessions::Message::PickDirectory) => {
+                if self.engine_config.is_some() {
+                    Task::perform(
+                        async {
+                            rfd::AsyncFileDialog::new()
+                                .pick_folder()
+                                .await
+                                .map(|handle| handle.path().display().to_string())
+                        },
+                        Message::DirectoryPicked,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Sessions(sessions::Message::SubmitAddProject) => self.submit_add_project(),
+            Message::Sessions(sessions::Message::RemoveProject(id)) => self.remove_project(id),
             Message::Sessions(child) => {
                 let select = matches!(child, sessions::Message::Select(_));
                 let draft_project = match &child {
@@ -515,9 +904,60 @@ impl App {
                     self.new_session = None;
                 }
                 self.sync_visible_transcript();
+                if select && let Some(summary) = self.sessions.selected_summary() {
+                    let id = summary.id.clone();
+                    let status = summary.status.clone();
+                    if status == SessionStatus::Orphaned
+                        && self.engine_config.is_some()
+                        && self.connection == Connection::Connected
+                        && !self.resuming.contains(&id)
+                        && let Some(engine) = &self.engine
+                    {
+                        engine.resume_session(id.clone());
+                        self.resuming.insert(id);
+                    }
+                }
                 self.refresh_send_gate();
                 Task::none()
             }
+            Message::DraftWorktreeModeSelected(mode) => {
+                if let Some(draft) = &mut self.new_session {
+                    draft.worktree_mode = mode;
+                }
+                self.refresh_send_gate();
+                Task::none()
+            }
+            Message::DraftWorktreeBaseChanged(base) => {
+                if let Some(draft) = &mut self.new_session {
+                    draft.worktree_base = base;
+                }
+                self.refresh_send_gate();
+                Task::none()
+            }
+            Message::DraftWorktreePathChanged(path) => {
+                if let Some(draft) = &mut self.new_session {
+                    draft.worktree_path = path;
+                }
+                self.refresh_send_gate();
+                Task::none()
+            }
+            Message::ProjectsLoaded(result) => self.apply_projects_loaded(result),
+            Message::ProjectsSaved(result) => match result {
+                Ok(()) => Task::none(),
+                Err(message) => {
+                    let appended = self.transcript.push_error(message);
+                    self.refresh_send_gate();
+                    scroll_transcript_to_end(appended)
+                }
+            },
+            Message::DirectoryPicked(picked) => {
+                if let Some(path) = picked {
+                    self.sessions
+                        .update(sessions::Message::DirectoryChanged(path));
+                }
+                Task::none()
+            }
+            Message::AddProjectChecked(checked) => self.apply_add_project_checked(checked),
             Message::Composer(composer::Message::SendPressed) => {
                 let task = self.send_from_composer();
                 self.refresh_send_gate();
@@ -589,6 +1029,7 @@ impl App {
                     return Task::none();
                 }
                 let mut appended = false;
+                let mut extra_task: Task<Message> = Task::none();
                 match input {
                     engine::Input::Ready(handle) => {
                         self.engine = Some(handle);
@@ -610,7 +1051,27 @@ impl App {
                                 self.running.clear();
                             }
                         }
-                        EngineEvent::SessionsLoaded { projects, sessions } => {
+                        EngineEvent::SessionsLoaded { sessions } => {
+                            if self.project_store.is_some() && self.projects_missing {
+                                let seeded = manifest_domain::seed_projects(&sessions);
+                                if !seeded.is_empty() {
+                                    self.projects = seeded;
+                                    self.projects_missing = false;
+                                    self.projects_ready = true;
+                                    extra_task = self.save_projects_task();
+                                }
+                            }
+                            let projects = if self.projects_ready {
+                                self.projects.clone()
+                            } else {
+                                manifest_domain::seed_projects(&sessions)
+                            };
+                            let sessions = manifest_domain::assign_projects(&projects, sessions);
+                            self.resuming.retain(|id| {
+                                sessions
+                                    .iter()
+                                    .any(|s| &s.id == id && s.status == SessionStatus::Orphaned)
+                            });
                             self.sessions.replace(projects, sessions);
                             if let Some(spawned) = self.select_on_load.clone()
                                 && self.session_is_listed(&spawned)
@@ -625,6 +1086,17 @@ impl App {
                         }
                         EngineEvent::CommandFailed(message) => {
                             appended = self.transcript.push_error(message);
+                            if self.awaiting_spawn {
+                                if let Some(pending) = self.pending_spawn.take() {
+                                    if let Some(draft) = pending.draft {
+                                        self.new_session = Some(draft);
+                                    }
+                                    self.composer.restore(pending.prompt);
+                                }
+                            } else {
+                                // Failures release resume gates so the next select retries.
+                                self.resuming.clear();
+                            }
                             if let Some(visible) = self.visible_session.clone() {
                                 self.running.remove(&visible);
                             }
@@ -643,6 +1115,7 @@ impl App {
                                 // parking the echo away first.
                                 self.visible_session = Some(session);
                                 self.awaiting_spawn = false;
+                                self.pending_spawn = None;
                             } else {
                                 self.sync_visible_transcript();
                             }
@@ -653,6 +1126,14 @@ impl App {
                         EngineEvent::TurnAccepted { session, .. } => {
                             self.running.insert(session);
                         }
+                        EngineEvent::SessionResumed { session } => {
+                            self.resuming.remove(&session);
+                            if self.connection == Connection::Connected
+                                && let Some(engine) = &self.engine
+                            {
+                                engine.list_sessions();
+                            }
+                        }
                         EngineEvent::Diagnostic(message) => {
                             appended = self.transcript.push_error(message);
                         }
@@ -662,11 +1143,12 @@ impl App {
                     },
                 }
                 self.refresh_send_gate();
-                if appended {
+                let scrolled = if appended {
                     transcript::scroll_to_end().map(Message::Transcript)
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([scrolled, extra_task])
             }
             Message::Reconnect => {
                 if self.engine_config.is_some() {
@@ -726,6 +1208,9 @@ impl App {
                 TodoDrawer::Open => todo_drawer_view(&self.todos, current, &self.todo_summary),
             };
             main = main.push(drawer);
+        }
+        if let Some(draft) = &self.new_session {
+            main = main.push(worktree_bar_view(draft));
         }
         let main: Element<'_, Message> = main
             .push(
@@ -847,6 +1332,23 @@ fn resize_corner<'a>(
     .into()
 }
 
+/// Validates the add-project form off the reducer: trims the name, then
+/// resolves the directory to its canonical path. Runs inside a
+/// [`Task`] so the reducer never touches the filesystem.
+fn validate_project_dir(directory: String, name: String) -> Result<(String, String), String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(String::from("Give the project a name."));
+    }
+    let canonical = std::fs::canonicalize(directory.trim()).map_err(|_| {
+        String::from("That folder couldn't be found. Check the path and try again.")
+    })?;
+    if !canonical.is_dir() {
+        return Err(String::from("That path isn't a folder. Choose a folder."));
+    }
+    Ok((canonical.display().to_string(), trimmed_name.to_string()))
+}
+
 /// User-facing note when send is pressed while the engine is not
 /// connected yet. Matches the worker's wording for the same refusal.
 fn not_connected_message() -> String {
@@ -953,6 +1455,67 @@ fn topbar(state: &App) -> Element<'_, Message> {
         .align_y(iced::alignment::Vertical::Center)
         .width(Length::Fill),
     )
+}
+
+/// The new-session draft's worktree bar, rendered directly above the
+/// composer while a draft is open: the mode pills, then the mode's
+/// field (if any). Reads the draft only (UI contract §2).
+fn worktree_bar_view(draft: &NewSessionDraft) -> Element<'_, Message> {
+    let kind_for = |mode| {
+        if draft.worktree_mode == mode {
+            kit::ButtonKind::Primary
+        } else {
+            kit::ButtonKind::Ghost
+        }
+    };
+    let row = iced::widget::row![
+        iced::widget::text("Worktree")
+            .size(FONT_SIZE_SMALL)
+            .color(TEXT_SECONDARY),
+        kit::pill_button(
+            "Off",
+            kind_for(DraftWorktreeMode::Off),
+            Some(Message::DraftWorktreeModeSelected(DraftWorktreeMode::Off)),
+        ),
+        kit::pill_button(
+            "Create",
+            kind_for(DraftWorktreeMode::Create),
+            Some(Message::DraftWorktreeModeSelected(
+                DraftWorktreeMode::Create
+            )),
+        ),
+        kit::pill_button(
+            "Existing",
+            kind_for(DraftWorktreeMode::Existing),
+            Some(Message::DraftWorktreeModeSelected(
+                DraftWorktreeMode::Existing
+            )),
+        ),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    let mut bar = iced::widget::column![iced::widget::container(row).width(Length::Fill),]
+        .spacing(SPACE_S)
+        .width(Length::Fill);
+    match draft.worktree_mode {
+        DraftWorktreeMode::Create => {
+            bar = bar.push(kit::text_field(
+                "Base ref (optional)",
+                draft.worktree_base.as_str(),
+                Message::DraftWorktreeBaseChanged,
+            ));
+        }
+        DraftWorktreeMode::Existing => {
+            bar = bar.push(kit::text_field(
+                "Existing worktree path",
+                draft.worktree_path.as_str(),
+                Message::DraftWorktreePathChanged,
+            ));
+        }
+        DraftWorktreeMode::Off => {}
+    }
+    bar.into()
 }
 
 /// The open TODO drawer: a panel whose first row is the shared bar
@@ -1164,6 +1727,7 @@ mod tests {
                 directory: String::from("/x/y/billing-service"),
                 name: String::from("billing-service"),
                 name_edited: false,
+                error: None,
             }
         );
         assert!(got.sessions.add_project_view().is_some());
@@ -1183,6 +1747,7 @@ mod tests {
                 directory: String::new(),
                 name: String::new(),
                 name_edited: false,
+                error: None,
             }
         );
     }
@@ -1222,8 +1787,9 @@ mod tests {
     #[derive(Clone)]
     struct FakeEngine {
         calls: std::sync::Arc<std::sync::Mutex<usize>>,
-        spawns: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        spawns: std::sync::Arc<std::sync::Mutex<Vec<(String, String, manifest_domain::SpawnChoices)>>>,
         turns: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
+        resumes: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
     }
 
     impl manifest_domain::SessionEngine for FakeEngine {
@@ -1231,12 +1797,24 @@ mod tests {
             *self.calls.lock().unwrap() += 1;
         }
 
-        fn spawn_session(&self, workspace: String, prompt: String) {
-            self.spawns.lock().unwrap().push((workspace, prompt));
+        fn spawn_session(
+            &self,
+            workspace: String,
+            prompt: String,
+            choices: manifest_domain::SpawnChoices,
+        ) {
+            self.spawns
+                .lock()
+                .unwrap()
+                .push((workspace, prompt, choices));
         }
 
         fn send_turn(&self, session: manifest_domain::SessionId, prompt: String) {
             self.turns.lock().unwrap().push((session, prompt));
+        }
+
+        fn resume_session(&self, session: manifest_domain::SessionId) {
+            self.resumes.lock().unwrap().push(session);
         }
     }
 
@@ -1247,8 +1825,9 @@ mod tests {
             calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
             spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        let mut app = App::live(manifest_mcp::ServerConfig::new("fake"));
+        let mut app = App::live(manifest_mcp::ServerConfig::new("fake"), None);
         let attempt = app.connection_attempt;
         let _ = app.update(Message::Engine {
             attempt,
@@ -1282,20 +1861,13 @@ mod tests {
         }
     }
 
-    fn draft_project() -> manifest_domain::ProjectSummary {
-        manifest_domain::ProjectSummary {
-            id: manifest_domain::ProjectId::new("project-live"),
-            name: String::from("live"),
-            workspace: Some(String::from("/live/workspace")),
-        }
-    }
-
     fn live_session(id: &str) -> manifest_domain::SessionSummary {
         manifest_domain::SessionSummary {
             id: manifest_domain::SessionId::new(id),
             title: String::from(id),
             status: manifest_domain::SessionStatus::Idle,
-            project: Some(manifest_domain::ProjectId::new("project-live")),
+            project: None,
+            workspace: String::from("/live/workspace"),
             relative_time: String::from("now"),
             stream_dropped_deltas: 0,
         }
@@ -1316,7 +1888,6 @@ mod tests {
         deliver(
             &mut app,
             engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
-                projects: vec![live_project()],
                 sessions: vec![live_session("s-1"), live_session("s-2")],
             }),
         );
@@ -1463,7 +2034,6 @@ mod tests {
         deliver(
             app,
             engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
-                projects: vec![live_project()],
                 sessions: ids.iter().map(|id| live_session(id)).collect(),
             }),
         );
@@ -1735,7 +2305,7 @@ mod tests {
 
     #[test]
     fn live_boot_is_empty_and_connecting() {
-        let app = App::live(manifest_mcp::ServerConfig::new("fake"));
+        let app = App::live(manifest_mcp::ServerConfig::new("fake"), None);
         assert!(app.transcript.entries.is_empty());
         assert!(app.todos.is_empty());
         assert!(app.sessions.groups.is_empty());
@@ -1807,7 +2377,11 @@ mod tests {
         let workspace = std::env::current_dir().unwrap().display().to_string();
         assert_eq!(
             *fake.spawns.lock().unwrap(),
-            vec![(workspace, String::from("start me"))]
+            vec![(
+                workspace,
+                String::from("start me"),
+                manifest_domain::SpawnChoices::default()
+            )]
         );
         assert!(fake.turns.lock().unwrap().is_empty());
         assert!(app.awaiting_spawn);
@@ -1870,22 +2444,24 @@ mod tests {
         assert!(app.composer.send_enabled);
     }
 
-    /// Loads one project carrying a workspace, for draft tests.
+    /// Loads sessions sharing one workspace, for draft tests: the
+    /// derived project carries that workspace.
     fn loaded_with_workspace(app: &mut App) {
-        deliver(
-            app,
-            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
-                projects: vec![draft_project()],
-                sessions: vec![live_session("s-1"), live_session("s-2")],
-            }),
-        );
+        loaded(app, &["s-1", "s-2"]);
     }
 
-    /// Presses the project's "+" button through the root reducer.
+    /// Presses the first listed project's "+" button through the root
+    /// reducer.
     fn new_session_pressed(app: &mut App) {
-        let _ = app.update(Message::Sessions(sessions::Message::NewSession(
-            manifest_domain::ProjectId::new("project-live"),
-        )));
+        let project = app
+            .sessions
+            .groups
+            .first()
+            .expect("a listed project")
+            .project
+            .id
+            .clone();
+        let _ = app.update(Message::Sessions(sessions::Message::NewSession(project)));
     }
 
     #[test]
@@ -1900,12 +2476,15 @@ mod tests {
             app.new_session,
             Some(NewSessionDraft {
                 workspace: String::from("/live/workspace"),
-                title: String::from("live · New session"),
+                title: String::from("workspace · New session"),
+                worktree_mode: DraftWorktreeMode::Off,
+                worktree_base: String::new(),
+                worktree_path: String::new(),
             })
         );
         assert_eq!(
             app.sessions.expanded,
-            Some(manifest_domain::ProjectId::new("project-live"))
+            Some(manifest_domain::ProjectId::for_workspace("/live/workspace"))
         );
         // The s-1 transcript parks; the draft shows empty.
         assert!(app.transcript.entries.is_empty());
@@ -1924,7 +2503,11 @@ mod tests {
         send_pressed(&mut app);
         assert_eq!(
             *fake.spawns.lock().unwrap(),
-            vec![(String::from("/live/workspace"), String::from("fresh idea"))]
+            vec![(
+                String::from("/live/workspace"),
+                String::from("fresh idea"),
+                manifest_domain::SpawnChoices::default()
+            )]
         );
         assert!(fake.turns.lock().unwrap().is_empty());
         assert!(app.new_session.is_none());
@@ -1987,7 +2570,12 @@ mod tests {
     fn new_session_without_workspace_expands_without_draft() {
         let (mut app, _) = live_app();
         deliver_connected(&mut app);
-        loaded(&mut app, &["s-1"]);
+        // A listed project with no workspace: built through replace
+        // directly, since derived projects always carry one.
+        let mut session = live_session("s-1");
+        session.workspace = String::new();
+        session.project = Some(manifest_domain::ProjectId::new("project-live"));
+        app.sessions.replace(vec![live_project()], vec![session]);
         new_session_pressed(&mut app);
         assert_eq!(
             app.sessions.expanded,
@@ -2009,7 +2597,7 @@ mod tests {
         assert_eq!(app.new_session, None);
         assert_eq!(
             app.sessions.expanded,
-            Some(manifest_domain::ProjectId::new("project-live"))
+            Some(manifest_domain::ProjectId::for_workspace("/live/workspace"))
         );
     }
 
@@ -2024,5 +2612,824 @@ mod tests {
             app.sessions.expanded,
             Some(manifest_domain::ProjectId::new("project-checkout-api"))
         );
+    }
+
+    /// Unique temp dir per test: temp dir plus process id, millis, and an
+    /// atomic counter, so parallel tests never share a registry file.
+    /// Std only. Best-effort cleanup after the test.
+    static STORE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_registry_path(suffix: &str) -> std::path::PathBuf {
+        let unique = STORE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "manifest-shell-test-{}-{millis}-{unique}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique temp dir");
+        dir.join("projects.json")
+    }
+
+    fn cleanup_registry(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// Production boot with a registry store, handle already delivered.
+    fn live_app_with_store(path: std::path::PathBuf) -> (App, FakeEngine) {
+        let fake = FakeEngine {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            spawns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            turns: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut app = App::live(
+            manifest_mcp::ServerConfig::new("fake"),
+            Some(manifest_store::ProjectStore::new(path)),
+        );
+        let attempt = app.connection_attempt;
+        let _ = app.update(Message::Engine {
+            attempt,
+            input: engine::Input::Ready(engine::EngineHandle::new(fake.clone())),
+        });
+        (app, fake)
+    }
+
+    fn workspace_session(id: &str, workspace: &str) -> manifest_domain::SessionSummary {
+        manifest_domain::SessionSummary {
+            id: SessionId::new(id),
+            title: String::from(id),
+            status: manifest_domain::SessionStatus::Idle,
+            project: None,
+            workspace: String::from(workspace),
+            relative_time: String::from("now"),
+            stream_dropped_deltas: 0,
+        }
+    }
+
+    fn workspace_project(name: &str, workspace: &str) -> manifest_domain::ProjectSummary {
+        manifest_domain::ProjectSummary {
+            id: manifest_domain::ProjectId::for_workspace(workspace),
+            name: String::from(name),
+            workspace: Some(String::from(workspace)),
+        }
+    }
+
+    fn load_sessions(app: &mut App, sessions: Vec<manifest_domain::SessionSummary>) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded { sessions }),
+        );
+    }
+
+    fn transcript_errors(app: &App) -> Vec<&str> {
+        app.transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::Error { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn projects_loaded_present_groups_sessions_under_custom_name() {
+        let path = temp_registry_path("present");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(
+            &mut app,
+            vec![
+                workspace_session("s-1", "/work/alpha"),
+                workspace_session("s-9", "/work/elsewhere"),
+            ],
+        );
+        let renamed = workspace_project("Custom", "/work/alpha");
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(vec![renamed.clone()]),
+        )));
+        assert!(app.projects_ready);
+        assert!(!app.projects_missing);
+        assert_eq!(app.projects, vec![renamed.clone()]);
+        assert_eq!(app.sessions.groups.len(), 1);
+        assert_eq!(app.sessions.groups[0].project.name, "Custom");
+        assert_eq!(app.sessions.groups[0].sessions.len(), 1);
+        assert_eq!(app.sessions.groups[0].sessions[0].id, SessionId::new("s-1"));
+        assert_eq!(app.sessions.unprojected.len(), 1);
+        assert_eq!(app.sessions.unprojected[0].id, SessionId::new("s-9"));
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn projects_loaded_missing_seeds_from_loaded_sessions() {
+        let path = temp_registry_path("missing-seeds");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(
+            &mut app,
+            vec![
+                workspace_session("s-1", "/work/alpha"),
+                workspace_session("s-2", "/work/alpha"),
+                workspace_session("s-3", "/work/beta"),
+            ],
+        );
+        let seeded = manifest_domain::seed_projects(&[
+            workspace_session("s-1", "/work/alpha"),
+            workspace_session("s-2", "/work/alpha"),
+            workspace_session("s-3", "/work/beta"),
+        ]);
+        let _ = app.update(Message::ProjectsLoaded(Ok(manifest_store::Loaded::Missing)));
+        assert_eq!(app.projects, seeded);
+        assert!(app.projects_ready);
+        assert!(!app.projects_missing);
+        assert_eq!(app.sessions.groups.len(), 2);
+        // The save task is not executed by `update`: persistence itself
+        // is covered by `manifest_store` tests. State is the assertion.
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn sessions_loaded_after_missing_seeds_and_saves() {
+        let path = temp_registry_path("missing-then-load");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        let _ = app.update(Message::ProjectsLoaded(Ok(manifest_store::Loaded::Missing)));
+        assert!(app.projects_ready);
+        assert!(app.projects_missing);
+        assert!(app.projects.is_empty());
+        load_sessions(
+            &mut app,
+            vec![
+                workspace_session("s-1", "/work/alpha"),
+                workspace_session("s-2", "/work/beta"),
+            ],
+        );
+        assert!(!app.projects_missing);
+        assert!(app.projects_ready);
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.sessions.groups.len(), 2);
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn projects_loaded_error_keeps_derived_grouping_and_shows_error() {
+        let path = temp_registry_path("load-error");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(
+            &mut app,
+            vec![
+                workspace_session("s-1", "/work/alpha"),
+                workspace_session("s-2", "/work/beta"),
+            ],
+        );
+        let groups_before = app.sessions.groups.len();
+        let before = app.transcript.entries.len();
+        let _ = app.update(Message::ProjectsLoaded(Err(String::from("disk broke"))));
+        assert!(!app.projects_ready);
+        assert_eq!(app.sessions.groups.len(), groups_before);
+        assert_eq!(app.sessions.groups.len(), 2);
+        assert_eq!(app.transcript.entries.len(), before + 1);
+        assert!(transcript_errors(&app).contains(&"disk broke"));
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn projects_saved_error_reports_verbatim_without_rollback() {
+        let path = temp_registry_path("save-error");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", "/work/alpha")]);
+        let _ = app.update(Message::ProjectsLoaded(Ok(manifest_store::Loaded::Missing)));
+        let projects_before = app.projects.clone();
+        assert!(!projects_before.is_empty());
+        let before = app.transcript.entries.len();
+        let _ = app.update(Message::ProjectsSaved(Err(String::from(
+            "Couldn't save the project list: disk broke",
+        ))));
+        assert_eq!(app.projects, projects_before);
+        assert_eq!(app.transcript.entries.len(), before + 1);
+        assert!(transcript_errors(&app).contains(&"Couldn't save the project list: disk broke"));
+        cleanup_registry(&path);
+    }
+
+    /// Opens the popup and fills the form through the real message path.
+    fn open_and_fill(app: &mut App, directory: &str, name: &str) {
+        let _ = app.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = app.update(Message::Sessions(sessions::Message::DirectoryChanged(
+            String::from(directory),
+        )));
+        let _ = app.update(Message::Sessions(sessions::Message::NameChanged(
+            String::from(name),
+        )));
+    }
+
+    #[test]
+    fn add_project_happy_path_closes_groups_and_expands() {
+        let workspace = temp_registry_path("happy-ws");
+        let dir = workspace
+            .parent()
+            .expect("temp dir has a parent")
+            .display()
+            .to_string();
+        let path = temp_registry_path("happy");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", &dir)]);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(Vec::new()),
+        )));
+        assert_eq!(app.sessions.groups.len(), 0);
+        open_and_fill(&mut app, &dir, "Custom");
+        let _ = app.update(Message::AddProjectChecked(Ok((
+            dir.clone(),
+            String::from("Custom"),
+        ))));
+        assert_eq!(app.sessions.add_project, sessions::AddProject::Closed);
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].workspace, Some(dir.clone()));
+        assert_eq!(app.projects[0].name, "Custom");
+        assert_eq!(app.sessions.groups.len(), 1);
+        assert_eq!(app.sessions.groups[0].project.name, "Custom");
+        assert_eq!(app.sessions.groups[0].sessions.len(), 1);
+        assert_eq!(app.sessions.groups[0].sessions[0].id, SessionId::new("s-1"));
+        assert_eq!(
+            app.sessions.expanded,
+            Some(manifest_domain::ProjectId::for_workspace(&dir))
+        );
+        cleanup_registry(&path);
+        cleanup_registry(&workspace);
+    }
+
+    #[test]
+    fn add_project_duplicate_expands_without_duplicating() {
+        let dir = String::from("/work/alpha");
+        let path = temp_registry_path("duplicate");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", &dir)]);
+        let existing = workspace_project("Old", &dir);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(vec![existing.clone()]),
+        )));
+        open_and_fill(&mut app, &dir, "New name");
+        let _ = app.update(Message::AddProjectChecked(Ok((
+            dir.clone(),
+            String::from("New name"),
+        ))));
+        assert_eq!(app.sessions.add_project, sessions::AddProject::Closed);
+        assert_eq!(app.projects, vec![existing.clone()]);
+        assert_eq!(app.sessions.groups.len(), 1);
+        assert_eq!(app.sessions.groups[0].project.name, "Old");
+        assert_eq!(app.sessions.expanded, Some(existing.id));
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn add_project_validation_error_keeps_popup_with_error() {
+        let path = temp_registry_path("validation-error");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", "/work/alpha")]);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(Vec::new()),
+        )));
+        open_and_fill(&mut app, "/work/alpha", "Alpha");
+        let _ = app.update(Message::AddProjectChecked(Err(String::from(
+            "That path isn't a folder. Choose a folder.",
+        ))));
+        assert_eq!(
+            app.sessions.add_project,
+            sessions::AddProject::Open {
+                directory: String::from("/work/alpha"),
+                name: String::from("Alpha"),
+                name_edited: true,
+                error: Some(String::from("That path isn't a folder. Choose a folder.")),
+            }
+        );
+        // Typing clears the error through the child contract.
+        let _ = app.update(Message::Sessions(sessions::Message::DirectoryChanged(
+            String::from("/work/other"),
+        )));
+        assert!(matches!(
+            &app.sessions.add_project,
+            sessions::AddProject::Open { error: None, .. }
+        ));
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn submit_in_fixture_mode_closes_popup() {
+        let mut app = App::boot();
+        let _ = app.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = app.update(Message::Sessions(sessions::Message::DirectoryChanged(
+            String::from("/x/y/billing-service"),
+        )));
+        let _ = app.update(Message::Sessions(sessions::Message::SubmitAddProject));
+        assert_eq!(app.sessions.add_project, sessions::AddProject::Closed);
+        assert!(app.projects.is_empty());
+    }
+
+    #[test]
+    fn submit_blank_form_in_live_mode_reports_error() {
+        let path = temp_registry_path("blank-form");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", "/work/alpha")]);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(Vec::new()),
+        )));
+        let _ = app.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = app.update(Message::Sessions(sessions::Message::SubmitAddProject));
+        assert!(matches!(
+            &app.sessions.add_project,
+            sessions::AddProject::Open { error: Some(_), .. }
+        ));
+        assert!(app.projects.is_empty());
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn remove_project_regroups_sessions_and_keeps_them_listed() {
+        let workspace_dir = std::env::temp_dir().join(format!(
+            "manifest-shell-ws-{}-{}",
+            std::process::id(),
+            STORE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+        let marker = workspace_dir.join("marker.txt");
+        std::fs::write(&marker, "keep me").expect("write marker");
+        let dir = workspace_dir.display().to_string();
+        let path = temp_registry_path("remove");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(
+            &mut app,
+            vec![
+                workspace_session("s-1", &dir),
+                workspace_session("s-2", "/work/other"),
+            ],
+        );
+        let kept = workspace_project("Kept", "/work/other");
+        let removed = workspace_project("Gone", &dir);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(vec![kept.clone(), removed.clone()]),
+        )));
+        assert_eq!(app.sessions.groups.len(), 2);
+        let _ = app.update(Message::Sessions(sessions::Message::RemoveProject(
+            removed.id.clone(),
+        )));
+        assert_eq!(app.sessions.groups.len(), 1);
+        assert_eq!(app.sessions.groups[0].project, kept);
+        assert_eq!(app.projects, vec![kept]);
+        // Both sessions stay listed; the removed project's rows land in
+        // unprojected with recomputed ownership.
+        let listed: Vec<SessionId> = app
+            .sessions
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .chain(app.sessions.unprojected.iter())
+            .map(|summary| summary.id.clone())
+            .collect();
+        assert!(listed.contains(&SessionId::new("s-1")));
+        assert!(listed.contains(&SessionId::new("s-2")));
+        assert!(
+            app.sessions
+                .unprojected
+                .iter()
+                .any(|summary| summary.id == SessionId::new("s-1"))
+        );
+        // Removal never touches the project folder on disk.
+        assert!(workspace_dir.is_dir());
+        assert!(marker.is_file());
+        let _ = std::fs::remove_dir_all(&workspace_dir);
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn remove_project_cancels_draft_in_that_project() {
+        let dir = String::from("/work/alpha");
+        let path = temp_registry_path("remove-draft");
+        let (mut app, _) = live_app_with_store(path.clone());
+        deliver_connected(&mut app);
+        load_sessions(&mut app, vec![workspace_session("s-1", &dir)]);
+        let project = workspace_project("Alpha", &dir);
+        let _ = app.update(Message::ProjectsLoaded(Ok(
+            manifest_store::Loaded::Present(vec![project.clone()]),
+        )));
+        let _ = app.update(Message::Sessions(sessions::Message::NewSession(
+            project.id.clone(),
+        )));
+        assert!(app.new_session.is_some());
+        let _ = app.update(Message::Sessions(sessions::Message::RemoveProject(
+            project.id.clone(),
+        )));
+        assert_eq!(app.new_session, None);
+        assert!(app.projects.is_empty());
+        cleanup_registry(&path);
+    }
+
+    #[test]
+    fn remove_in_fixture_mode_removes_group_only() {
+        let mut app = App::boot();
+        let before: usize = app
+            .sessions
+            .groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>()
+            + app.sessions.unprojected.len();
+        let _ = app.update(Message::Sessions(sessions::Message::RemoveProject(
+            manifest_domain::ProjectId::new("project-checkout-api"),
+        )));
+        assert_eq!(app.sessions.groups.len(), 1);
+        let after: usize = app
+            .sessions
+            .groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>()
+            + app.sessions.unprojected.len();
+        assert_eq!(before, after);
+        assert!(app.project_store.is_none());
+    }
+
+    #[test]
+    fn directory_picked_some_types_into_popup() {
+        let mut app = App::boot();
+        let _ = app.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = app.update(Message::DirectoryPicked(Some(String::from("/x/y/picked"))));
+        assert_eq!(
+            app.sessions.add_project,
+            sessions::AddProject::Open {
+                directory: String::from("/x/y/picked"),
+                name: String::from("picked"),
+                name_edited: false,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn directory_picked_none_is_noop() {
+        let mut app = App::boot();
+        let _ = app.update(Message::Sessions(sessions::Message::OpenAddProject));
+        let _ = app.update(Message::DirectoryPicked(None));
+        assert_eq!(
+            app.sessions.add_project,
+            sessions::AddProject::Open {
+                directory: String::new(),
+                name: String::new(),
+                name_edited: false,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_project_dir_accepts_a_real_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "manifest-shell-validate-{}-{}",
+            std::process::id(),
+            STORE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let got = validate_project_dir(dir.display().to_string(), String::from("  Pretty  "))
+            .expect("real dir validates");
+        let canonical = std::fs::canonicalize(&dir)
+            .expect("canonicalize")
+            .display()
+            .to_string();
+        assert_eq!(got, (canonical, String::from("Pretty")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_project_dir_rejects_file_and_missing_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "manifest-shell-validate-file-{}-{}",
+            std::process::id(),
+            STORE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "x").expect("write file");
+        assert_eq!(
+            validate_project_dir(file.display().to_string(), String::from("n")),
+            Err(String::from("That path isn't a folder. Choose a folder."))
+        );
+        assert_eq!(
+            validate_project_dir(
+                dir.join("no-such-dir").display().to_string(),
+                String::from("n")
+            ),
+            Err(String::from(
+                "That folder couldn't be found. Check the path and try again."
+            ))
+        );
+        assert_eq!(
+            validate_project_dir(dir.display().to_string(), String::from("   ")),
+            Err(String::from("Give the project a name."))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session with an explicit status, for resume tests.
+    fn status_session(
+        id: &str,
+        status: manifest_domain::SessionStatus,
+    ) -> manifest_domain::SessionSummary {
+        let mut summary = live_session(id);
+        summary.status = status;
+        summary
+    }
+
+    /// Loads one orphaned and one idle session.
+    fn loaded_orphan_and_idle(app: &mut App) {
+        deliver(
+            app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![
+                    status_session("sess-orphan", manifest_domain::SessionStatus::Orphaned),
+                    live_session("s-idle"),
+                ],
+            }),
+        );
+    }
+
+    fn select(app: &mut App, id: &str) {
+        let _ = app.update(Message::Sessions(sessions::Message::Select(
+            SessionId::new(id),
+        )));
+    }
+
+    #[test]
+    fn orphaned_select_resumes_once() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert_eq!(
+            *fake.resumes.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+        // Still in flight: a second select issues no duplicate resume.
+        select(&mut app, "sess-orphan");
+        assert_eq!(
+            *fake.resumes.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+        // An idle selection resumes nothing further.
+        select(&mut app, "s-idle");
+        assert_eq!(
+            *fake.resumes.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+    }
+
+    #[test]
+    fn orphaned_select_while_connecting_does_not_resume() {
+        let (mut app, fake) = live_app();
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert!(fake.resumes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resumed_then_loaded_idle_releases_gate_and_send_enabled() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.resumes.lock().unwrap().len(), 1);
+        // The orphaned selection with a resume in flight is busy.
+        assert!(!app.composer.send_enabled);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionResumed {
+                session: SessionId::new("sess-orphan"),
+            }),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![
+                    status_session("sess-orphan", manifest_domain::SessionStatus::Idle),
+                    live_session("s-idle"),
+                ],
+            }),
+        );
+        assert!(app.composer.send_enabled);
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.resumes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resume_failure_releases_gate_for_retry() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.resumes.lock().unwrap().len(), 1);
+        let message = String::from(
+            "session sess-orphan is in use by another client (sessionInUse: already attached). Muse MCP will not attach to it.",
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+        );
+        assert!(transcript_errors(&app).contains(&message.as_str()));
+        // The gate released: reselecting retries the resume.
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.resumes.lock().unwrap().len(), 2);
+    }
+
+    /// Enters a draft, sets its worktree mode and field, and types a
+    /// prompt through the root reducer.
+    fn draft_with_worktree(app: &mut App, mode: DraftWorktreeMode, field: &str, prompt: &str) {
+        loaded_with_workspace(app);
+        new_session_pressed(app);
+        let _ = app.update(Message::DraftWorktreeModeSelected(mode));
+        match mode {
+            DraftWorktreeMode::Create => {
+                let _ = app.update(Message::DraftWorktreeBaseChanged(String::from(field)));
+            }
+            DraftWorktreeMode::Existing => {
+                let _ = app.update(Message::DraftWorktreePathChanged(String::from(field)));
+            }
+            DraftWorktreeMode::Off => {}
+        }
+        type_composer_text(app, prompt);
+    }
+
+    #[test]
+    fn draft_existing_path_reaches_spawn() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        draft_with_worktree(
+            &mut app,
+            DraftWorktreeMode::Existing,
+            "/tmp/wt-x",
+            "build it",
+        );
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                String::from("/live/workspace"),
+                String::from("build it"),
+                manifest_domain::SpawnChoices {
+                    worktree: manifest_domain::WorktreeChoice::Existing {
+                        path: String::from("/tmp/wt-x"),
+                    },
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn draft_create_base_reaches_spawn() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        draft_with_worktree(&mut app, DraftWorktreeMode::Create, "main", "build it");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                String::from("/live/workspace"),
+                String::from("build it"),
+                manifest_domain::SpawnChoices {
+                    worktree: manifest_domain::WorktreeChoice::Create {
+                        base: Some(String::from("main")),
+                    },
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn draft_create_blank_base_spawns_without_base() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        draft_with_worktree(&mut app, DraftWorktreeMode::Create, "   ", "build it");
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![(
+                String::from("/live/workspace"),
+                String::from("build it"),
+                manifest_domain::SpawnChoices {
+                    worktree: manifest_domain::WorktreeChoice::Create { base: None },
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn existing_worktree_without_path_blocks_send() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        draft_with_worktree(&mut app, DraftWorktreeMode::Existing, "", "build it");
+        send_pressed(&mut app);
+        assert!(fake.spawns.lock().unwrap().is_empty());
+        let draft = app.new_session.as_ref().expect("draft stays");
+        assert_eq!(draft.worktree_mode, DraftWorktreeMode::Existing);
+        assert_eq!(draft.worktree_path, "");
+        assert_eq!(app.composer.content.text(), "build it");
+        assert!(
+            transcript_errors(&app).contains(
+                &"Choose an existing worktree folder, or switch the worktree choice off."
+            )
+        );
+    }
+
+    #[test]
+    fn spawn_failure_restores_draft_choices_and_prompt() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        draft_with_worktree(
+            &mut app,
+            DraftWorktreeMode::Existing,
+            "/tmp/wt-x",
+            "build it",
+        );
+        send_pressed(&mut app);
+        assert_eq!(fake.spawns.lock().unwrap().len(), 1);
+        assert!(app.new_session.is_none());
+        let message = String::from(
+            "Repository '/untrusted' is not trusted; worktree create, attach, and list require a trusted repository.",
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(message.clone())),
+        );
+        assert!(!app.awaiting_spawn);
+        let draft = app.new_session.as_ref().expect("draft restored");
+        assert_eq!(draft.worktree_mode, DraftWorktreeMode::Existing);
+        assert_eq!(draft.worktree_path, "/tmp/wt-x");
+        assert_eq!(app.composer.content.text(), "build it");
+        assert!(transcript_errors(&app).contains(&message.as_str()));
+        // Retry after switching the choice off: the restored prompt
+        // spawns again with no worktree.
+        let _ = app.update(Message::DraftWorktreeModeSelected(DraftWorktreeMode::Off));
+        send_pressed(&mut app);
+        assert_eq!(
+            *fake.spawns.lock().unwrap(),
+            vec![
+                (
+                    String::from("/live/workspace"),
+                    String::from("build it"),
+                    manifest_domain::SpawnChoices {
+                        worktree: manifest_domain::WorktreeChoice::Existing {
+                            path: String::from("/tmp/wt-x"),
+                        },
+                    }
+                ),
+                (
+                    String::from("/live/workspace"),
+                    String::from("build it"),
+                    manifest_domain::SpawnChoices::default()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn cwd_spawn_failure_restores_prompt_only() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        assert!(app.sessions.selected_summary().is_none());
+        type_composer_text(&mut app, "start me");
+        send_pressed(&mut app);
+        assert_eq!(fake.spawns.lock().unwrap().len(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed(String::from(
+                "spawn broke",
+            ))),
+        );
+        assert!(!app.awaiting_spawn);
+        assert_eq!(app.new_session, None);
+        assert_eq!(app.composer.content.text(), "start me");
+        assert!(transcript_errors(&app).contains(&"spawn broke"));
+    }
+
+    #[test]
+    fn worktree_messages_without_draft_are_noops() {
+        let mut app = App::boot();
+        type_composer_text(&mut app, "hi");
+        let _ = app.update(Message::DraftWorktreeModeSelected(
+            DraftWorktreeMode::Existing,
+        ));
+        let _ = app.update(Message::DraftWorktreeBaseChanged(String::from("main")));
+        let _ = app.update(Message::DraftWorktreePathChanged(String::from("/tmp/wt-x")));
+        assert_eq!(app.new_session, None);
+        assert_eq!(app.composer.content.text(), "hi");
     }
 }

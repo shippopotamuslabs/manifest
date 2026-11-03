@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use iced::futures::StreamExt;
-use manifest_domain::{Connection, EngineEvent, SessionEngine, SessionId, StreamEvent};
+use manifest_domain::{Connection, EngineEvent, SessionEngine, SessionId, SpawnChoices, StreamEvent};
 
 /// Folds `next` into `into` when both are item deltas for the same
 /// session, item, and field: the delta texts concatenate and the first
@@ -72,13 +72,18 @@ impl EngineHandle {
     }
 
     /// Spawns a session; success arrives as `SessionSpawned`.
-    pub fn spawn_session(&self, workspace: String, prompt: String) {
-        self.inner.spawn_session(workspace, prompt);
+    pub fn spawn_session(&self, workspace: String, prompt: String, choices: SpawnChoices) {
+        self.inner.spawn_session(workspace, prompt, choices);
     }
 
     /// Sends a follow-up turn; success arrives as `TurnAccepted`.
     pub fn send_turn(&self, session: SessionId, prompt: String) {
         self.inner.send_turn(session, prompt);
+    }
+
+    /// Resumes a session; success arrives as `SessionResumed`.
+    pub fn resume_session(&self, session: SessionId) {
+        self.inner.resume_session(session);
     }
 }
 
@@ -292,5 +297,39 @@ mod tests {
             &mut EngineEvent::Diagnostic(String::from("note")),
             &into
         ));
+    }
+
+    /// Records engine commands: the handle must forward without I/O.
+    /// Shared so clones observe the same calls.
+    #[derive(Clone)]
+    struct RecordingEngine {
+        resumed: std::sync::Arc<std::sync::Mutex<Vec<SessionId>>>,
+    }
+
+    impl SessionEngine for RecordingEngine {
+        fn list_sessions(&self) {}
+
+        fn spawn_session(
+            &self,
+            _workspace: String,
+            _prompt: String,
+            _choices: manifest_domain::SpawnChoices,
+        ) {
+        }
+
+        fn send_turn(&self, _session: SessionId, _prompt: String) {}
+
+        fn resume_session(&self, session: SessionId) {
+            self.resumed.lock().unwrap().push(session);
+        }
+    }
+
+    #[test]
+    fn resume_passthrough_forwards_session() {
+        let engine = RecordingEngine {
+            resumed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        EngineHandle::new(engine.clone()).resume_session(SessionId::new("s-1"));
+        assert_eq!(*engine.resumed.lock().unwrap(), vec![SessionId::new("s-1")]);
     }
 }

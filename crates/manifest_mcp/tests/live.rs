@@ -4,7 +4,8 @@
 //! `MANIFEST_MUSE_MCP_BIN` set to a real server binary.
 
 use manifest_domain::{
-    Connection, EngineEvent, ItemStatus, SessionEngine, SessionId, StreamEvent, StreamItem,
+    Connection, EngineEvent, ItemStatus, SessionEngine, SessionId, SpawnChoices, StreamEvent,
+    StreamItem,
 };
 use manifest_mcp::{ServerConfig, connect};
 use std::time::Duration;
@@ -90,7 +91,7 @@ fn live_spawn_streams_a_real_turn() {
         }
     }
 
-    engine.spawn_session(workspace_text, prompt);
+    engine.spawn_session(workspace_text, prompt, SpawnChoices::default());
 
     // Overall deadline for the whole turn; the model turn can take minutes.
     let deadline = std::time::Instant::now() + Duration::from_secs(240);
