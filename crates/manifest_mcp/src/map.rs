@@ -246,7 +246,10 @@ fn item_text(item: &Value, key: &str) -> String {
 /// Parse one wire item object into a [`StreamItem`].
 ///
 /// `itemId` is required; `kind` decides the variant. `reminderChild`
-/// classifies as system bookkeeping; any other unknown kind stays an
+/// classifies as system bookkeeping; `compaction` classifies as a
+/// [`StreamItem::Compaction`] whose terminal outcome and reason ride
+/// as values (failures after admission arrive as the item's terminal
+/// event, never as wire errors). Any other unknown kind stays an
 /// [`StreamItem::Unknown`] value, never a silent drop.
 fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
     let item_id = match item.get("itemId").and_then(Value::as_str) {
@@ -311,6 +314,13 @@ fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
         "reminderChild" => Ok(StreamItem::System {
             item_id,
             kind: kind.to_string(),
+        }),
+        "compaction" => Ok(StreamItem::Compaction {
+            item_id,
+            outcome: field_str(item, "outcome").map(String::from),
+            reason: field_str(item, "reason").map(String::from),
+            tokens_before: item.get("tokensBefore").and_then(Value::as_u64),
+            tokens_after: item.get("tokensAfter").and_then(Value::as_u64),
         }),
         _ => Ok(StreamItem::Unknown {
             item_id,
@@ -1997,6 +2007,94 @@ mod tests {
                 StreamItem::Unknown {
                     item_id: String::from("x-2"),
                     kind: String::from("from-the-future"),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_completed_carries_outcome_and_tokens() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-1",
+                "kind": "compaction",
+                "status": "completed",
+                "outcome": "compacted",
+                "trigger": "manual",
+                "tokensBefore": 48210,
+                "tokensAfter": 3912,
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-1"),
+                    outcome: Some(String::from("compacted")),
+                    reason: None,
+                    tokens_before: Some(48210),
+                    tokens_after: Some(3912),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_failed_carries_outcome_and_reason() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-2",
+                "kind": "compaction",
+                "status": "failed",
+                "outcome": "failed",
+                "reason": "summarizer_failed",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-2"),
+                    outcome: Some(String::from("failed")),
+                    reason: Some(String::from("summarizer_failed")),
+                    tokens_before: None,
+                    tokens_after: None,
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_compaction_started_without_outcome_is_in_progress() {
+        let event = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {"itemId": "c-3", "kind": "compaction", "turnId": "t"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Compaction {
+                    item_id: String::from("c-3"),
+                    outcome: None,
+                    reason: None,
+                    tokens_before: None,
+                    tokens_after: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),

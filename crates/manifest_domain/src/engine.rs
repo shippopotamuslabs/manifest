@@ -103,6 +103,24 @@ pub enum StreamItem {
         /// Wire kind, kept so new system kinds stay classifiable.
         kind: String,
     },
+    /// A context-compaction turn: the host summarised history to free
+    /// the window. Failures after admission arrive as this item's
+    /// terminal outcome, never as wire errors, so the outcome and
+    /// reason ride here and the shell renders them.
+    Compaction {
+        /// Host item handle; joins deltas to this item.
+        item_id: String,
+        /// Terminal outcome (`compacted`, `noop`, `failed`,
+        /// `cancelled`); none while the item is still in progress.
+        outcome: Option<String>,
+        /// Machine reason verbatim (for example
+        /// `no_compactable_history`); present on some terminals.
+        reason: Option<String>,
+        /// Window tokens before compaction; none when unsent.
+        tokens_before: Option<u64>,
+        /// Window tokens after compaction; none when unsent.
+        tokens_after: Option<u64>,
+    },
     /// Any other kind; the shell renders a generic note, never a drop.
     Unknown {
         /// Host item handle; joins deltas to this item.
@@ -121,6 +139,7 @@ impl StreamItem {
             | Self::Reasoning { item_id, .. }
             | Self::ToolCall { item_id, .. }
             | Self::System { item_id, .. }
+            | Self::Compaction { item_id, .. }
             | Self::Unknown { item_id, .. } => item_id,
         }
     }
@@ -1556,6 +1575,16 @@ mod tests {
                     kind: String::from("reminderChild"),
                 },
                 "s",
+            ),
+            (
+                StreamItem::Compaction {
+                    item_id: String::from("c"),
+                    outcome: Some(String::from("compacted")),
+                    reason: None,
+                    tokens_before: Some(100),
+                    tokens_after: Some(10),
+                },
+                "c",
             ),
             (
                 StreamItem::Unknown {
