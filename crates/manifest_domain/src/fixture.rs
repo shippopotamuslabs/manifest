@@ -448,17 +448,28 @@ fn trimmed_workspace(workspace: &str) -> &str {
     workspace.trim_end_matches('/')
 }
 
+/// Compose a session row's display title: `{label} · {title}`, where
+/// `label` is the project name when the session belongs to a project,
+/// else [`workspace_name`] of its workspace, and `title` is the
+/// session's own title — the server's session name, or the short id
+/// for unnamed rows.
+pub fn compose_session_title(project_name: Option<&str>, workspace: &str, title: &str) -> String {
+    match project_name {
+        Some(name) => format!("{name} · {title}"),
+        None => format!("{} · {title}", workspace_name(workspace)),
+    }
+}
+
 /// Group sessions onto projects by workspace.
 ///
 /// For each session with a non-empty workspace, `project` becomes the
 /// listed project whose workspace matches (exact strings compared
 /// after trimming trailing `/`; a project with `None` or empty
-/// workspace never matches), else `None`, and the title recomposes as
-/// `{name} · {short}` where `name` is the matched project name else
-/// [`workspace_name`] of the session workspace and `short` is the
-/// first 8 chars (not bytes) of the session id. Sessions with an
-/// empty workspace are returned untouched. Input session order is
-/// preserved.
+/// workspace never matches), else `None`, and the title recomposes
+/// via [`compose_session_title`] from the matched project name (else
+/// the workspace name) and the session's incoming title. Sessions
+/// with an empty workspace are returned untouched. Input session
+/// order is preserved.
 pub fn assign_projects(
     projects: &[ProjectSummary],
     sessions: Vec<SessionSummary>,
@@ -475,14 +486,15 @@ pub fn assign_projects(
                 }
                 _ => false,
             });
-            let short: String = session.id.as_str().chars().take(8).collect();
             match matched {
                 Some(project) => {
-                    session.title = format!("{} · {short}", project.name);
+                    let title = compose_session_title(Some(&project.name), &session.workspace, &session.title);
+                    session.title = title;
                     session.project = Some(project.id.clone());
                 }
                 None => {
-                    session.title = format!("{} · {short}", workspace_name(&session.workspace));
+                    let title = compose_session_title(None, &session.workspace, &session.title);
+                    session.title = title;
                     session.project = None;
                 }
             }
@@ -638,11 +650,15 @@ mod tests {
             helper_project("mystery", None),
             helper_project("empty", Some("")),
         ];
+        // Incoming titles are what the mapper produced: a short id for
+        // unnamed rows, the server's session name for named ones.
+        let mut named = helper_session("sess-fresh-2", "/home/dev/gamma");
+        named.title = String::from("Fix the login bug");
         let got = assign_projects(
             &projects,
             vec![
                 helper_session("sess-run-1", "/home/dev/beta"),
-                helper_session("sess-fresh-2", "/home/dev/gamma"),
+                named,
                 helper_session("ééééééééXYZ", "/w/long-name"),
                 helper_session("untouched", ""),
             ],
@@ -652,10 +668,10 @@ mod tests {
             Some(ProjectId::new("project-beta")),
             "trailing-slash project workspace still matches"
         );
-        assert_eq!(got[0].title, "beta · sess-run");
+        assert_eq!(got[0].title, "beta · stale");
         assert_eq!(got[1].project, None);
-        assert_eq!(got[1].title, "gamma · sess-fre");
-        assert_eq!(got[2].title, "long-name · éééééééé");
+        assert_eq!(got[1].title, "gamma · Fix the login bug");
+        assert_eq!(got[2].title, "long-name · stale");
         // Empty workspaces pass through untouched.
         assert_eq!(got[3].title, "stale");
         assert_eq!(got[3].project, None);
@@ -717,11 +733,23 @@ mod tests {
             got[0].project,
             Some(ProjectId::for_workspace("/home/dev/beta"))
         );
-        assert_eq!(got[0].title, "beta · sess-run");
+        assert_eq!(got[0].title, "beta · stale");
         assert_eq!(
             got[1].project,
             Some(ProjectId::for_workspace("/home/dev/alpha"))
         );
-        assert_eq!(got[1].title, "alpha · sess-idl");
+        assert_eq!(got[1].title, "alpha · stale");
+    }
+
+    #[test]
+    fn compose_session_title_labels_by_project_else_workspace() {
+        assert_eq!(
+            compose_session_title(Some("beta"), "/home/dev/beta", "Fix the login bug"),
+            "beta · Fix the login bug"
+        );
+        assert_eq!(
+            compose_session_title(None, "/home/dev/gamma", "sess-fre"),
+            "gamma · sess-fre"
+        );
     }
 }

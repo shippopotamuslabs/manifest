@@ -259,6 +259,12 @@ pub struct App {
     /// Latest usage snapshot per session; the composer's meter reads
     /// the visible session's entry.
     pub usage: HashMap<SessionId, UsageSnapshot>,
+    /// Latest known session name per session (MFST-34), from
+    /// `name-changed` stream events. Status rows are authoritative on
+    /// a list refresh; the overlay covers the gap between an event
+    /// and the next refresh, and a stale refresh never clobbers a
+    /// newer name. Entries prune with the list, like `usage`.
+    pub session_names: HashMap<SessionId, String>,
     /// A spawned session awaiting its first list load to select it.
     pub select_on_load: Option<SessionId>,
     /// A spawn command is in flight and the visible transcript holds
@@ -384,6 +390,7 @@ impl App {
             running: HashSet::new(),
             running_turns: HashMap::new(),
             usage: HashMap::new(),
+            session_names: HashMap::new(),
             select_on_load: None,
             awaiting_spawn: false,
             pending_spawn: None,
@@ -1591,6 +1598,14 @@ impl App {
                 }
                 false
             }
+            StreamEvent::NameChanged { session, name } => {
+                // The overlay records the name even for a session the
+                // list has not caught up with; a listed row retitles
+                // in place, and the topbar follows the selected row.
+                self.session_names.insert(session.clone(), name.clone());
+                self.sessions.retitle(&session, &name);
+                false
+            }
         }
     }
 
@@ -1898,6 +1913,16 @@ impl App {
                             } else {
                                 manifest_domain::seed_projects(&sessions)
                             };
+                            // Names the stream already delivered win
+                            // over a refresh that predates them: the
+                            // overlay re-titles rows before grouping
+                            // composes their display titles.
+                            let mut sessions = sessions;
+                            for session in &mut sessions {
+                                if let Some(name) = self.session_names.get(&session.id) {
+                                    session.title = name.clone();
+                                }
+                            }
                             let sessions = manifest_domain::assign_projects(&projects, sessions);
                             self.resuming.retain(|id| {
                                 sessions
@@ -1943,6 +1968,7 @@ impl App {
                             let listed: std::collections::HashSet<SessionId> =
                                 self.current_sessions().into_iter().map(|s| s.id).collect();
                             self.usage.retain(|id, _| listed.contains(id));
+                            self.session_names.retain(|id, _| listed.contains(id));
                             self.sync_composer_usage();
                             // Cold start names no host until a session is
                             // listed: request the catalog now, with the
@@ -6853,6 +6879,64 @@ mod tests {
         assert_eq!(app.usage.len(), 1);
         loaded(&mut app, &["s-1"]);
         assert!(app.usage.is_empty());
+    }
+
+    #[test]
+    fn name_changed_retitles_the_listed_session() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::NameChanged {
+                session: SessionId::new("s-1"),
+                name: String::from("Fix the login bug"),
+            },
+        );
+        // The sidebar row and the topbar share the selected summary's
+        // title, composed with the row's workspace label.
+        let selected = app.sessions.selected_summary().expect("s-1 selected");
+        assert_eq!(selected.title, "workspace · Fix the login bug");
+        assert_eq!(
+            app.session_names.get(&SessionId::new("s-1")).map(String::as_str),
+            Some("Fix the login bug")
+        );
+    }
+
+    #[test]
+    fn name_changed_survives_a_stale_sessions_loaded() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::NameChanged {
+                session: SessionId::new("s-1"),
+                name: String::from("Fix the login bug"),
+            },
+        );
+        // A refresh whose rows predate the rename carries the old
+        // title; the overlay re-titles the row before composition.
+        loaded(&mut app, &["s-1"]);
+        let selected = app.sessions.selected_summary().expect("s-1 selected");
+        assert_eq!(selected.title, "workspace · Fix the login bug");
+    }
+
+    #[test]
+    fn sessions_loaded_prunes_names_of_unlisted_sessions() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::NameChanged {
+                session: SessionId::new("s-2"),
+                name: String::from("Other work"),
+            },
+        );
+        assert_eq!(app.session_names.len(), 1);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.session_names.is_empty());
     }
 
     /// Loads two listed sessions with carried usage for the first.

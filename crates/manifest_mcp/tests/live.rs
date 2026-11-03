@@ -167,7 +167,8 @@ fn live_spawn_streams_a_real_turn() {
                     | StreamEvent::Usage { session, .. }
                     | StreamEvent::Pending { session, .. }
                     | StreamEvent::CatalogChanged { session }
-                    | StreamEvent::GoalChanged { session, .. } => session,
+                    | StreamEvent::GoalChanged { session, .. }
+                    | StreamEvent::NameChanged { session, .. } => session,
                 };
                 (owner != &session).then(|| event.clone())
             }

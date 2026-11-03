@@ -15,7 +15,9 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length};
-use manifest_domain::{ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary};
+use manifest_domain::{
+    ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, compose_session_title,
+};
 
 use crate::kit;
 use crate::theme::{
@@ -157,6 +159,29 @@ impl State {
             expanded,
             add_project: AddProject::Closed,
             pending_counts: HashMap::new(),
+        }
+    }
+
+    /// Retitle one listed session from a new bare name (MFST-34): the
+    /// stored title recomposes with the row's group label — its
+    /// project name, or its workspace name when unprojected. Unknown
+    /// ids are a no-op; the App-level name overlay still records the
+    /// name for the next list refresh.
+    pub fn retitle(&mut self, id: &SessionId, name: &str) {
+        for group in &mut self.groups {
+            if group.sessions.iter().any(|session| &session.id == id) {
+                let label = group.project.name.clone();
+                let session = group
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == id)
+                    .expect("presence checked above");
+                session.title = compose_session_title(Some(&label), &session.workspace, name);
+                return;
+            }
+        }
+        if let Some(session) = self.unprojected.iter_mut().find(|session| &session.id == id) {
+            session.title = compose_session_title(None, &session.workspace, name);
         }
     }
 

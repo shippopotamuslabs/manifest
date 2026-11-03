@@ -1,7 +1,8 @@
 //! Crate-private mapping from wire values into domain values.
 //!
 //! The wire carries no project objects: each session row keeps its
-//! workspace and a title of the session id's first 8 chars, and
+//! workspace and a title — the server's session name when the row
+//! carries one, the session id's first 8 chars otherwise — and
 //! grouping onto projects happens in the shell via domain
 //! [`assign_projects`](manifest_domain::assign_projects). Anything the
 //! wire cannot explain becomes a [`Diagnostic`] value rather than a
@@ -29,6 +30,11 @@ struct StatusDto {
     pending_user_inputs: u64,
     #[serde(default)]
     stream_dropped_deltas: Option<u64>,
+    /// The session's name from the server (MFST-34): the host's
+    /// allocated name, or the server's spawn-prompt fallback. Absent
+    /// on rows from older servers and for unnamed sessions.
+    #[serde(default)]
+    name: Option<String>,
     /// Cumulative token usage folded by the server from the session's
     /// live `session/tokenUsage`; absent or unparseable stays out of
     /// the carried vec, never a row failure.
@@ -84,9 +90,15 @@ pub(crate) fn map_status_rows(
         };
         // First 8 chars (not bytes) so multi-byte ids truncate safely.
         let short: String = dto.session_id.chars().take(8).collect();
+        // The server's name labels the row when it carries one; the
+        // short id stays as the label for unnamed rows.
+        let title = match dto.name.as_deref() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => short,
+        };
         sessions.push(SessionSummary {
             id: SessionId::new(&dto.session_id),
-            title: short,
+            title,
             status,
             project: None,
             workspace: dto.workspace.clone(),
@@ -487,6 +499,18 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
                 Some(block) => Some(parse_goal(block)?),
             };
             Ok(Some(StreamEvent::GoalChanged { session, goal }))
+        }
+        "name-changed" => {
+            let session = SessionId::new(req_string(params, "sessionId")?);
+            // A frame without a name carries nothing to display; it
+            // maps to no event rather than an error, matching the
+            // server's own gating.
+            match params.get("name").and_then(Value::as_str) {
+                Some(name) if !name.is_empty() => {
+                    Ok(Some(StreamEvent::NameChanged { session, name: name.to_string() }))
+                }
+                _ => Ok(None),
+            }
         }
         _ => Ok(None),
     }
@@ -1213,6 +1237,20 @@ mod tests {
                 "A session from the server couldn't be read and was skipped."
             )]
         );
+    }
+
+    #[test]
+    fn rows_with_a_server_name_title_by_name() {
+        let mut named = row("s1", "idle", "/home/dev/beta", 0, None);
+        named["name"] = json!("Fix the login bug");
+        let mut empty_named = row("s2", "idle", "/home/dev/alpha", 0, None);
+        empty_named["name"] = json!("");
+        let rows = vec![named, empty_named];
+        let (sessions, _, _) = map_status_rows(&rows);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].title, String::from("Fix the login bug"));
+        // An empty name is no name: the short id labels the row.
+        assert_eq!(sessions[1].title, String::from("s2"));
     }
 
     #[test]
@@ -2721,6 +2759,32 @@ mod tests {
         assert_eq!(map_skills_result(&no_skills), Err(String::from(generic)));
         let empty = json!({"content": [], "isError": true});
         assert_eq!(map_skills_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn stream_name_changed_maps_name() {
+        let event = map_stream_event(&json!({
+            "type": "name-changed",
+            "sessionId": "sess-1",
+            "name": "Fix the login bug",
+            "origin": "automatic",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::NameChanged {
+                session: SessionId::new("sess-1"),
+                name: String::from("Fix the login bug"),
+            }
+        );
+        // A name-changed frame without a name maps to no event.
+        let unnamed = map_stream_event(&json!({
+            "type": "name-changed",
+            "sessionId": "sess-1",
+        }))
+        .expect("ok");
+        assert_eq!(unnamed, None);
     }
 
     #[test]
