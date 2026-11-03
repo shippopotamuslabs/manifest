@@ -1,0 +1,13 @@
+[package]
+name = "manifest_shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "manifest"
+path = "src/main.rs"
+
+[dependencies]
+manifest_domain = { path = "../manifest_domain" }
+iced = "0.14"
