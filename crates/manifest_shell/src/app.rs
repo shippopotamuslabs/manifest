@@ -323,12 +323,6 @@ pub struct App {
     pub todo_summary: String,
     /// Label of the first unfinished todo, for the drawer bar.
     pub current_todo: Option<String>,
-    /// Precomputed usage line for the top bar's right cluster:
-    /// `<used> / <window> · <%>` when the window is known, else
-    /// `<used> tokens`; `None` while the visible session has no
-    /// snapshot. Refreshed with the composer meter in
-    /// [`App::sync_composer_usage`], so the view reads it directly.
-    pub topbar_usage: Option<String>,
     /// The window id from boot, for the title-bar window controls.
     pub window_id: Option<iced::window::Id>,
     /// Whether the window is maximized; drives the maximize icon.
@@ -408,7 +402,6 @@ impl App {
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
-            topbar_usage: None,
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: PanelDrag::Idle,
             window_id: None,
@@ -973,27 +966,15 @@ impl App {
 
     /// Points the composer's usage meter at the visible session's
     /// snapshot. Called after usage events, status reconciles, and
-    /// transcript syncs; the composer stores the strings, so the view
-    /// formats nothing. Refreshes the top bar usage line from the
-    /// same snapshot, in the same format as the composer's meter.
+    /// transcript syncs; the composer stores the snapshot, so the
+    /// views format nothing. The top bar carries no usage text: the
+    /// composer's ring and popover are the only meter surfaces.
     fn sync_composer_usage(&mut self) {
         let snapshot = self
             .visible_session
             .as_ref()
             .and_then(|session| self.usage.get(session))
             .cloned();
-        self.topbar_usage = snapshot.as_ref().map(|snapshot| match snapshot.window {
-            Some(window) if window > 0 => {
-                let ratio = snapshot.used as f32 / window as f32;
-                format!(
-                    "{} / {} · {}%",
-                    snapshot.used,
-                    window,
-                    (ratio * 100.0).round() as u64
-                )
-            }
-            _ => format!("{} tokens", snapshot.used),
-        });
         self.composer.set_usage(snapshot);
     }
 
@@ -2825,15 +2806,8 @@ fn topbar(state: &App) -> Element<'_, Message> {
         )),
         iced::widget::container({
             let mut controls = iced::widget::row![];
-            // The usage line reads the precomputed top bar string,
-            // then the connection cluster, then the window controls.
-            if has_context && let Some(usage) = state.topbar_usage.as_deref() {
-                controls = controls.push(
-                    iced::widget::text(usage)
-                        .size(FONT_SIZE_SMALL)
-                        .color(TEXT_SECONDARY),
-                );
-            }
+            // The right cluster names the connection, then the window
+            // controls; usage lives in the composer's ring, not here.
             // Fixture mode shows no cluster; live mode names the
             // connection state and offers Retry while failed.
             if state.engine_config.is_some() {
@@ -6813,7 +6787,8 @@ mod tests {
         let (mut app, _) = live_app();
         deliver_connected(&mut app);
         loaded(&mut app, &["s-1", "s-2"]);
-        assert_eq!(app.composer.context_label, "Context —");
+        assert_eq!(app.composer.usage, None);
+        assert_eq!(app.composer.context_percent, None);
         stream(
             &mut app,
             manifest_domain::StreamEvent::Usage {
@@ -6825,7 +6800,8 @@ mod tests {
             },
         );
         // Background usage stores without touching the visible meter.
-        assert_eq!(app.composer.context_label, "Context —");
+        assert_eq!(app.composer.usage, None);
+        assert_eq!(app.composer.context_percent, None);
         assert_eq!(app.usage.len(), 1);
         stream(
             &mut app,
@@ -6837,7 +6813,11 @@ mod tests {
                 usage_json: String::from(r#"{"total": 7}"#),
             },
         );
-        assert_eq!(app.composer.context_label, "7 tokens");
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(7)
+        );
+        assert_eq!(app.composer.context_percent, None);
         // Unknown payloads leave the snapshot in place.
         stream(
             &mut app,
@@ -6849,7 +6829,10 @@ mod tests {
                 usage_json: String::from("nope"),
             },
         );
-        assert_eq!(app.composer.context_label, "7 tokens");
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(7)
+        );
     }
 
     #[test]
@@ -6919,8 +6902,11 @@ mod tests {
         // visible meter follows through the existing sync path.
         assert_eq!(app.usage[&SessionId::new("s-1")].used, 42);
         assert_eq!(app.usage[&SessionId::new("s-1")].window, Some(200));
-        assert_eq!(app.composer.context_label, "42 / 200 · 21%");
-        assert_eq!(app.topbar_usage.as_deref(), Some("42 / 200 · 21%"));
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(42)
+        );
+        assert_eq!(app.composer.context_percent, Some(21.0));
         // Sessions absent from the carried vec keep their snapshot.
         assert_eq!(app.usage[&SessionId::new("s-2")].used, 9);
     }
@@ -6940,21 +6926,28 @@ mod tests {
                 usage_json: String::from(r#"{"total": 7}"#),
             },
         );
-        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(7)
+        );
         // A row without token_usage carries no entry, so the stored
-        // snapshot and both meters stay put.
+        // snapshot and the meter stay put.
         loaded(&mut app, &["s-1"]);
         assert_eq!(app.usage[&SessionId::new("s-1")].used, 7);
-        assert_eq!(app.composer.context_label, "7 tokens");
-        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(7)
+        );
+        assert_eq!(app.composer.context_percent, None);
     }
 
     #[test]
-    fn topbar_usage_label_formats_with_and_without_window() {
+    fn composer_meter_reconciles_with_and_without_window() {
         let (mut app, _) = live_app();
         deliver_connected(&mut app);
         loaded(&mut app, &["s-1"]);
-        assert_eq!(app.topbar_usage, None);
+        assert_eq!(app.composer.usage, None);
+        assert_eq!(app.composer.context_percent, None);
         stream(
             &mut app,
             manifest_domain::StreamEvent::Usage {
@@ -6965,7 +6958,11 @@ mod tests {
                 usage_json: String::from(r#"{"total": 7}"#),
             },
         );
-        assert_eq!(app.topbar_usage.as_deref(), Some("7 tokens"));
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(7)
+        );
+        assert_eq!(app.composer.context_percent, None);
         stream(
             &mut app,
             manifest_domain::StreamEvent::Usage {
@@ -6976,9 +6973,12 @@ mod tests {
                 usage_json: String::from(r#"{"total": 42, "limit": 200}"#),
             },
         );
-        assert_eq!(app.topbar_usage.as_deref(), Some("42 / 200 · 21%"));
-        assert_eq!(app.composer.context_label, "42 / 200 · 21%");
-        // A zero window is not a window: plain token count.
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(42)
+        );
+        assert_eq!(app.composer.context_percent, Some(21.0));
+        // A zero window is not a window: no meter fill.
         stream(
             &mut app,
             manifest_domain::StreamEvent::Usage {
@@ -6989,7 +6989,11 @@ mod tests {
                 usage_json: String::from(r#"{"total": 5, "limit": 0}"#),
             },
         );
-        assert_eq!(app.topbar_usage.as_deref(), Some("5 tokens"));
+        assert_eq!(
+            app.composer.usage.as_ref().map(|snapshot| snapshot.used),
+            Some(5)
+        );
+        assert_eq!(app.composer.context_percent, None);
     }
 
     #[test]
@@ -6998,7 +7002,6 @@ mod tests {
         deliver_connected(&mut app);
         // No listed session and no draft: no segments.
         assert_eq!(app.topbar_project_name(), None);
-        assert_eq!(app.topbar_usage, None);
         assert_eq!(app.branch, None);
         loaded(&mut app, &["s-1", "s-2"]);
         // The selected session's project group names the segment; the

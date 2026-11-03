@@ -310,10 +310,10 @@ pub struct State {
     pub goal_display: Option<GoalDisplay>,
     /// Precomputed "model · effort" pill text.
     pub model_effort_label: String,
-    /// Precomputed context meter text ("used/window · %" or a
-    /// no-report fallback).
-    pub context_label: String,
     /// Precomputed meter fill in percent, when the window is known.
+    /// The sub-bar ring and the popover derive their text from
+    /// [`State::usage`] via [`format_tokens`] and
+    /// [`context_usage_line`], so no stored string is needed.
     pub context_percent: Option<f32>,
 }
 
@@ -344,7 +344,6 @@ impl State {
             usage: None,
             goal_display: None,
             model_effort_label: String::new(),
-            context_label: String::new(),
             context_percent: None,
         };
         state.refresh_derived();
@@ -386,29 +385,21 @@ impl State {
     /// Recomputes the derived display strings from the picker state.
     /// The single writer of the label fields, called from every fold
     /// that changes them, so the view reads without formatting
-    /// (UI contract §2).
+    /// (UI contract §2). Usage text is derived on demand from
+    /// [`State::usage`] via [`format_tokens`]; only the ring/popover
+    /// percent is stored.
     fn refresh_derived(&mut self) {
         self.model_effort_label = format!("{} · {}", self.model_name(), self.effort_name());
-        let (label, percent) = match &self.usage {
-            None => (String::from("Context —"), None),
+        self.context_percent = match &self.usage {
             Some(snapshot) => match snapshot.window {
                 Some(window) if window > 0 => {
                     let ratio = snapshot.used as f32 / window as f32;
-                    (
-                        format!(
-                            "{} / {} · {}%",
-                            snapshot.used,
-                            window,
-                            (ratio * 100.0).round() as u64
-                        ),
-                        Some((ratio * 100.0).clamp(0.0, 100.0)),
-                    )
+                    Some((ratio * 100.0).clamp(0.0, 100.0))
                 }
-                _ => (format!("{} tokens", snapshot.used), None),
+                _ => None,
             },
+            None => None,
         };
-        self.context_label = label;
-        self.context_percent = percent;
     }
 
     /// Human name of the selected model: the catalog label when the
@@ -968,8 +959,8 @@ impl State {
     }
 
     /// The live sub-bar: the permission text-button on the left, and
-    /// the combined model-effort pill plus the context meter pinned
-    /// to the right.
+    /// the combined model-effort pill plus the clickable context
+    /// ring pinned to the right.
     fn sub_bar_view(&self) -> Element<'_, Message> {
         let permission_kind = if self.permission == PermissionMode::Muse(MusePermission::Yolo) {
             kit::ButtonKind::DangerGhost
@@ -988,11 +979,7 @@ impl State {
                 kit::ButtonKind::Ghost,
                 Some(Message::ModelPressed),
             ),
-            kit::pill_button(
-                self.context_label.as_str(),
-                kit::ButtonKind::Ghost,
-                Some(Message::ContextPressed),
-            ),
+            kit::context_ring(self.context_percent, Some(Message::ContextPressed)),
         ]
         .spacing(SPACE_S)
         .width(Length::Fill)
@@ -1098,23 +1085,49 @@ impl State {
         kit::popup_card(rows, EFFORT_POPUP_WIDTH)
     }
 
-    /// The context popover: the meter plus the one-line breakdown, or
-    /// the no-report fallback.
+    /// The context popover: the percent header, the K-formatted
+    /// usage line, and the meter when the window is known, plus the
+    /// one-line breakdown verbatim; or the no-report fallback.
     fn context_popover_view(&self) -> Element<'_, Message> {
         let mut popover = iced::widget::column![].spacing(SPACE_XS);
-        if let Some(percent) = self.context_percent {
-            popover = popover.push(iced::widget::progress_bar(0.0..=100.0, percent));
+        match &self.usage {
+            None => {
+                popover = popover.push(
+                    iced::widget::text("No usage reported yet.")
+                        .size(crate::theme::FONT_SIZE_SMALL)
+                        .color(crate::theme::TEXT_SECONDARY),
+                );
+            }
+            Some(snapshot) => {
+                if let Some(percent) = self.context_percent {
+                    // Same tokens as kit::popup_header, but owned text:
+                    // the percent is derived per view and lives nowhere
+                    // in state.
+                    popover = popover.push(
+                        iced::widget::container(
+                            iced::widget::text(format!("{}% full", percent.round()))
+                                .size(FONT_SIZE_PANEL_SMALL)
+                                .color(TEXT_TERTIARY),
+                        )
+                        .padding([SPACE_XS, SPACE_S])
+                        .width(Length::Fill),
+                    );
+                }
+                popover = popover.push(
+                    iced::widget::text(format!("{} tokens", context_usage_line(snapshot)))
+                        .size(FONT_SIZE_PANEL)
+                        .color(TEXT_SECONDARY),
+                );
+                if let Some(percent) = self.context_percent {
+                    popover = popover.push(iced::widget::progress_bar(0.0..=100.0, percent));
+                }
+                popover = popover.push(
+                    iced::widget::text(snapshot.detail.as_str())
+                        .size(crate::theme::FONT_SIZE_SMALL)
+                        .color(crate::theme::TEXT_SECONDARY),
+                );
+            }
         }
-        let detail = self
-            .usage
-            .as_ref()
-            .map(|snapshot| snapshot.detail.as_str())
-            .unwrap_or("No usage reported yet.");
-        popover = popover.push(
-            iced::widget::text(detail)
-                .size(crate::theme::FONT_SIZE_SMALL)
-                .color(crate::theme::TEXT_SECONDARY),
-        );
         kit::popup_card(popover.width(Length::Fill), CONTEXT_POPUP_WIDTH)
     }
 
@@ -1172,6 +1185,42 @@ impl State {
 impl Default for State {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// K/M-formatted token count: values under 1000 stay raw, thousands
+/// read as `k` and millions as `M` with one decimal trimmed when it
+/// is zero (`999`, `1k`, `57.1k`, `200k`, `1.5M`). Pure so the
+/// popover line is unit-testable without rendering.
+pub(crate) fn format_tokens(used: u64) -> String {
+    fn scaled(value: f64, suffix: &str) -> String {
+        let rounded = (value * 10.0).round() / 10.0;
+        if rounded.fract() == 0.0 {
+            format!("{}{suffix}", rounded as u64)
+        } else {
+            format!("{rounded:.1}{suffix}")
+        }
+    }
+    if used < 1_000 {
+        format!("{used}")
+    } else if used < 1_000_000 {
+        scaled(used as f64 / 1_000.0, "k")
+    } else {
+        scaled(used as f64 / 1_000_000.0, "M")
+    }
+}
+
+/// Popover usage line for a snapshot: `used / window` K-formatted
+/// when the window is known and nonzero, else the K-formatted total.
+/// Pure so the popover text is unit-testable without rendering.
+pub(crate) fn context_usage_line(snapshot: &UsageSnapshot) -> String {
+    match snapshot.window {
+        Some(window) if window > 0 => format!(
+            "{} / {}",
+            format_tokens(snapshot.used),
+            format_tokens(window)
+        ),
+        _ => format_tokens(snapshot.used),
     }
 }
 
@@ -1575,7 +1624,7 @@ mod tests {
             r#"{"prompt":57064,"output":16,"total":57080,"limit":200000}"#,
         ));
         let label_before = got.model_effort_label.clone();
-        let context_before = got.context_label.clone();
+        let usage_before = got.usage.clone();
         let percent_before = got.context_percent;
         type_text(&mut got, "draft text");
         got.insert_attachment(String::from("/work/notes.md"));
@@ -1599,7 +1648,14 @@ mod tests {
         assert!(matches!(got.catalog, ModelCatalog::Ready(_)));
         assert!(got.usage.is_some());
         assert_eq!(got.model_effort_label, label_before);
-        assert_eq!(got.context_label, context_before);
+        assert_eq!(
+            got.usage.as_ref().map(|snapshot| snapshot.used),
+            usage_before.as_ref().map(|snapshot| snapshot.used)
+        );
+        assert_eq!(
+            got.usage.as_ref().and_then(|snapshot| snapshot.window),
+            usage_before.as_ref().and_then(|snapshot| snapshot.window)
+        );
         assert_eq!(got.context_percent, percent_before);
         assert!(!got.send_enabled);
         assert!(got.running_visible);
@@ -2049,14 +2105,15 @@ mod tests {
     #[test]
     fn context_popover_toggles_and_labels_usage() {
         let mut got = State::new();
-        assert_eq!(got.context_label, "Context —");
+        assert_eq!(got.usage, None);
         assert_eq!(got.context_percent, None);
         got.update(Message::ContextPressed);
         assert_eq!(got.context_popover, ContextPopover::Open);
         got.set_usage(UsageSnapshot::parse(
             r#"{"prompt":57064,"output":16,"total":57080,"limit":200000}"#,
         ));
-        assert_eq!(got.context_label, "57080 / 200000 · 29%");
+        let snapshot = got.usage.as_ref().expect("usage stored");
+        assert_eq!(context_usage_line(snapshot), "57.1k / 200k");
         let percent = got.context_percent.expect("windowed usage meters");
         assert!((percent - 28.54).abs() < 0.01);
         got.update(Message::ContextPressed);
@@ -2088,10 +2145,38 @@ mod tests {
     fn usage_without_window_has_no_meter() {
         let mut got = State::new();
         got.set_usage(UsageSnapshot::parse(r#"{"total": 42}"#));
-        assert_eq!(got.context_label, "42 tokens");
+        let snapshot = got.usage.as_ref().expect("usage stored");
+        assert_eq!(context_usage_line(snapshot), "42");
         assert_eq!(got.context_percent, None);
         got.set_usage(None);
-        assert_eq!(got.context_label, "Context —");
+        assert_eq!(got.usage, None);
+        assert_eq!(got.context_percent, None);
+    }
+
+    #[test]
+    fn format_tokens_formats_k_and_m() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(1_050), "1.1k");
+        assert_eq!(format_tokens(57_080), "57.1k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(999_949), "999.9k");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn context_usage_line_covers_window_states() {
+        let windowed =
+            UsageSnapshot::parse(r#"{"prompt":57064,"output":16,"total":57080,"limit":200000}"#)
+                .expect("usage parses");
+        assert_eq!(context_usage_line(&windowed), "57.1k / 200k");
+        let windowless = UsageSnapshot::parse(r#"{"total": 42}"#).expect("usage parses");
+        assert_eq!(context_usage_line(&windowless), "42");
+        let zero_window =
+            UsageSnapshot::parse(r#"{"total": 5, "limit": 0}"#).expect("usage parses");
+        assert_eq!(context_usage_line(&zero_window), "5");
     }
 
     fn goal(objective: &str, percent: f64, status: GoalStatus) -> GoalInfo {

@@ -13,16 +13,17 @@
 //! the surfaces they overlay.
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
-use iced::{Background, Border, Color, Element, Length, Theme};
+use iced::{Background, Border, Color, Element, Length, Rectangle, Theme};
 use manifest_domain::TodoStatus;
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
-    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT, DANGER,
-    DIVIDER_HIT_WIDTH, FONT_SIZE_BODY, FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL,
-    ICON_BUTTON_SIZE, ICON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
-    SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT,
-    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT,
+    CONTEXT_RING_SIZE, CONTEXT_RING_STROKE, DANGER, DIVIDER_HIT_WIDTH, FONT_SIZE_BODY,
+    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, ICON_SIZE,
+    MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
+    SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
+    TEXT_TERTIARY,
 };
 
 /// The pill-button treatments.
@@ -198,6 +199,85 @@ pub(crate) fn icon_pill_button<'a, Message: Clone + 'a>(
         .padding(SPACE_S)
         .on_press_maybe(on_press)
         .style(style)
+        .into()
+}
+
+/// Sweep fraction behind the context ring: `None` draws the bare
+/// track, `Some(f)` sweeps `f` of the circle from the top. Pure so
+/// the meter math is unit-testable without constructing widgets.
+pub(crate) fn ring_fraction(percent: Option<f32>) -> Option<f32> {
+    percent.map(|p| (p / 100.0).clamp(0.0, 1.0))
+}
+
+/// The canvas program behind [`context_ring`]: a faint track circle
+/// plus an accent progress arc starting at the top.
+#[derive(Debug, Clone, Copy)]
+struct ContextRingProgram {
+    fraction: Option<f32>,
+}
+
+impl<Message> iced::widget::canvas::Program<Message> for ContextRingProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Path, Stroke, path::Arc};
+        use std::f32::consts::PI;
+        let mut frame = Frame::new(renderer, bounds.size());
+        let radius = (bounds.width.min(bounds.height) - CONTEXT_RING_STROKE).max(0.0) / 2.0;
+        let track = Path::circle(frame.center(), radius);
+        frame.stroke(
+            &track,
+            Stroke::default()
+                .with_width(CONTEXT_RING_STROKE)
+                .with_color(TEXT_FAINT),
+        );
+        if let Some(fraction) = self.fraction.filter(|f| *f > 0.0) {
+            let start = -PI / 2.0;
+            let arc = Path::new(|builder| {
+                builder.arc(Arc {
+                    center: frame.center(),
+                    radius,
+                    start_angle: start.into(),
+                    end_angle: (start + fraction * 2.0 * PI).into(),
+                });
+            });
+            frame.stroke(
+                &arc,
+                Stroke::default()
+                    .with_width(CONTEXT_RING_STROKE)
+                    .with_line_cap(iced::widget::canvas::LineCap::Round)
+                    .with_color(ACCENT_BASE),
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// A clickable context ring for the composer's sub-bar: a small
+/// canvas drawing the track circle plus the usage arc (`None` draws
+/// the track only), wrapped in a ghost-style button so hover and
+/// press read like the neighboring pills. No text, ever.
+pub(crate) fn context_ring<'a, Message: Clone + 'a>(
+    percent: Option<f32>,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    use iced::widget::canvas::Canvas;
+    let ring = Canvas::new(ContextRingProgram {
+        fraction: ring_fraction(percent),
+    })
+    .width(Length::Fixed(CONTEXT_RING_SIZE))
+    .height(Length::Fixed(CONTEXT_RING_SIZE));
+    button(ring)
+        .padding(SPACE_XS)
+        .on_press_maybe(on_press)
+        .style(ghost_style)
         .into()
 }
 
@@ -1645,6 +1725,16 @@ mod tests {
             super::selection_icon(false, true),
             lucide_icons::Icon::Square
         ));
+    }
+
+    #[test]
+    fn ring_fraction_clamps_sweep() {
+        assert_eq!(super::ring_fraction(None), None);
+        assert_eq!(super::ring_fraction(Some(0.0)), Some(0.0));
+        assert_eq!(super::ring_fraction(Some(29.0)), Some(0.29));
+        assert_eq!(super::ring_fraction(Some(100.0)), Some(1.0));
+        assert_eq!(super::ring_fraction(Some(140.0)), Some(1.0));
+        assert_eq!(super::ring_fraction(Some(-5.0)), Some(0.0));
     }
 
     #[test]
