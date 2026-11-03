@@ -701,6 +701,41 @@ impl State {
         self.rebuild_rows();
     }
 
+    /// Seeds the transcript from stored history items, oldest first.
+    ///
+    /// History predates every live entry, so missing items prepend
+    /// ahead of existing entries in host order. Items already present
+    /// (by host id, from an earlier seed or a live stream event) are
+    /// skipped, and system items produce no entry. Returns whether an
+    /// entry was added. History is terminal, so seeded entries read
+    /// completed.
+    pub fn seed_history(&mut self, items: Vec<StreamItem>) -> bool {
+        let mut present: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.host_id.as_deref())
+            .collect();
+        let mut fresh = Vec::new();
+        for item in &items {
+            let id = item.item_id();
+            if present.contains(id) {
+                continue;
+            }
+            if let Some(entry) = entry_from_item(item, true) {
+                present.insert(id);
+                fresh.push(entry);
+            }
+        }
+        if fresh.is_empty() {
+            return false;
+        }
+        let mut entries = std::mem::take(&mut self.entries);
+        fresh.append(&mut entries);
+        self.entries = fresh;
+        self.rebuild_rows();
+        true
+    }
+
     /// Derives rows from entries: a maximal run of consecutive
     /// reasoning/tool entries forms one group (even a run of one);
     /// everything else stands alone. Expanded flags persist by key.
@@ -1797,6 +1832,81 @@ mod tests {
         state.item_completed(system_item("s-1"));
         assert!(state.entries.is_empty());
         assert!(state.rows.is_empty());
+    }
+
+    #[test]
+    fn seed_history_appends_in_order_completed() {
+        let mut state = State::default();
+        assert!(state.seed_history(vec![
+            user_item("h-u1", "First question"),
+            agent_item("h-a1", "First answer."),
+        ]));
+        assert_eq!(state.entries.len(), 2);
+        assert!(matches!(
+            &state.entries[0].kind,
+            EntryKind::User { text } if text == "First question"
+        ));
+        assert!(matches!(
+            &state.entries[1].kind,
+            EntryKind::Assistant { text, .. } if text == "First answer."
+        ));
+        assert!(state.entries.iter().all(|entry| entry.completed));
+        assert_eq!(state.entries[0].host_id, Some(String::from("h-u1")));
+    }
+
+    #[test]
+    fn seed_history_prepends_ahead_of_live_entries() {
+        let mut state = State::default();
+        state.item_completed(agent_item("live-1", "Live answer."));
+        assert!(state.seed_history(vec![
+            user_item("h-u1", "First question"),
+            agent_item("h-a1", "First answer."),
+        ]));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.host_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(String::from("h-u1")),
+                Some(String::from("h-a1")),
+                Some(String::from("live-1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn seed_history_skips_present_ids_and_system_items() {
+        let mut state = State::default();
+        state.item_completed(agent_item("h-a1", "Streamed answer."));
+        assert!(state.seed_history(vec![
+            agent_item("h-a1", "Seeded answer."),
+            system_item("h-s1"),
+            user_item("h-u1", "First question"),
+        ]));
+        // The live entry keeps its streamed text; the seed fills only
+        // the gap, ahead of it.
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.host_id.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(String::from("h-u1")), Some(String::from("h-a1"))]
+        );
+        assert!(matches!(
+            &state.entries[1].kind,
+            EntryKind::Assistant { text, .. } if text == "Streamed answer."
+        ));
+        // A repeat seed finds everything present and adds nothing.
+        assert!(!state.seed_history(vec![
+            user_item("h-u1", "First question"),
+            agent_item("h-a1", "Seeded answer."),
+        ]));
+        assert_eq!(state.entries.len(), 2);
+        // System-only seeds add nothing.
+        assert!(!state.seed_history(vec![system_item("h-s2")]));
     }
 
     #[test]

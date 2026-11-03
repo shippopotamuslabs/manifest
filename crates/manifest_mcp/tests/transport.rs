@@ -452,6 +452,46 @@ fn resume_in_use_reports_server_text() {
 }
 
 #[test]
+fn history_loads_seed_items_in_order() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.load_history(SessionId::new("sess-orphan"));
+    let seen = recv_until(&rx, "HistoryLoaded", |event| {
+        matches!(event, EngineEvent::HistoryLoaded { .. })
+    });
+    let loaded = seen.iter().find_map(|event| match event {
+        EngineEvent::HistoryLoaded { session, items } => Some((session, items)),
+        _ => None,
+    });
+    let (session, items) = loaded.expect("HistoryLoaded seen above");
+    assert_eq!(session, &SessionId::new("sess-orphan"));
+    let texts: Vec<(&str, &str)> = items
+        .iter()
+        .map(|item| match item {
+            StreamItem::UserMessage { item_id, text } => (item_id.as_str(), text.as_str()),
+            StreamItem::AgentMessage { item_id, text, .. } => (item_id.as_str(), text.as_str()),
+            other => panic!("expected user/agent history, saw {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            ("hist-user-1", "First question"),
+            ("hist-agent-1", "First answer."),
+            ("hist-user-2", "Second question"),
+            ("hist-agent-2", "Second answer."),
+        ]
+    );
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
 fn send_turn_flows_into_acceptance_and_stream() {
     let (tx, rx) = std::sync::mpsc::channel();
     let engine = connect(fake_config("ok"), tx);

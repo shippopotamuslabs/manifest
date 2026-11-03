@@ -973,6 +973,113 @@ pub(crate) fn map_resume_result(
     Ok(commanded.clone())
 }
 
+/// One `session/read` history page: the seed items in host order,
+/// per-item diagnostics, and the `none` reason when the host sent
+/// no items.
+pub(crate) struct HistoryPage {
+    /// Stored items, oldest first; system items ride along and the
+    /// shell drops them while seeding.
+    pub items: Vec<StreamItem>,
+    /// One line per degradation (unparseable items skipped); the
+    /// worker emits these before the loaded event.
+    pub diagnostics: Vec<String>,
+    /// The `none` mode's `noneReason`, when the host sent one; the
+    /// worker surfaces it only when it names truncation.
+    pub none_reason: Option<String>,
+}
+
+/// The raw items array for a `session/read` history mode: `items`
+/// for `inline`, `snapshot.items` for the snapshot modes, and
+/// nothing for `none` or an unknown mode (forward compatible,
+/// mirroring the ignored unknown stream types).
+fn history_items<'a>(history: &'a Value, mode: &str) -> &'a [Value] {
+    match mode {
+        "inline" => history.get("items").and_then(Value::as_array),
+        "snapshot" | "anchoredSnapshot" => history
+            .get("snapshot")
+            .and_then(|snapshot| snapshot.get("items"))
+            .and_then(Value::as_array),
+        _ => None,
+    }
+    .map(Vec::as_slice)
+    .unwrap_or(&[])
+}
+
+/// Map a `muse_raw` `session/read` result into its history page.
+///
+/// The content text parses as the method result: a `history`
+/// object whose `mode` picks the items (`inline` reads
+/// `history.items`, the snapshot modes read
+/// `history.snapshot.items`, `none` reads none) plus the view
+/// cursor the shell ignores. Each item classifies through
+/// [`parse_stream_item`]; an unparseable item is skipped and
+/// counted into one diagnostic, never a whole-page failure. A
+/// server-authored `isError` body passes through as the failure
+/// text; anything else that does not parse fails with the friendly
+/// generic message, mirroring [`map_models_result`].
+pub(crate) fn map_history_result(result: &Value) -> Result<HistoryPage, String> {
+    let generic = "Couldn't load that session's stored history from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let history = body.get("history").cloned().unwrap_or(Value::Null);
+    let mode = history
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    let mut skipped = 0_usize;
+    for item in history_items(&history, mode) {
+        match parse_stream_item(item) {
+            Ok(parsed) => items.push(parsed),
+            Err(_) => skipped += 1,
+        }
+    }
+    let mut diagnostics = Vec::new();
+    if skipped > 0 {
+        diagnostics.push(format!(
+            "Skipped {skipped} stored history items that couldn't be read."
+        ));
+    }
+    let none_reason = if mode == "none" {
+        history
+            .get("noneReason")
+            .and_then(Value::as_str)
+            .map(String::from)
+    } else {
+        None
+    };
+    Ok(HistoryPage {
+        items,
+        diagnostics,
+        none_reason,
+    })
+}
+
+/// Truncation diagnostic for a `none` history reason, when the
+/// reason names truncation: a plain `none` seeds nothing silently,
+/// while a truncation-flavored reason surfaces so the gap shows
+/// instead of reading as an empty session.
+pub(crate) fn history_truncation_diagnostic(none_reason: &str) -> Option<String> {
+    if none_reason.to_lowercase().contains("truncat") {
+        Some(format!(
+            "This session's stored history was unavailable ({none_reason}); older turns are missing."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Text of the first `type == "text"` content item, if any.
 fn first_text_opt(result: &Value) -> Option<String> {
     result
@@ -1163,6 +1270,181 @@ mod tests {
         // No isError flag at all still resumes.
         let bare = json!({"content": []});
         assert_eq!(map_resume_result(&bare, &commanded), Ok(commanded.clone()));
+    }
+
+    fn history_envelope(history: Value) -> Value {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&json!({
+                    "history": history,
+                    "viewCursor": "v4:s:9",
+                })).expect("envelope is JSON"),
+            }],
+            "isError": false,
+        })
+    }
+
+    fn history_user(id: &str, text: &str) -> Value {
+        json!({"itemId": id, "kind": "userMessage", "status": "completed", "text": text})
+    }
+
+    fn history_agent(id: &str, text: &str) -> Value {
+        json!({"itemId": id, "kind": "agentMessage", "status": "completed", "text": text})
+    }
+
+    #[test]
+    fn history_inline_reads_items_in_order() {
+        let tool_envelope = serde_json::json!({
+            "chunk_id": "exec-1-1",
+            "exit_code": 0,
+            "output": "total 0",
+        })
+        .to_string();
+        let result = history_envelope(json!({
+            "mode": "inline",
+            "items": [
+                history_user("h-u1", "First question"),
+                history_agent("h-a1", "First answer."),
+                {
+                    "itemId": "h-t1",
+                    "kind": "toolCall",
+                    "status": "completed",
+                    "tool": "bash",
+                    "args": serde_json::json!({"command": "ls"}).to_string(),
+                    "visibleOutput": tool_envelope,
+                },
+                {
+                    "itemId": "h-c1",
+                    "kind": "compaction",
+                    "status": "completed",
+                    "outcome": "compacted",
+                    "tokensBefore": 100,
+                    "tokensAfter": 10,
+                },
+            ],
+        }));
+        let page = map_history_result(&result).expect("ok");
+        assert!(page.diagnostics.is_empty(), "saw {:?}", page.diagnostics);
+        assert_eq!(page.none_reason, None);
+        assert_eq!(page.items.len(), 4);
+        assert_eq!(page.items[0].item_id(), "h-u1");
+        assert!(matches!(
+            &page.items[0],
+            StreamItem::UserMessage { text, .. } if text == "First question"
+        ));
+        assert!(matches!(
+            &page.items[1],
+            StreamItem::AgentMessage { text, .. } if text == "First answer."
+        ));
+        assert!(matches!(
+            &page.items[2],
+            StreamItem::ToolCall { tool, output, .. }
+            if tool == "bash" && output.as_deref() == Some("total 0")
+        ));
+        assert!(matches!(
+            &page.items[3],
+            StreamItem::Compaction { outcome, .. } if outcome.as_deref() == Some("compacted")
+        ));
+    }
+
+    #[test]
+    fn history_snapshot_modes_read_snapshot_items() {
+        for mode in ["snapshot", "anchoredSnapshot"] {
+            let result = history_envelope(json!({
+                "mode": mode,
+                "items": [history_user("ignored", "elsewhere")],
+                "snapshot": {"items": [
+                    history_user("s-u1", "Snapshot question"),
+                    history_agent("s-a1", "Snapshot answer."),
+                ]},
+            }));
+            let page = map_history_result(&result).expect("ok");
+            assert!(page.diagnostics.is_empty());
+            assert_eq!(page.none_reason, None);
+            assert_eq!(
+                page.items
+                    .iter()
+                    .map(StreamItem::item_id)
+                    .collect::<Vec<_>>(),
+                vec!["s-u1", "s-a1"],
+                "mode {mode} reads snapshot.items"
+            );
+        }
+    }
+
+    #[test]
+    fn history_none_is_empty_with_its_reason() {
+        let result = history_envelope(json!({"mode": "none", "noneReason": "empty"}));
+        let page = map_history_result(&result).expect("ok");
+        assert!(page.items.is_empty());
+        assert!(page.diagnostics.is_empty());
+        assert_eq!(page.none_reason.as_deref(), Some("empty"));
+        // A plain reason stays silent; a truncation-flavored one surfaces.
+        assert_eq!(history_truncation_diagnostic("empty"), None);
+        assert_eq!(
+            history_truncation_diagnostic("viewTruncated: kept the tail"),
+            Some(String::from(
+                "This session's stored history was unavailable (viewTruncated: kept the tail); older turns are missing."
+            ))
+        );
+        // Only `none` carries a reason.
+        let inline = history_envelope(json!({
+            "mode": "inline",
+            "items": [history_user("h-u1", "Hi")],
+            "noneReason": "empty",
+        }));
+        let page = map_history_result(&inline).expect("ok");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.none_reason, None);
+    }
+
+    #[test]
+    fn history_malformed_item_is_skipped_with_the_rest_intact() {
+        let result = history_envelope(json!({
+            "mode": "inline",
+            "items": [
+                history_user("h-u1", "First question"),
+                {"kind": "userMessage", "text": "no id"},
+                history_agent("h-a1", "First answer."),
+            ],
+        }));
+        let page = map_history_result(&result).expect("ok");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(StreamItem::item_id)
+                .collect::<Vec<_>>(),
+            vec!["h-u1", "h-a1"]
+        );
+        assert_eq!(
+            page.diagnostics,
+            vec![String::from(
+                "Skipped 1 stored history items that couldn't be read."
+            )]
+        );
+    }
+
+    #[test]
+    fn history_result_failures_carry_server_or_generic_text() {
+        let server = json!({
+            "content": [{"type": "text", "text": "session gone"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_history_result(&server).map(|page| page.items.len()),
+            Err(String::from("session gone"))
+        );
+        let garbled = json!({
+            "content": [{"type": "text", "text": "not json"}],
+            "isError": false,
+        });
+        assert_eq!(
+            map_history_result(&garbled).map(|page| page.items.len()),
+            Err(String::from(
+                "Couldn't load that session's stored history from the Muse MCP server."
+            ))
+        );
     }
 
     #[test]

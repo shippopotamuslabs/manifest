@@ -785,6 +785,66 @@ fn main() {
                     );
                     continue;
                 }
+                if tool == "muse_raw" {
+                    let method = arguments
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if method == "session/read" {
+                        let session = arguments
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("sess-orphan");
+                        let history = serde_json::json!({
+                            "history": {
+                                "mode": "inline",
+                                "items": [
+                                    {
+                                        "itemId": "hist-user-1",
+                                        "kind": "userMessage",
+                                        "recordedAt": "2026-11-02T20:00:00Z",
+                                        "revision": 1,
+                                        "status": "completed",
+                                        "text": "First question",
+                                        "turnId": "hist-turn-1",
+                                    },
+                                    {
+                                        "itemId": "hist-agent-1",
+                                        "kind": "agentMessage",
+                                        "messagePhase": "finalAnswer",
+                                        "recordedAt": "2026-11-02T20:00:01Z",
+                                        "revision": 2,
+                                        "status": "completed",
+                                        "text": "First answer.",
+                                        "turnId": "hist-turn-1",
+                                    },
+                                    {
+                                        "itemId": "hist-user-2",
+                                        "kind": "userMessage",
+                                        "recordedAt": "2026-11-02T20:01:00Z",
+                                        "revision": 1,
+                                        "status": "completed",
+                                        "text": "Second question",
+                                        "turnId": "hist-turn-2",
+                                    },
+                                    {
+                                        "itemId": "hist-agent-2",
+                                        "kind": "agentMessage",
+                                        "messagePhase": "finalAnswer",
+                                        "recordedAt": "2026-11-02T20:01:01Z",
+                                        "revision": 2,
+                                        "status": "completed",
+                                        "text": "Second answer.",
+                                        "turnId": "hist-turn-2",
+                                    },
+                                ],
+                            },
+                            "viewCursor": format!("v4:{session}:2"),
+                        });
+                        tool_result(&mut out, &call_id, &history.to_string(), false);
+                        continue;
+                    }
+                }
                 if tool == "muse_models" {
                     if mode == "resume-in-use" {
                         tool_result(

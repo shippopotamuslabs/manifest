@@ -108,6 +108,13 @@ impl EngineHandle {
         self.inner.list_skills(session);
     }
 
+    /// Fetches the session's stored history; results arrive as
+    /// `HistoryLoaded`, failures as `CommandFailed(History)`. The
+    /// shell fetches once per session when reopening it.
+    pub fn load_history(&self, session: SessionId) {
+        self.inner.load_history(session);
+    }
+
     /// Compacts the session's context; failures arrive as
     /// `CommandFailed(Compact)`, success emits nothing.
     pub fn compact_session(&self, session: SessionId) {
