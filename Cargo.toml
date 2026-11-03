@@ -4,6 +4,7 @@ members = [
     "crates/manifest_domain",
     "crates/manifest_mcp",
     "crates/manifest_shell",
+    "crates/manifest_store",
 ]
 
 [workspace.package]
