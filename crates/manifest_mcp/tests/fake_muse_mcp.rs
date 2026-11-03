@@ -519,6 +519,20 @@ fn main() {
                         );
                         continue;
                     }
+                    let worktree = arguments
+                        .get("worktree")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if (worktree == "create" || worktree == "existing") && workspace == "/untrusted"
+                    {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            "Repository '/untrusted' is not trusted; worktree create, attach, and list require a trusted repository.",
+                            true,
+                        );
+                        continue;
+                    }
                     let prompt = arguments
                         .get("prompt")
                         .and_then(serde_json::Value::as_str)
@@ -558,6 +572,24 @@ fn main() {
                         false,
                     );
                     emit_turn_stream(&mut out, session, prompt);
+                    continue;
+                }
+                if tool == "muse_models" {
+                    if mode == "resume-in-use" {
+                        tool_result(
+                            &mut out,
+                            &call_id,
+                            "session sess-orphan is in use by another client (sessionInUse: already attached). Muse MCP will not attach to it.",
+                            true,
+                        );
+                        continue;
+                    }
+                    tool_result(
+                        &mut out,
+                        &call_id,
+                        &serde_json::json!({"models": ["fake-model-1"]}).to_string(),
+                        false,
+                    );
                     continue;
                 }
                 status_calls += 1;
