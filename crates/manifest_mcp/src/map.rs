@@ -46,8 +46,7 @@ pub(crate) fn map_status_rows(
     rows: &[Value],
 ) -> (Vec<ProjectSummary>, Vec<SessionSummary>, Vec<String>) {
     let mut projects = Vec::new();
-    let mut project_ids: HashMap<String, ProjectId> = HashMap::new();
-    let mut project_names: HashMap<String, String> = HashMap::new();
+    let mut projects_by_workspace: HashMap<String, (ProjectId, String)> = HashMap::new();
     let mut sessions = Vec::new();
     let mut diagnostics = Vec::new();
 
@@ -74,24 +73,23 @@ pub(crate) fn map_status_rows(
                 continue;
             }
         };
-        let status = if dto.pending_approvals + dto.pending_user_inputs > 0 {
+        let status = if dto.pending_approvals > 0 || dto.pending_user_inputs > 0 {
             SessionStatus::AwaitingApproval
         } else {
             status
         };
-        let project_id = project_ids.entry(dto.workspace.clone()).or_insert_with(|| {
-            let name = project_name(&dto.workspace).to_string();
-            project_names.insert(dto.workspace.clone(), name.clone());
-            projects.push(ProjectSummary {
-                id: ProjectId::new(format!("workspace:{}", dto.workspace)),
-                name: name.clone(),
-            });
-            ProjectId::new(format!("workspace:{}", dto.workspace))
-        });
-        let name = project_names
-            .get(&dto.workspace)
-            .cloned()
-            .unwrap_or_else(|| dto.workspace.clone());
+        let (project_id, name) = projects_by_workspace
+            .entry(dto.workspace.clone())
+            .or_insert_with(|| {
+                let name = project_name(&dto.workspace).to_string();
+                let id = ProjectId::new(format!("workspace:{}", dto.workspace));
+                projects.push(ProjectSummary {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                (id, name)
+            })
+            .clone();
         // First 8 chars (not bytes) so multi-byte ids truncate safely.
         let short: String = dto.session_id.chars().take(8).collect();
         sessions.push(SessionSummary {
@@ -120,6 +118,17 @@ fn req_string(params: &Value, key: &str) -> Result<String, String> {
     }
 }
 
+/// Session, turn, and view cursor shared by the known stream event types.
+///
+/// Parsing them here keeps unknown event types free of any `sessionId`
+/// requirement: the wildcard arm returns `Ok(None)` before calling this.
+fn parts(params: &Value) -> Result<(SessionId, Option<TurnId>, Option<String>), String> {
+    let session = SessionId::new(req_string(params, "sessionId")?);
+    let turn = opt_string(params, "turnId").map(TurnId::new);
+    let view_cursor = opt_string(params, "viewCursor");
+    Ok((session, turn, view_cursor))
+}
+
 /// Map `notifications/muse/event` params into a domain stream event.
 ///
 /// `Ok(None)` means the event is one this client ignores (an unknown
@@ -130,26 +139,14 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
         Some(kind) => kind,
         None => return Err(String::from("stream event is missing its type")),
     };
-    if !matches!(
-        kind,
-        "turn-started"
-            | "item-started"
-            | "item-delta"
-            | "item-completed"
-            | "turn-completed"
-            | "usage"
-            | "pending"
-    ) {
-        return Ok(None);
-    }
-    let session_id = req_string(params, "sessionId")?;
-    let session = SessionId::new(session_id);
-    let turn = opt_string(params, "turnId").map(TurnId::new);
-    let view_cursor = opt_string(params, "viewCursor");
 
     match kind {
-        "turn-started" => Ok(Some(StreamEvent::TurnStarted { session, turn })),
+        "turn-started" => {
+            let (session, turn, _) = parts(params)?;
+            Ok(Some(StreamEvent::TurnStarted { session, turn }))
+        }
         "item-started" | "item-completed" => {
+            let (session, turn, view_cursor) = parts(params)?;
             let item = params
                 .get("item")
                 .ok_or_else(|| String::from("stream event is missing its item"))?;
@@ -171,6 +168,7 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
             }
         }
         "item-delta" => {
+            let (session, turn, view_cursor) = parts(params)?;
             let item_id = req_string(params, "itemId")?;
             let delta = params
                 .get("delta")
@@ -186,18 +184,22 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
                 delta: delta.to_string(),
             }))
         }
-        "turn-completed" => Ok(Some(StreamEvent::TurnCompleted {
-            session,
-            turn,
-            view_cursor,
-            terminal: opt_string(params, "terminal"),
-            answer: opt_string(params, "answer"),
-            dropped_deltas: params
-                .get("droppedDeltas")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        })),
+        "turn-completed" => {
+            let (session, turn, view_cursor) = parts(params)?;
+            Ok(Some(StreamEvent::TurnCompleted {
+                session,
+                turn,
+                view_cursor,
+                terminal: opt_string(params, "terminal"),
+                answer: opt_string(params, "answer"),
+                dropped_deltas: params
+                    .get("droppedDeltas")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            }))
+        }
         "usage" => {
+            let (session, turn, view_cursor) = parts(params)?;
             let usage_kind = match params.get("usageKind").and_then(Value::as_str) {
                 Some("tokenUsage") => UsageKind::TokenUsage,
                 Some("changed") => UsageKind::Changed,
@@ -215,6 +217,7 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
             }))
         }
         "pending" => {
+            let (session, turn, _) = parts(params)?;
             let request_id = req_string(params, "requestId")?;
             let kind = match params.get("kind").and_then(Value::as_str) {
                 Some("approval") => PendingKind::Approval,
@@ -234,7 +237,6 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
                 phase,
             }))
         }
-        // Covered by the known-type gate above; unknown types return early.
         _ => Ok(None),
     }
 }
@@ -337,6 +339,21 @@ mod tests {
         assert_eq!(sessions[0].status, SessionStatus::Idle);
     }
 
+    /// Guards against overflow when the server reports huge pending counts.
+    #[test]
+    fn huge_pending_counts_do_not_overflow() {
+        let rows = vec![json!({
+            "session_id": "max-1",
+            "status": "running",
+            "workspace": "/w/p",
+            "pending_approvals": u64::MAX,
+            "pending_user_inputs": u64::MAX,
+        })];
+        let (_, sessions, _) = map_status_rows(&rows);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::AwaitingApproval);
+    }
+
     #[test]
     fn pending_overrides_running_and_unknown_is_a_diagnostic() {
         let rows = vec![
@@ -403,6 +420,12 @@ mod tests {
     fn stream_unknown_type_is_none_and_missing_session_is_err() {
         let unknown = json!({"type": "from-the-future", "sessionId": "s"});
         assert_eq!(map_stream_event(&unknown).expect("ok"), None);
+        // Unknown types ignore the event before any `sessionId` is required.
+        let unknown_without_session = json!({"type": "from-the-future"});
+        assert_eq!(
+            map_stream_event(&unknown_without_session).expect("ok"),
+            None
+        );
         let missing = json!({"type": "item-delta", "itemId": "i", "delta": "d"});
         assert!(map_stream_event(&missing).is_err());
         let non_string_type = json!({"type": 7});

@@ -6,7 +6,7 @@
 //! routes messages down, and maps child messages up (UI contract §7).
 
 use iced::{Element, Length, Task};
-use manifest_domain::{Connection, EngineEvent, Fixture, StreamEvent, TodoItem};
+use manifest_domain::{Connection, Fixture, TodoItem};
 
 use crate::engine;
 use crate::kit;
@@ -266,44 +266,13 @@ impl App {
                 if attempt != self.connection_attempt || self.engine_config.is_none() {
                     return Task::none();
                 }
-                let mut appended = false;
-                match input {
-                    engine::Input::Ready(handle) => {
-                        self.engine = Some(handle);
-                    }
-                    engine::Input::Event(EngineEvent::ConnectionChanged(next)) => {
-                        if let Connection::Failed(message) = &next {
-                            appended = self.transcript.push_error(message.clone());
-                        }
-                        self.connection = next;
-                        if self.connection == Connection::Connected {
-                            if let Some(engine) = &self.engine {
-                                engine.list_sessions();
-                            }
-                        } else if matches!(self.connection, Connection::Failed(_)) {
-                            self.engine = None;
-                        }
-                    }
-                    engine::Input::Event(EngineEvent::SessionsLoaded { projects, sessions }) => {
-                        self.sessions.replace(projects, sessions);
-                    }
-                    engine::Input::Event(EngineEvent::SessionsLoadFailed(message)) => {
-                        appended = self.transcript.push_error(message);
-                    }
-                    engine::Input::Event(EngineEvent::Diagnostic(message)) => {
-                        appended = self.transcript.push_error(message);
-                    }
-                    engine::Input::Event(EngineEvent::Stream(StreamEvent::Pending { .. })) => {
-                        if self.connection == Connection::Connected
-                            && let Some(engine) = &self.engine
-                        {
-                            engine.list_sessions();
-                        }
-                    }
-                    // M2 owns no transcript: other stream events are
-                    // consumed as no-ops until M3 renders them.
-                    engine::Input::Event(EngineEvent::Stream(_)) => {}
-                }
+                let appended = engine::apply(
+                    &mut self.connection,
+                    &mut self.engine,
+                    &mut self.sessions,
+                    &mut self.transcript,
+                    input,
+                );
                 if appended {
                     transcript::scroll_to_end().map(Message::Transcript)
                 } else {
@@ -326,24 +295,19 @@ impl App {
     /// Drag subscription plus the engine stream: idle produces nothing
     /// for the drag; while a divider drag is in flight, cursor moves
     /// resize the panel and releasing the left button ends the drag.
-    /// The engine stream runs only while connecting or connected with a
-    /// config; a finished stream whose recipe is still returned gets
-    /// restarted, which would respawn against a dead server in a loop,
-    /// so failure and fixture mode return no engine recipe until the
-    /// user retries.
+    /// The engine stream is gated in
+    /// [`engine::subscription_for`](crate::engine::subscription_for).
     pub fn subscription(&self) -> iced::Subscription<Message> {
         let drag = match self.panel_drag {
             PanelDrag::Idle => iced::Subscription::none(),
             PanelDrag::Dragging { .. } => iced::event::listen_with(drag_event),
         };
-        let engine = match (&self.engine_config, &self.connection) {
-            (Some(config), Connection::Connecting | Connection::Connected) => {
-                let attempt = self.connection_attempt;
-                engine::subscription(attempt, config)
-                    .map(move |(attempt, input)| Message::Engine { attempt, input })
-            }
-            _ => iced::Subscription::none(),
-        };
+        let engine = engine::subscription_for(
+            self.connection_attempt,
+            self.engine_config.as_ref(),
+            &self.connection,
+        )
+        .map(move |(attempt, input)| Message::Engine { attempt, input });
         iced::Subscription::batch([drag, engine])
     }
 
@@ -493,18 +457,6 @@ fn resize_corner<'a>(
     .into()
 }
 
-/// Static label for the connection state. The view performs no
-/// formatting: this match returns a static label, keeping string
-/// building out of the view (UI contract §2).
-fn connection_label(connection: &Connection) -> &'static str {
-    match connection {
-        Connection::Disconnected => "Offline",
-        Connection::Connecting => "Connecting...",
-        Connection::Connected => "Connected",
-        Connection::Failed(_) => "Connection failed",
-    }
-}
-
 /// The title bar: the app title in the fixed panel share, then the
 /// selected session title truly centered in the fill share with the
 /// window controls right-aligned. A plain function on the root state
@@ -533,18 +485,10 @@ fn topbar(state: &App) -> Element<'_, Message> {
             // Fixture mode shows no cluster; live mode names the
             // connection state and offers Retry while failed.
             if state.engine_config.is_some() {
-                controls = controls.push(
-                    iced::widget::text(connection_label(&state.connection))
-                        .size(FONT_SIZE_SMALL)
-                        .color(TEXT_TERTIARY),
-                );
-                if matches!(state.connection, Connection::Failed(_)) {
-                    controls = controls.push(kit::pill_button(
-                        "Retry",
-                        kit::ButtonKind::Ghost,
-                        Some(Message::Reconnect),
-                    ));
-                }
+                controls = controls.push(engine::connection_cluster(
+                    &state.connection,
+                    Message::Reconnect,
+                ));
             }
             controls
                 .push(kit::icon_button(
@@ -849,9 +793,11 @@ mod tests {
     }
 
     /// Test engine: counts `list_sessions` calls like the real worker
-    /// would serve them, without spawning anything.
+    /// would serve them, without spawning anything. The counter is
+    /// shared, so clones observe the same call count.
+    #[derive(Clone)]
     struct FakeEngine {
-        calls: std::sync::Mutex<usize>,
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
     }
 
     impl manifest_domain::SessionEngine for FakeEngine {
@@ -862,10 +808,10 @@ mod tests {
 
     /// Production boot with the handle already delivered, as the
     /// subscription's first item would.
-    fn live_app() -> (App, std::sync::Arc<FakeEngine>) {
-        let fake = std::sync::Arc::new(FakeEngine {
-            calls: std::sync::Mutex::new(0),
-        });
+    fn live_app() -> (App, FakeEngine) {
+        let fake = FakeEngine {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        };
         let mut app = App::live(manifest_mcp::ServerConfig::new("fake"));
         let attempt = app.connection_attempt;
         let _ = app.update(Message::Engine {
