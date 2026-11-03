@@ -1,8 +1,8 @@
 //! Transport tests against the scripted fake server.
 
 use manifest_domain::{
-    Connection, EngineEvent, PendingKind, PendingPhase, ProjectId, SessionEngine, SessionId,
-    SessionStatus, StreamEvent,
+    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, ProjectId, SessionEngine,
+    SessionId, SessionStatus, StreamEvent, StreamItem, TurnId,
 };
 use manifest_mcp::{MuseEngine, ServerConfig, connect};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -187,6 +187,193 @@ fn connects_and_lists_sessions() {
     assert!(
         !seen.iter().any(is_failed),
         "no failure while listing, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn spawn_flows_into_typed_stream() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.spawn_session(String::from("/tmp/ws"), String::from("Read note.txt"));
+    let mut seen = recv_until(&rx, "SessionSpawned", |event| {
+        matches!(event, EngineEvent::SessionSpawned { .. })
+    });
+    let spawned = seen.iter().find_map(|event| match event {
+        EngineEvent::SessionSpawned { session, turn } => Some((session, turn)),
+        _ => None,
+    });
+    let (session, turn) = spawned.expect("SessionSpawned seen above");
+    assert_eq!(session, &SessionId::new("fake-session-1"));
+    assert_eq!(turn, &Some(TurnId::new("fake-turn-1")));
+
+    seen.extend(recv_until(&rx, "spawn turn-completed", |event| {
+        matches!(
+            event,
+            EngineEvent::Stream(StreamEvent::TurnCompleted { turn, .. })
+            if turn == &Some(TurnId::new("fake-turn-1"))
+        )
+    }));
+
+    let user_text = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::ItemCompleted {
+            item: StreamItem::UserMessage { text, .. },
+            ..
+        }) => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(user_text.as_deref(), Some("Read note.txt"));
+
+    let reasoning = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::ItemCompleted {
+            item: StreamItem::Reasoning { summary, .. },
+            ..
+        }) => Some(summary.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        reasoning,
+        Some(vec![String::from(
+            "Planning the turn, listing the workspace, and quoting the note."
+        )])
+    );
+
+    let tool = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::ItemCompleted {
+            item:
+                StreamItem::ToolCall {
+                    tool,
+                    headline,
+                    output,
+                    status,
+                    ..
+                },
+            ..
+        }) => Some((
+            tool.clone(),
+            headline.clone(),
+            output.clone(),
+            status.clone(),
+        )),
+        _ => None,
+    });
+    let (tool, headline, output, status) = tool.expect("completed tool call seen above");
+    assert_eq!(tool, "bash");
+    assert_eq!(
+        headline.as_deref(),
+        Some("List workspace directory contents")
+    );
+    assert_eq!(output.as_deref(), Some("total 0"));
+    assert_eq!(status, ItemStatus::Completed);
+
+    let answer = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::ItemCompleted {
+            item:
+                StreamItem::AgentMessage {
+                    text,
+                    phase: Some(phase),
+                    ..
+                },
+            ..
+        }) if phase == "finalAnswer" => Some(text.clone()),
+        _ => None,
+    });
+    let answer = answer.expect("completed agent message seen above");
+    assert!(
+        answer.contains("```\ntotal 0\n```"),
+        "answer keeps its fenced code block, saw {answer:?}"
+    );
+
+    let close = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::TurnCompleted {
+            terminal,
+            answer,
+            dropped_deltas,
+            ..
+        }) => Some((terminal.clone(), answer.clone(), *dropped_deltas)),
+        _ => None,
+    });
+    let (terminal, closed_answer, dropped) = close.expect("turn-completed seen above");
+    assert_eq!(terminal.as_deref(), Some("completed"));
+    assert_eq!(closed_answer.as_deref(), Some(answer.as_str()));
+    assert_eq!(dropped, 0);
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn spawn_bad_workspace_is_command_failed() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.spawn_session(
+        String::from("/tmp/does-not-exist/ws"),
+        String::from("Read note.txt"),
+    );
+    let seen = recv_until(&rx, "CommandFailed", |event| {
+        matches!(event, EngineEvent::CommandFailed(_))
+    });
+    let failure = seen
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::CommandFailed(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("failure seen above");
+    assert!(
+        failure.contains("workspace does not exist: /tmp/does-not-exist/ws"),
+        "failure carries the server text, saw {failure:?}"
+    );
+    assert!(
+        failed_text(&seen).is_none(),
+        "the connection stays up, saw {seen:#?}"
+    );
+    drop(engine);
+}
+
+#[test]
+fn send_turn_flows_into_acceptance_and_stream() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = connect(fake_config("ok"), tx);
+    let _ = connected_with_sessions(&rx);
+
+    engine.send_turn(SessionId::new("fake-session-1"), String::from("And again"));
+    let mut seen = recv_until(&rx, "TurnAccepted", |event| {
+        matches!(event, EngineEvent::TurnAccepted { .. })
+    });
+    let accepted = seen.iter().find_map(|event| match event {
+        EngineEvent::TurnAccepted { session, turn } => Some((session, turn)),
+        _ => None,
+    });
+    let (session, turn) = accepted.expect("TurnAccepted seen above");
+    assert_eq!(session, &SessionId::new("fake-session-1"));
+    assert_eq!(turn, &Some(TurnId::new("fake-turn-2")));
+
+    seen.extend(recv_until(&rx, "turn turn-completed", |event| {
+        matches!(
+            event,
+            EngineEvent::Stream(StreamEvent::TurnCompleted { turn, .. })
+            if turn == &Some(TurnId::new("fake-turn-2"))
+        )
+    }));
+    let answer = seen.iter().find_map(|event| match event {
+        EngineEvent::Stream(StreamEvent::ItemCompleted {
+            item: StreamItem::AgentMessage { text, .. },
+            turn,
+            ..
+        }) if turn == &Some(TurnId::new("fake-turn-2")) => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(answer.as_deref(), Some("Second turn done."));
+    assert!(
+        !seen.iter().any(is_failed),
+        "the connection stays up, saw {seen:#?}"
     );
     drop(engine);
 }

@@ -12,8 +12,8 @@ use manifest_domain::{ProjectId, ProjectSummary, SessionId, SessionStatus, Sessi
 
 use crate::kit;
 use crate::theme::{
-    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_SMALL, POPUP_WIDTH, SPACE_M, SPACE_S, SPACE_XS,
-    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    FONT_SIZE_BODY, FONT_SIZE_HEADING, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, POPUP_WIDTH,
+    SPACE_M, SPACE_S, SPACE_XS, SPACE_XXS, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// Stand-in for the OS folder picker while the form is a fixture: the
@@ -27,6 +27,11 @@ pub enum Message {
     Select(SessionId),
     /// Expand the project with this id, or collapse it if open.
     ExpandProject(ProjectId),
+    /// Start composing a new session in this project's workspace.
+    /// `State::update` handles this locally by expanding the project;
+    /// the App enters draft mode on top, mirroring the composer
+    /// `SendPressed` split (a local no-op there, acted on by the App).
+    NewSession(ProjectId),
     /// Open the add-project popup with empty fields.
     OpenAddProject,
     /// Close the add-project popup, discarding its fields.
@@ -210,6 +215,12 @@ impl State {
                     };
                 }
             }
+            Message::NewSession(id) => {
+                // Expansion only; the App enters draft mode on top.
+                if self.groups.iter().any(|group| group.project.id == id) {
+                    self.expanded = Some(id);
+                }
+            }
             Message::OpenAddProject => {
                 self.add_project = AddProject::Open {
                     directory: String::new(),
@@ -249,9 +260,10 @@ impl State {
                 .spacing(SPACE_S)
                 .width(Length::Fill);
         for group in &self.groups {
-            list = list.push(kit::section_header(
+            list = list.push(kit::project_header(
                 group.project.name.as_str(),
                 Message::ExpandProject(group.project.id.clone()),
+                Message::NewSession(group.project.id.clone()),
             ));
             if self.expanded.as_ref() == Some(&group.project.id) {
                 list = list.push(indented(session_rows(&group.sessions, &self.selected)));
@@ -334,13 +346,20 @@ fn session_rows<'a>(
     selected: &'a SessionId,
 ) -> Element<'a, Message> {
     let mut rows = iced::widget::column![]
-        .spacing(SPACE_XS)
+        .spacing(SPACE_XXS)
         .width(Length::Fill);
     for summary in sessions {
+        // The trailing meta is the relative time when the row has one,
+        // else the status label; both are precomputed, never formatted
+        // here (UI contract §2).
+        let trailing = if summary.relative_time.is_empty() {
+            status_label(&summary.status)
+        } else {
+            summary.relative_time.as_str()
+        };
         rows = rows.push(kit::list_row(
             &summary.title,
-            status_label(&summary.status),
-            &summary.relative_time,
+            trailing,
             summary.id == *selected,
             Message::Select(summary.id.clone()),
         ));
@@ -359,11 +378,12 @@ fn indented(content: Element<'_, Message>) -> Element<'_, Message> {
 }
 
 /// The static header above project-less sessions, padded to match
-/// [`kit::section_header`] without being pressable.
+/// the project headers without being pressable. It carries no "+":
+/// a new session needs a project workspace to spawn in.
 fn no_project_header() -> Element<'static, Message> {
     iced::widget::container(
         iced::widget::text("No project")
-            .size(FONT_SIZE_SMALL)
+            .size(FONT_SIZE_PANEL_SMALL)
             .color(TEXT_TERTIARY),
     )
     .padding([SPACE_XS, SPACE_S])
@@ -478,6 +498,29 @@ mod tests {
         let before = got.expanded.clone();
         got.update(Message::ExpandProject(ProjectId::new("no-such-project")));
         assert_eq!(got.expanded, before);
+    }
+
+    #[test]
+    fn new_session_expands_its_project() {
+        let mut got = state();
+        got.update(Message::ExpandProject(ProjectId::new(
+            "project-checkout-api",
+        )));
+        assert_eq!(got.expanded, None);
+        got.update(Message::NewSession(ProjectId::new(
+            "project-storefront-web",
+        )));
+        assert_eq!(got.expanded, Some(ProjectId::new("project-storefront-web")));
+    }
+
+    #[test]
+    fn new_session_unknown_project_is_noop() {
+        let mut got = state();
+        let before = got.expanded.clone();
+        let selected = got.selected.clone();
+        got.update(Message::NewSession(ProjectId::new("no-such-project")));
+        assert_eq!(got.expanded, before);
+        assert_eq!(got.selected, selected);
     }
 
     #[test]
@@ -609,6 +652,7 @@ mod tests {
         ProjectSummary {
             id: ProjectId::new(id),
             name: String::from(name),
+            workspace: None,
         }
     }
 

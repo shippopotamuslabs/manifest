@@ -11,8 +11,8 @@ mod engine;
 mod fixture;
 
 pub use engine::{
-    Connection, EngineEvent, PendingKind, PendingPhase, SessionEngine, StreamEvent, TurnId,
-    UsageKind,
+    Connection, EngineEvent, ItemStatus, PendingKind, PendingPhase, SessionEngine, StreamEvent,
+    StreamItem, TurnId, UsageKind,
 };
 pub use fixture::{
     Fixture, ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, TodoItem,

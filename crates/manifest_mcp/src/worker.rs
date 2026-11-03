@@ -12,18 +12,27 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcCommand, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
-use manifest_domain::{Connection, EngineEvent};
+use manifest_domain::{Connection, EngineEvent, SessionId};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::map::{map_status_result, map_stream_event};
+use crate::map::{map_spawn_result, map_status_result, map_stream_event, map_turn_result};
 use crate::{ServerConfig, wire};
+
+/// Message when a spawn or turn command arrives before the connection.
+fn not_connected_message() -> String {
+    String::from("The Muse MCP server isn't connected yet. Try again once it connects.")
+}
 
 /// Commands the [`crate::MuseEngine`] handle can send the worker.
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Request a `muse_status` round trip (or queue one until connected).
     ListSessions,
+    /// Spawn a session: `muse_spawn` with `wait: false`.
+    SpawnSession { workspace: String, prompt: String },
+    /// Send a follow-up turn: `muse_turn` with `wait: false`.
+    SendTurn { session: SessionId, prompt: String },
     /// Shut down: kill the child and exit without emitting.
     Shutdown,
 }
@@ -38,10 +47,12 @@ pub(crate) enum WorkerMsg {
 }
 
 /// What one in-flight request id is waiting for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     Initialize,
     ListSessions,
+    Spawn,
+    Turn(SessionId),
 }
 
 /// Owns the child process; killing and reaping it on drop so every exit
@@ -97,6 +108,22 @@ impl Worker {
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::ListSessions);
         self.send_line(&wire::status_call(id))
+    }
+
+    /// Issue a `muse_spawn` round trip with a fresh id.
+    fn send_spawn_call(&mut self, workspace: &str, prompt: &str) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Spawn);
+        self.send_line(&wire::spawn_call(id, workspace, prompt))
+    }
+
+    /// Issue a `muse_turn` round trip with a fresh id.
+    fn send_turn_call(&mut self, session: &SessionId, prompt: &str) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Turn(session.clone()));
+        self.send_line(&wire::turn_call(id, session.as_str(), prompt))
     }
 
     /// Handle one stdout line. `Ok(true)` keeps looping, `Ok(false)`
@@ -165,6 +192,7 @@ impl Worker {
         match pending {
             Pending::Initialize => self.handle_initialize_reply(message),
             Pending::ListSessions => self.handle_status_reply(message),
+            Pending::Spawn | Pending::Turn(_) => self.handle_command_reply(&pending, message),
         }
     }
 
@@ -205,6 +233,33 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// Handle the reply to a `muse_spawn` or `muse_turn` call.
+    ///
+    /// The connection stays up: every outcome is a value the shell
+    /// renders, mirroring [`Worker::handle_status_reply`].
+    fn handle_command_reply(&mut self, pending: &Pending, message: &Value) -> bool {
+        if let Some(error) = message.get("error") {
+            let text = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Couldn't reach the Muse MCP server.");
+            return self.emit(EngineEvent::CommandFailed(text.to_string()));
+        }
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        let event = match pending {
+            Pending::Spawn => match map_spawn_result(&result) {
+                Ok((session, turn)) => EngineEvent::SessionSpawned { session, turn },
+                Err(message) => EngineEvent::CommandFailed(message),
+            },
+            Pending::Turn(commanded) => match map_turn_result(&result, commanded) {
+                Ok((session, turn)) => EngineEvent::TurnAccepted { session, turn },
+                Err(message) => EngineEvent::CommandFailed(message),
+            },
+            Pending::Initialize | Pending::ListSessions => return true,
+        };
+        self.emit(event)
     }
 
     /// Handle the reply to a `muse_status` call. The connection stays up.
@@ -327,6 +382,26 @@ pub(crate) fn run(
                     worker.list_on_connect = true;
                     true
                 } else if let Err(err) = worker.send_status_call() {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::SpawnSession { workspace, prompt }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                } else if let Err(err) = worker.send_spawn_call(&workspace, &prompt) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::SendTurn { session, prompt }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed(not_connected_message()))
+                } else if let Err(err) = worker.send_turn_call(&session, &prompt) {
                     let _ = worker.fail(err);
                     false
                 } else {

@@ -9,8 +9,8 @@
 
 use crate::error::Error;
 use manifest_domain::{
-    EngineEvent, PendingKind, PendingPhase, ProjectId, ProjectSummary, SessionId, SessionStatus,
-    SessionSummary, StreamEvent, TurnId, UsageKind,
+    EngineEvent, ItemStatus, PendingKind, PendingPhase, ProjectId, ProjectSummary, SessionId,
+    SessionStatus, SessionSummary, StreamEvent, StreamItem, TurnId, UsageKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -86,6 +86,7 @@ pub(crate) fn map_status_rows(
                 projects.push(ProjectSummary {
                     id: id.clone(),
                     name: name.clone(),
+                    workspace: Some(dto.workspace.clone()),
                 });
                 (id, name)
             })
@@ -129,6 +130,145 @@ fn parts(params: &Value) -> Result<(SessionId, Option<TurnId>, Option<String>), 
     Ok((session, turn, view_cursor))
 }
 
+/// Headline arg keys in priority order for tool calls.
+const HEADLINE_KEYS: [&str; 8] = [
+    "description",
+    "command",
+    "path",
+    "file",
+    "query",
+    "pattern",
+    "url",
+    "prompt",
+];
+
+/// One-line headline from raw args JSON text.
+///
+/// When the args parse as an object, the first present non-empty string
+/// among [`HEADLINE_KEYS`], else the first string value among the
+/// object's entries. Anything else yields no headline.
+fn headline_from_args(args_json: &str) -> Option<String> {
+    let object = serde_json::from_str::<Value>(args_json)
+        .ok()?
+        .as_object()?
+        .clone();
+    for key in HEADLINE_KEYS {
+        if let Some(text) = object.get(key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
+        }
+    }
+    object
+        .values()
+        .find_map(|value| value.as_str().map(String::from))
+}
+
+/// Renderable text from a `visibleOutput` value.
+///
+/// Shell tool results arrive as a JSON envelope string holding an
+/// `output` field; anything else renders as its raw string.
+fn unwrap_output(raw: &str) -> String {
+    if let Ok(Value::Object(envelope)) = serde_json::from_str::<Value>(raw)
+        && let Some(text) = envelope.get("output").and_then(Value::as_str)
+    {
+        return text.to_string();
+    }
+    raw.to_string()
+}
+
+/// Wire status text into an [`ItemStatus`]; unknown or absent stays a value.
+fn map_item_status(item: &Value) -> ItemStatus {
+    match item.get("status").and_then(Value::as_str) {
+        Some("inProgress") => ItemStatus::InProgress,
+        Some("completed") => ItemStatus::Completed,
+        Some("failed") => ItemStatus::Failed,
+        Some(other) => ItemStatus::Other(other.to_string()),
+        None => ItemStatus::Other(String::new()),
+    }
+}
+
+/// Text field that is empty when the wire sent none or a non-string.
+fn item_text(item: &Value, key: &str) -> String {
+    item.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Parse one wire item object into a [`StreamItem`].
+///
+/// `itemId` is required; `kind` decides the variant. `reminderChild`
+/// classifies as system bookkeeping; any other unknown kind stays an
+/// [`StreamItem::Unknown`] value, never a silent drop.
+fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
+    let item_id = match item.get("itemId").and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return Err(String::from("stream event is missing itemId")),
+    };
+    let kind = match item.get("kind").and_then(Value::as_str) {
+        Some(kind) => kind,
+        None => return Err(String::from("stream event is missing kind")),
+    };
+    match kind {
+        "userMessage" => Ok(StreamItem::UserMessage {
+            item_id,
+            text: item_text(item, "text"),
+        }),
+        "agentMessage" => Ok(StreamItem::AgentMessage {
+            item_id,
+            text: item_text(item, "text"),
+            phase: item
+                .get("messagePhase")
+                .and_then(Value::as_str)
+                .map(String::from),
+        }),
+        "reasoning" => Ok(StreamItem::Reasoning {
+            item_id,
+            summary: item
+                .get("summary")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }),
+        "toolCall" => {
+            let args_json = match item.get("args") {
+                None => String::new(),
+                Some(Value::String(args)) => args.clone(),
+                Some(other) => other.to_string(),
+            };
+            Ok(StreamItem::ToolCall {
+                item_id,
+                tool: item_text(item, "tool"),
+                headline: headline_from_args(&args_json),
+                args_json,
+                status: map_item_status(item),
+                output: item
+                    .get("visibleOutput")
+                    .and_then(Value::as_str)
+                    .map(unwrap_output),
+                failure: item
+                    .get("failureReason")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            })
+        }
+        "reminderChild" => Ok(StreamItem::System {
+            item_id,
+            kind: kind.to_string(),
+        }),
+        _ => Ok(StreamItem::Unknown {
+            item_id,
+            kind: kind.to_string(),
+        }),
+    }
+}
+
 /// Map `notifications/muse/event` params into a domain stream event.
 ///
 /// `Ok(None)` means the event is one this client ignores (an unknown
@@ -142,28 +282,35 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
 
     match kind {
         "turn-started" => {
-            let (session, turn, _) = parts(params)?;
-            Ok(Some(StreamEvent::TurnStarted { session, turn }))
+            let (session, turn, view_cursor) = parts(params)?;
+            Ok(Some(StreamEvent::TurnStarted {
+                session,
+                turn,
+                view_cursor,
+            }))
         }
         "item-started" | "item-completed" => {
             let (session, turn, view_cursor) = parts(params)?;
             let item = params
                 .get("item")
                 .ok_or_else(|| String::from("stream event is missing its item"))?;
-            let item_json = item.to_string();
+            // Item events carry no envelope turn id in captures; the
+            // item object's own turn id joins the event to its turn.
+            let turn = turn.or_else(|| item.get("turnId").and_then(Value::as_str).map(TurnId::new));
+            let item = parse_stream_item(item)?;
             if kind == "item-started" {
                 Ok(Some(StreamEvent::ItemStarted {
                     session,
                     turn,
                     view_cursor,
-                    item_json,
+                    item,
                 }))
             } else {
                 Ok(Some(StreamEvent::ItemCompleted {
                     session,
                     turn,
                     view_cursor,
-                    item_json,
+                    item,
                 }))
             }
         }
@@ -281,6 +428,68 @@ pub(crate) fn map_status_result(result: &Value) -> Vec<EngineEvent> {
         .collect();
     events.push(EngineEvent::SessionsLoaded { projects, sessions });
     events
+}
+
+/// Session and turn ids from a `muse_spawn` or `muse_turn` result body.
+#[derive(Debug, Deserialize)]
+struct CommandIds {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
+/// Parse the content text of a spawn or turn result into raw ids.
+///
+/// A server-authored `isError` body passes through as the failure text;
+/// anything else that does not parse fails with the friendly `generic`
+/// message. Empty ids count as absent.
+fn command_ids(result: &Value, generic: &str) -> Result<(Option<String>, Option<String>), String> {
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let ids: CommandIds = match serde_json::from_str(&text) {
+        Ok(ids) => ids,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let session = ids.session_id.filter(|id| !id.is_empty());
+    let turn = ids.turn_id.filter(|id| !id.is_empty());
+    Ok((session, turn))
+}
+
+/// Map a `muse_spawn` result into the spawned session and first turn.
+pub(crate) fn map_spawn_result(result: &Value) -> Result<(SessionId, Option<TurnId>), String> {
+    let generic = "Couldn't start a session on the Muse MCP server.";
+    let (session, turn) = command_ids(result, generic)?;
+    match session {
+        Some(session) => Ok((SessionId::new(session), turn.map(TurnId::new))),
+        None => Err(Error::Tool(String::from(generic)).to_string()),
+    }
+}
+
+/// Map a `muse_turn` result into the accepted session and turn.
+///
+/// The session comes from the result's `session_id`; when the result
+/// carries none, the commanded session is kept so the acceptance still
+/// joins its stream.
+pub(crate) fn map_turn_result(
+    result: &Value,
+    commanded: &SessionId,
+) -> Result<(SessionId, Option<TurnId>), String> {
+    let generic = "Couldn't send that turn to the Muse MCP server.";
+    let (session, turn) = command_ids(result, generic)?;
+    Ok((
+        session
+            .map(SessionId::new)
+            .unwrap_or_else(|| commanded.clone()),
+        turn.map(TurnId::new),
+    ))
 }
 
 /// Text of the first `type == "text"` content item, if any.
@@ -407,6 +616,15 @@ mod tests {
     }
 
     #[test]
+    fn projects_carry_their_workspace() {
+        let rows = vec![row("s1", "idle", "/home/dev/beta", 0, None)];
+        let (projects, _, _) = map_status_rows(&rows);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, String::from("beta"));
+        assert_eq!(projects[0].workspace, Some(String::from("/home/dev/beta")));
+    }
+
+    #[test]
     fn title_truncates_by_chars_not_bytes() {
         let rows = vec![row("ééééééééXYZ", "idle", "/w/long-name", 0, Some(4))];
         let (_, sessions, _) = map_status_rows(&rows);
@@ -488,6 +706,481 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], EngineEvent::Diagnostic(_)));
         assert!(matches!(events[1], EngineEvent::SessionsLoaded { .. }));
+    }
+
+    #[test]
+    fn stream_turn_started_maps_view_cursor() {
+        let event = map_stream_event(&json!({
+            "type": "turn-started",
+            "sessionId": "s",
+            "turnId": "t",
+            "viewCursor": "v4:s:1",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::TurnStarted {
+                session: SessionId::new("s"),
+                turn: Some(TurnId::new("t")),
+                view_cursor: Some(String::from("v4:s:1")),
+            }
+        );
+    }
+
+    #[test]
+    fn stream_user_message_completed() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "viewCursor": "v4:s:2",
+            "item": {
+                "itemId": "u-1",
+                "kind": "userMessage",
+                "status": "completed",
+                "text": "Read the file note.txt",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::ItemCompleted {
+                session: SessionId::new("s"),
+                turn: Some(TurnId::new("t")),
+                view_cursor: Some(String::from("v4:s:2")),
+                item: StreamItem::UserMessage {
+                    item_id: String::from("u-1"),
+                    text: String::from("Read the file note.txt"),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn stream_agent_message_started_and_completed() {
+        let started = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {
+                "itemId": "a-1",
+                "kind": "agentMessage",
+                "revision": 1,
+                "status": "inProgress",
+                "text": "",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            started,
+            StreamEvent::ItemStarted {
+                session: SessionId::new("s"),
+                turn: Some(TurnId::new("t")),
+                view_cursor: None,
+                item: StreamItem::AgentMessage {
+                    item_id: String::from("a-1"),
+                    text: String::new(),
+                    phase: None,
+                },
+            }
+        );
+        let completed = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "a-1",
+                "kind": "agentMessage",
+                "messagePhase": "finalAnswer",
+                "revision": 2,
+                "status": "completed",
+                "text": "```\nThe quick brown fox\n```",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            completed,
+            StreamEvent::ItemCompleted {
+                session: SessionId::new("s"),
+                turn: Some(TurnId::new("t")),
+                view_cursor: None,
+                item: StreamItem::AgentMessage {
+                    item_id: String::from("a-1"),
+                    text: String::from("```\nThe quick brown fox\n```"),
+                    phase: Some(String::from("finalAnswer")),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_keeps_string_summaries_only() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "r-1",
+                "kind": "reasoning",
+                "status": "completed",
+                "summary": ["Applying step-by-step arithmetic.", 7, ""],
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Reasoning {
+                    item_id: String::from("r-1"),
+                    summary: vec![
+                        String::from("Applying step-by-step arithmetic."),
+                        String::new(),
+                    ],
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_read_file_tool_call_headlines_path() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-1",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "read_file",
+                "args": "{\"path\":\"/tmp/ws/note.txt\"}",
+                "visibleOutput": "Read text file `/tmp/ws/note.txt`.",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, turn, .. } => {
+                assert_eq!(turn, Some(TurnId::new("t")));
+                assert_eq!(
+                    item,
+                    StreamItem::ToolCall {
+                        item_id: String::from("c-1"),
+                        tool: String::from("read_file"),
+                        headline: Some(String::from("/tmp/ws/note.txt")),
+                        args_json: String::from("{\"path\":\"/tmp/ws/note.txt\"}"),
+                        status: ItemStatus::Completed,
+                        output: Some(String::from("Read text file `/tmp/ws/note.txt`.")),
+                        failure: None,
+                    }
+                );
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_bash_tool_call_unwraps_output_envelope() {
+        let envelope = json!({
+            "chunk_id": "exec-1-1",
+            "command": "ls -la /tmp/ws",
+            "description": "List workspace directory contents",
+            "exit_code": 0,
+            "terminal_status": "completed",
+            "output": "total 0",
+        })
+        .to_string();
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-2",
+                "kind": "toolCall",
+                "status": "completed",
+                "tool": "bash",
+                "args": "{\"command\":\"ls -la /tmp/ws\",\"description\":\"List workspace directory contents\"}",
+                "visibleOutput": envelope,
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::ToolCall {
+                    item_id: String::from("c-2"),
+                    tool: String::from("bash"),
+                    headline: Some(String::from("List workspace directory contents")),
+                    args_json: String::from(
+                        "{\"command\":\"ls -la /tmp/ws\",\"description\":\"List workspace directory contents\"}"
+                    ),
+                    status: ItemStatus::Completed,
+                    output: Some(String::from("total 0")),
+                    failure: None,
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_failed_tool_call_carries_status_and_failure() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-3",
+                "kind": "toolCall",
+                "status": "failed",
+                "tool": "read_file",
+                "args": "{\"path\":\"missing-file.txt\"}",
+                "visibleOutput": "tool failed: No such file or directory (os error 2)",
+                "failureReason": "No such file or directory (os error 2)",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => assert_eq!(
+                item,
+                StreamItem::ToolCall {
+                    item_id: String::from("c-3"),
+                    tool: String::from("read_file"),
+                    headline: Some(String::from("missing-file.txt")),
+                    args_json: String::from("{\"path\":\"missing-file.txt\"}"),
+                    status: ItemStatus::Failed,
+                    output: Some(String::from(
+                        "tool failed: No such file or directory (os error 2)"
+                    )),
+                    failure: Some(String::from("No such file or directory (os error 2)")),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_tool_call_with_object_args_keeps_compact_json() {
+        let event = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-4",
+                "kind": "toolCall",
+                "status": "inProgress",
+                "tool": "read_file",
+                "args": {"path": "/tmp/ws/note.txt"},
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::ToolCall {
+                    item_id: String::from("c-4"),
+                    tool: String::from("read_file"),
+                    headline: Some(String::from("/tmp/ws/note.txt")),
+                    args_json: String::from("{\"path\":\"/tmp/ws/note.txt\"}"),
+                    status: ItemStatus::InProgress,
+                    output: None,
+                    failure: None,
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_unknown_status_stays_a_value() {
+        let event = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {
+                "itemId": "c-5",
+                "kind": "toolCall",
+                "status": "paused",
+                "tool": "bash",
+                "turnId": "t",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemStarted { item, .. } => match item {
+                StreamItem::ToolCall {
+                    status, args_json, ..
+                } => {
+                    assert_eq!(status, ItemStatus::Other(String::from("paused")));
+                    assert_eq!(args_json, String::new());
+                }
+                other => panic!("wrong item: {other:?}"),
+            },
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_reminder_child_is_system_and_other_kinds_are_unknown() {
+        let system = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {"itemId": "x-1", "kind": "reminderChild", "turnId": "t"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match system {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::System {
+                    item_id: String::from("x-1"),
+                    kind: String::from("reminderChild"),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+        let unknown = map_stream_event(&json!({
+            "type": "item-started",
+            "sessionId": "s",
+            "item": {"itemId": "x-2", "kind": "from-the-future", "turnId": "t"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match unknown {
+            StreamEvent::ItemStarted { item, .. } => assert_eq!(
+                item,
+                StreamItem::Unknown {
+                    item_id: String::from("x-2"),
+                    kind: String::from("from-the-future"),
+                }
+            ),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_item_requires_id_and_kind() {
+        let missing_id = json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {"kind": "userMessage", "text": "hi"},
+        });
+        assert!(map_stream_event(&missing_id).is_err());
+        let empty_id = json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {"itemId": "", "kind": "userMessage"},
+        });
+        assert!(map_stream_event(&empty_id).is_err());
+        let missing_kind = json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": {"itemId": "i"},
+        });
+        assert!(map_stream_event(&missing_kind).is_err());
+        let missing_item = json!({"type": "item-completed", "sessionId": "s"});
+        assert!(map_stream_event(&missing_item).is_err());
+    }
+
+    #[test]
+    fn stream_envelope_turn_id_wins_over_item_turn_id() {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "turnId": "envelope-turn",
+            "item": {"itemId": "u-1", "kind": "userMessage", "turnId": "item-turn"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { turn, .. } => {
+                assert_eq!(turn, Some(TurnId::new("envelope-turn")));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_result_maps_ids_and_turn_absent_is_none() {
+        let body = serde_json::to_string(&json!({
+            "session_id": "sess-1",
+            "turn_id": "turn-1",
+            "status": "running",
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        assert_eq!(
+            map_spawn_result(&result),
+            Ok((SessionId::new("sess-1"), Some(TurnId::new("turn-1"))))
+        );
+        let no_turn = json!({"content": [{"type": "text", "text": "{\"session_id\":\"sess-1\"}"}]});
+        assert_eq!(
+            map_spawn_result(&no_turn),
+            Ok((SessionId::new("sess-1"), None))
+        );
+    }
+
+    #[test]
+    fn spawn_result_failures_carry_server_or_generic_text() {
+        let server = json!({
+            "content": [{"type": "text", "text": "workspace does not exist: /nope"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_spawn_result(&server),
+            Err(String::from("workspace does not exist: /nope"))
+        );
+        let garbage = json!({"content": [{"type": "text", "text": "not json"}]});
+        assert_eq!(
+            map_spawn_result(&garbage),
+            Err(String::from(
+                "Couldn't start a session on the Muse MCP server."
+            ))
+        );
+        let no_session = json!({"content": [{"type": "text", "text": "{\"turn_id\":\"t\"}"}]});
+        assert_eq!(
+            map_spawn_result(&no_session),
+            Err(String::from(
+                "Couldn't start a session on the Muse MCP server."
+            ))
+        );
+    }
+
+    #[test]
+    fn turn_result_prefers_result_session_then_commanded() {
+        let commanded = SessionId::new("sess-cmd");
+        let body = serde_json::to_string(&json!({
+            "session_id": "sess-echo",
+            "turn_id": "turn-2",
+            "status": "running",
+        }))
+        .expect("body is JSON");
+        let result = json!({"content": [{"type": "text", "text": body}]});
+        assert_eq!(
+            map_turn_result(&result, &commanded),
+            Ok((SessionId::new("sess-echo"), Some(TurnId::new("turn-2"))))
+        );
+        let bare = json!({"content": [{"type": "text", "text": "{\"status\":\"running\"}"}]});
+        assert_eq!(
+            map_turn_result(&bare, &commanded),
+            Ok((SessionId::new("sess-cmd"), None))
+        );
+        let server = json!({
+            "content": [{"type": "text", "text": "unknown session"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_turn_result(&server, &commanded),
+            Err(String::from("unknown session"))
+        );
     }
 
     #[test]
