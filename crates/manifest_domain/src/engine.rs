@@ -754,6 +754,15 @@ pub enum StreamEvent {
         /// The new goal, or `None` when cleared.
         goal: Option<GoalInfo>,
     },
+    /// The session's name changed: the host allocated or renamed it,
+    /// or the server's spawn-prompt fallback was superseded. Carries
+    /// the new canonical name; replaces the displayed title wholesale.
+    NameChanged {
+        /// Session whose name changed.
+        session: SessionId,
+        /// The new name now in effect.
+        name: String,
+    },
 }
 
 /// One Muse approval posture, mirroring the server's `approval_mode`.
