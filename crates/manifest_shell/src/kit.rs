@@ -999,10 +999,10 @@ pub(crate) type ComposerKeys<'a, Message> =
 /// `visible_lines` up to [`COMPOSER_MAX_LINES`]; past that cap the
 /// caller holds the height fixed and the editor scrolls internally,
 /// so later slices inherit the growth contract from this constructor.
-/// The draft's first `/selector` token highlights through
-/// [`crate::composer::SlashHighlighter`] (no-op while the settings
-/// name no valid token); `key_binding` intercepts keys before the
-/// editor consumes them, when the caller installs one.
+/// Every exact `/selector` token on every draft line highlights
+/// through [`crate::composer::SlashHighlighter`] (no-op while the
+/// settings name no valid token); `key_binding` intercepts keys
+/// before the editor consumes them, when the caller installs one.
 pub(crate) fn composer_input<'a, Message: Clone + 'a>(
     content: &'a text_editor::Content,
     visible_lines: usize,

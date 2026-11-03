@@ -736,9 +736,9 @@ impl State {
                 as kit::ComposerKeys<'_, Message>
         });
         // The highlight settings carry the draft's live token
-        // validity, so the editor re-arms exactly when the first token
-        // becomes (or stops being) an exact selector — typed, pasted,
-        // or accepted — with no extra keystroke.
+        // validity, so the editor re-arms exactly when the set of
+        // matched tokens changes — typed, pasted, or accepted — with
+        // no extra keystroke.
         let highlight =
             SlashHighlightSettings::for_draft(&self.highlight_selectors, &self.content.text());
         let mut row = iced::widget::row![
@@ -1286,21 +1286,43 @@ fn slash_source_icon(source: &str) -> lucide_icons::Icon {
     }
 }
 
-/// Byte range of the draft's highlightable first token: the leading
-/// `/selector` token when its selector is known, `None` otherwise.
-/// The range covers the first token only, and only on an exact
-/// selector match; the arguments region never highlights.
-pub(crate) fn slash_token_range(line: &str, selectors: &[String]) -> Option<Range<usize>> {
-    let start = line.find(|next: char| !next.is_whitespace())?;
-    let token = line[start..].split_whitespace().next()?;
-    let selector = token.strip_prefix('/')?;
-    if selector.is_empty() {
-        return None;
+/// Byte ranges of one line's highlightable tokens: every
+/// whitespace-delimited token that is exactly `/` plus a known
+/// selector. Punctuation-glued tokens such as `/goal,` never match:
+/// the token must equal the selector exactly, not merely start with
+/// it. Plain words and `/`-less tokens never match.
+pub(crate) fn slash_token_ranges(line: &str, selectors: &[String]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut token_start: Option<usize> = None;
+    // A sentinel whitespace past the end flushes the final token, so
+    // byte offsets stay exact without a post-loop duplicate.
+    for (index, next) in line
+        .char_indices()
+        .chain(std::iter::once((line.len(), ' ')))
+    {
+        if next.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                let token = &line[start..index];
+                if let Some(selector) = token.strip_prefix('/')
+                    && !selector.is_empty()
+                    && selectors.iter().any(|known| known == selector)
+                {
+                    ranges.push(start..index);
+                }
+            }
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
     }
-    selectors
-        .iter()
-        .any(|known| known == selector)
-        .then(|| start..start + token.len())
+    ranges
+}
+
+/// First highlightable token of one line: the first element of
+/// [`slash_token_ranges`]. Test-only convenience for assertions that
+/// pin the leading match; production reads the full vector.
+#[cfg(test)]
+pub(crate) fn slash_token_range(line: &str, selectors: &[String]) -> Option<Range<usize>> {
+    slash_token_ranges(line, selectors).into_iter().next()
 }
 
 /// The slash-menu key binding: while the menu has rows, arrows move
@@ -1360,8 +1382,8 @@ pub(crate) fn slash_token_style(theme: &iced::Theme) -> (iced::Color, iced::Font
 pub(crate) struct SlashHighlight;
 
 /// Settings for [`SlashHighlighter`]: the known selectors plus
-/// whether the draft's first line currently opens with an exact
-/// `/selector` token.
+/// whether the draft currently holds an exact `/selector` token on
+/// any line.
 ///
 /// The token bit exists so the editor re-arms the highlighter through
 /// its own settings path exactly when validity flips — typed, pasted,
@@ -1375,45 +1397,50 @@ pub(crate) struct SlashHighlight;
 pub(crate) struct SlashHighlightSettings {
     /// Known selectors: builtins plus the ready catalog's.
     selectors: Vec<String>,
-    /// Whether the draft's first line opens with an exact token.
+    /// Whether any draft line holds an exact token.
     token: bool,
 }
 
 impl SlashHighlightSettings {
     /// Settings for one draft snapshot: the selectors plus the live
-    /// validity of the draft's first line. The view derives this per
+    /// validity of the whole draft. The view derives this per
     /// rebuild, so any edit that flips validity changes the settings
     /// value the widget compares.
     pub(crate) fn for_draft(selectors: &[String], draft: &str) -> Self {
-        let first = draft.lines().next().unwrap_or("");
-        let token = slash_token_range(first, selectors).is_some();
+        let token = draft
+            .lines()
+            .any(|line| !slash_token_ranges(line, selectors).is_empty());
         Self {
             selectors: selectors.to_vec(),
             token,
         }
     }
 
-    /// Whether the draft's first line opens with an exact token.
-    /// Test-only observability for the validity bit the widget
-    /// compares opaquely; production reads it through `PartialEq`.
+    /// Whether any draft line holds an exact token. Test-only
+    /// observability for the validity bit the widget compares
+    /// opaquely; production reads it through `PartialEq`.
     #[cfg(test)]
     pub(crate) fn token_valid(&self) -> bool {
         self.token
     }
 }
 
-/// Highlights the draft's leading `/selector` token.
+/// Highlights every exact `/selector` token on every draft line.
+/// Mid-text matches are purely visual command references: send and
+/// invocation behavior still key off the leading first token only
+/// (see `slash_query` and `parse_slash_draft`), which this never
+/// touches.
 ///
 /// The editor feeds lines in order from the last `change_line`
 /// notification (`iced_graphics` 0.14.0 `text/editor.rs`
 /// `update`/`highlight`: every edit reports its topmost changed line,
 /// and each draw feeds `highlight_line` for lines
 /// `current_line..=last_visible` unless the highlighter is already
-/// past them), so this tracks its position: only position 0 (the
-/// draft's first line) can highlight, and each fed line advances the
-/// position by one. Selector and token-validity changes arrive
-/// through `update`, which re-arms from line 0 so the next draw
-/// re-highlights.
+/// past them), so this still tracks its position: each fed line
+/// advances it by one, keeping `current_line` honest so the editor
+/// feeds every visible line. Selector and token-validity changes
+/// arrive through `update`, which re-arms from line 0 so the next
+/// draw re-highlights.
 pub(crate) struct SlashHighlighter {
     /// Known selectors: builtins plus the ready catalog's.
     selectors: Vec<String>,
@@ -1424,7 +1451,7 @@ pub(crate) struct SlashHighlighter {
 impl iced::widget::text::Highlighter for SlashHighlighter {
     type Settings = SlashHighlightSettings;
     type Highlight = SlashHighlight;
-    type Iterator<'a> = std::option::IntoIter<(Range<usize>, SlashHighlight)>;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, SlashHighlight)>;
 
     fn new(settings: &SlashHighlightSettings) -> Self {
         Self {
@@ -1443,15 +1470,12 @@ impl iced::widget::text::Highlighter for SlashHighlighter {
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        let at_first = self.line == 0;
         self.line = self.line.saturating_add(1);
-        if at_first {
-            slash_token_range(line, &self.selectors)
-                .map(|range| (range, SlashHighlight))
-                .into_iter()
-        } else {
-            None.into_iter()
-        }
+        slash_token_ranges(line, &self.selectors)
+            .into_iter()
+            .map(|range| (range, SlashHighlight))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn current_line(&self) -> usize {
@@ -2380,44 +2404,62 @@ mod tests {
     }
 
     #[test]
-    fn slash_token_range_highlights_exact_first_token_only() {
+    fn slash_token_ranges_highlights_exact_tokens_anywhere() {
         let selectors = vec![String::from("review"), String::from("goal")];
+        assert_eq!(slash_token_ranges("/review", &selectors), vec![0..7]);
         assert_eq!(
-            slash_token_range("/review", &selectors),
-            Some(0..7),
-            "exact match highlights the token"
-        );
-        assert_eq!(
-            slash_token_range("/review fix it", &selectors),
-            Some(0..7),
+            slash_token_ranges("/review fix it", &selectors),
+            vec![0..7],
             "arguments never highlight"
         );
         assert_eq!(
-            slash_token_range("/rev", &selectors),
-            None,
+            slash_token_ranges("Create a test /goal so that", &selectors),
+            vec![14..19],
+            "a mid-sentence token highlights at its byte range"
+        );
+        assert_eq!(
+            slash_token_ranges("/goal and /review", &selectors),
+            vec![0..5, 10..17],
+            "two commands on one line both highlight"
+        );
+        assert_eq!(
+            slash_token_ranges("  /goal x", &selectors),
+            vec![2..7],
+            "leading whitespace shifts the byte range"
+        );
+        assert!(
+            slash_token_ranges("/goal,", &selectors).is_empty(),
+            "punctuation-glued tokens never match"
+        );
+        assert!(
+            slash_token_ranges("/goa", &selectors).is_empty(),
             "prefix match does not highlight"
         );
-        assert_eq!(
-            slash_token_range("/nope", &selectors),
-            None,
+        assert!(
+            slash_token_ranges("/nope", &selectors).is_empty(),
             "unknown selector does not highlight"
         );
-        assert_eq!(
-            slash_token_range("hello", &selectors),
-            None,
+        assert!(
+            slash_token_ranges("hello", &selectors).is_empty(),
             "plain text does not highlight"
         );
-        assert_eq!(slash_token_range("/", &selectors), None);
-        assert_eq!(slash_token_range("", &selectors), None);
-        assert_eq!(
-            slash_token_range("  /goal x", &selectors),
-            Some(2..7),
-            "leading whitespace still anchors the first token"
+        assert!(slash_token_ranges("/", &selectors).is_empty());
+        assert!(slash_token_ranges("", &selectors).is_empty());
+        assert!(
+            slash_token_ranges("   ", &selectors).is_empty(),
+            "whitespace-only lines hold no token"
         );
+        // The singular helper is the first match of the plural one.
+        assert_eq!(
+            slash_token_range("Create a test /goal so that", &selectors),
+            Some(14..19)
+        );
+        assert_eq!(slash_token_range("/rev", &selectors), None);
+        assert_eq!(slash_token_range("hello", &selectors), None);
     }
 
     #[test]
-    fn slash_highlighter_marks_first_line_only() {
+    fn slash_highlighter_marks_every_line() {
         use iced::widget::text::Highlighter;
         let selectors = vec![String::from("review")];
         let mut got = SlashHighlighter::new(&SlashHighlightSettings::for_draft(
@@ -2427,9 +2469,18 @@ mod tests {
         let first: Vec<_> = got.highlight_line("/review fix").collect();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 0..7);
-        // The second fed line never highlights, even for a match.
+        // Every fed line highlights now, not just the first: the
+        // position still advances so `current_line` stays honest.
         let second: Vec<_> = got.highlight_line("/review").collect();
-        assert!(second.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, 0..7);
+        assert_eq!(got.current_line(), 2);
+        // A mid-sentence token on a later line highlights at its own
+        // byte range.
+        got.change_line(2);
+        let mid: Vec<_> = got.highlight_line("Create a test /review ok").collect();
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].0, 14..21);
         // A change notification re-arms the position.
         got.change_line(0);
         let again: Vec<_> = got.highlight_line("/review").collect();
@@ -2600,6 +2651,36 @@ mod tests {
         assert!(settings_for(&got).token_valid());
     }
 
+    #[test]
+    fn slash_highlight_settings_flip_with_mid_text_token() {
+        let mut got = skill_state();
+        let settings_for = |state: &State| {
+            crate::composer::SlashHighlightSettings::for_draft(
+                &state.highlight_selectors,
+                &state.content.text(),
+            )
+        };
+        // A mid-sentence prefix is not valid: no re-arm.
+        type_text(&mut got, "Create a test /goa");
+        assert!(!settings_for(&got).token_valid());
+        // Completing the exact selector flips validity on, so the
+        // next layout re-arms with no extra keystroke.
+        type_text(&mut got, "l");
+        let exact = settings_for(&got);
+        assert!(exact.token_valid());
+        // A command on the second line flips validity on its own.
+        let mut second = skill_state();
+        type_text(&mut second, "plain first line\n/review");
+        assert!(settings_for(&second).token_valid());
+        // Breaking the mid-text token flips validity off again.
+        got.update(Message::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Backspace,
+        )));
+        let reverted = settings_for(&got);
+        assert!(!reverted.token_valid());
+        assert_ne!(exact, reverted);
+    }
+
     /// Mirror of the vendored editor protocol the widget runs
     /// (iced_widget 0.14.2 `text_editor.rs` layout/draw with
     /// iced_graphics 0.14.0 `text/editor.rs` update/highlight): each
@@ -2662,5 +2743,11 @@ mod tests {
             editor.draw().is_empty(),
             "deleting out of the exact token clears the span"
         );
+        // A mid-sentence token styles at its own byte range under the
+        // same edit-then-draw choreography.
+        editor.edit("Create a test /compact ok");
+        let mid = editor.draw();
+        assert_eq!(mid.len(), 1, "mid-text token styles immediately");
+        assert_eq!(mid[0].0, 14..22);
     }
 }
