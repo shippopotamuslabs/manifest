@@ -12,15 +12,16 @@ use std::ops::Range;
 use iced::widget::text_editor;
 use iced::{Element, Length};
 use manifest_domain::{
-    BuiltinCommand, EffortChoice, ModelChoice, ModelInfo, MusePermission, PermissionMode,
-    SkillInfo, UsageSnapshot,
+    BuiltinCommand, EffortChoice, GoalInfo, GoalStatus, ModelChoice, ModelInfo, MusePermission,
+    PermissionMode, SkillInfo, UsageSnapshot,
 };
 
 use crate::kit::{self, IconButtonKind};
 use crate::theme::{
     ATTACH_POPUP_WIDTH, COMPOSER_MAX_LINES, CONTEXT_POPUP_WIDTH, EFFORT_POPUP_WIDTH,
-    FONT_SIZE_PANEL, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH,
-    PERMISSION_POPUP_WIDTH, SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, TEXT_FAINT, TEXT_TERTIARY,
+    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT,
+    MODEL_POPUP_WIDTH, PERMISSION_POPUP_WIDTH, SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, SUCCESS,
+    TEXT_FAINT, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The attach popup has two real situations, so it is an enum, not a
@@ -127,6 +128,44 @@ pub enum SlashPick {
     Builtin(BuiltinCommand),
     /// A catalog skill row, by selector.
     Skill(String),
+}
+
+/// Precomputed goal strip values for the visible session's goal:
+/// the objective line, the clamped percent and its label, and the
+/// current-work line. Computed once in [`State::set_goal`] (from the
+/// App's per-session goal store), so the view reads without
+/// formatting (UI contract §2). A completed goal forces the percent
+/// to 100; every other status shows the sent percent clamped.
+#[derive(Debug, Clone)]
+pub struct GoalDisplay {
+    /// Goal objective, rendered on one line.
+    pub objective: String,
+    /// Display percent in `0.0..=100.0`; 100.0 when completed.
+    pub percent: f32,
+    /// Precomputed percent text, e.g. `42%`.
+    pub percent_label: String,
+    /// Current-work line, when the host reported one.
+    pub current_work: Option<String>,
+    /// Lifecycle situation; picks the strip's icon and tones.
+    pub status: GoalStatus,
+}
+
+impl GoalDisplay {
+    /// Precompute the strip values from one goal block.
+    fn from_goal(goal: &GoalInfo) -> Self {
+        let percent = if goal.status == GoalStatus::Completed {
+            100.0
+        } else {
+            goal.clamped_percent()
+        };
+        Self {
+            objective: goal.objective.clone(),
+            percent,
+            percent_label: format!("{}%", percent.round() as u64),
+            current_work: goal.current_work.clone(),
+            status: goal.status.clone(),
+        }
+    }
 }
 
 /// One precomputed visible slash-menu row: builtins first, then the
@@ -264,6 +303,11 @@ pub struct State {
     pub attachments: Vec<String>,
     /// The visible session's latest usage snapshot, when reported.
     pub usage: Option<UsageSnapshot>,
+    /// Precomputed goal strip for the visible session's goal; `None`
+    /// hides the strip entirely. Written by the App from its
+    /// per-session goal store, so the view reads without formatting
+    /// (UI contract §2).
+    pub goal_display: Option<GoalDisplay>,
     /// Precomputed "model · effort" pill text.
     pub model_effort_label: String,
     /// Precomputed context meter text ("used/window · %" or a
@@ -298,6 +342,7 @@ impl State {
             highlight_selectors: builtin_selectors(),
             attachments: Vec::new(),
             usage: None,
+            goal_display: None,
             model_effort_label: String::new(),
             context_label: String::new(),
             context_percent: None,
@@ -664,6 +709,14 @@ impl State {
         self.refresh_derived();
     }
 
+    /// Replaces the visible session's goal display: `Some` precomputes
+    /// the strip values, `None` hides the strip entirely. Called by
+    /// the App from its per-session goal store, so the view reads
+    /// without formatting (UI contract §2).
+    pub fn set_goal(&mut self, goal: Option<&GoalInfo>) {
+        self.goal_display = goal.map(GoalDisplay::from_goal);
+    }
+
     /// Renders the input bar with the inside-bar buttons, the
     /// attachment refs, and the live sub-bar. The attach, model,
     /// permission, and context popups are not part of this flow; they
@@ -736,8 +789,66 @@ impl State {
         if !self.attachments.is_empty() {
             column = column.push(self.attachments_view());
         }
+        if let Some(display) = &self.goal_display {
+            column = column.push(Self::goal_strip_view(display));
+        }
         column = column.push(self.sub_bar_view());
         column.width(Length::Fill).into()
+    }
+
+    /// The goal strip: the objective line with its percent, the meter,
+    /// and the current-work line when the host reported one. Display
+    /// only: no pause, clear, or edit controls. A paused goal reads in
+    /// tertiary tones with the sent percent frozen; a completed goal
+    /// reads with the check icon at full percent.
+    fn goal_strip_view(display: &GoalDisplay) -> Element<'_, Message> {
+        let paused = matches!(display.status, GoalStatus::Paused);
+        let completed = matches!(display.status, GoalStatus::Completed);
+        let icon = if completed {
+            lucide_icons::Icon::CircleCheck
+        } else {
+            lucide_icons::Icon::Target
+        };
+        let icon_color = if completed {
+            SUCCESS
+        } else if paused {
+            TEXT_TERTIARY
+        } else {
+            TEXT_SECONDARY
+        };
+        let line_color = if paused {
+            TEXT_TERTIARY
+        } else {
+            TEXT_SECONDARY
+        };
+        let mut strip = iced::widget::column![
+            iced::widget::row![
+                kit::icon(icon, FONT_SIZE_PANEL, icon_color),
+                iced::widget::text(display.objective.as_str())
+                    .size(FONT_SIZE_PANEL)
+                    .color(line_color)
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                iced::widget::text(display.percent_label.as_str())
+                    .size(FONT_SIZE_PANEL)
+                    .color(line_color),
+            ]
+            .spacing(SPACE_XS)
+            .align_y(iced::alignment::Vertical::Center),
+            iced::widget::progress_bar(0.0..=100.0, display.percent).length(Length::Fill),
+        ]
+        .spacing(SPACE_XS)
+        .width(Length::Fill);
+        if let Some(current) = &display.current_work {
+            strip = strip.push(
+                iced::widget::text(current.as_str())
+                    .size(FONT_SIZE_PANEL_SMALL)
+                    .color(if paused { TEXT_FAINT } else { TEXT_TERTIARY })
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            );
+        }
+        strip.into()
     }
 
     /// The floating model menu for the App to overlay above the
@@ -1957,6 +2068,68 @@ mod tests {
         assert_eq!(got.context_percent, None);
         got.set_usage(None);
         assert_eq!(got.context_label, "Context —");
+    }
+
+    fn goal(objective: &str, percent: f64, status: GoalStatus) -> GoalInfo {
+        GoalInfo {
+            objective: String::from(objective),
+            percent_complete: percent,
+            status,
+            current_work: None,
+            next_work: None,
+        }
+    }
+
+    #[test]
+    fn goal_display_precomputes_label_and_clamps() {
+        let mut got = State::new();
+        assert!(got.goal_display.is_none());
+        got.set_goal(Some(&goal("Ship the slice", 42.0, GoalStatus::Active)));
+        let display = got.goal_display.as_ref().expect("goal shows");
+        assert_eq!(display.objective, "Ship the slice");
+        assert_eq!(display.percent, 42.0);
+        assert_eq!(display.percent_label, "42%");
+        assert_eq!(display.current_work, None);
+        // Past-100 input clamps in the display, not the domain value.
+        got.set_goal(Some(&goal("Ship it", 150.0, GoalStatus::Active)));
+        let display = got.goal_display.as_ref().expect("goal shows");
+        assert_eq!(display.percent, 100.0);
+        assert_eq!(display.percent_label, "100%");
+    }
+
+    #[test]
+    fn goal_display_carries_current_work_line() {
+        let mut with_work = goal("Ship it", 10.0, GoalStatus::Active);
+        with_work.current_work = Some(String::from("Wiring the mapper"));
+        let mut got = State::new();
+        got.set_goal(Some(&with_work));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").current_work,
+            Some(String::from("Wiring the mapper"))
+        );
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Active)));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").current_work,
+            None
+        );
+    }
+
+    #[test]
+    fn goal_display_completed_forces_full_percent() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 30.0, GoalStatus::Completed)));
+        let display = got.goal_display.as_ref().expect("goal shows");
+        assert_eq!(display.percent, 100.0);
+        assert_eq!(display.percent_label, "100%");
+    }
+
+    #[test]
+    fn goal_display_none_hides_the_strip() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 30.0, GoalStatus::Active)));
+        assert!(got.goal_display.is_some());
+        got.set_goal(None);
+        assert!(got.goal_display.is_none());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use iced::{Element, Length, Task};
 use manifest_domain::{
-    Connection, EffortChoice, EngineEvent, Fixture, ModelChoice, PermissionMode, ProjectId,
-    ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
+    Connection, EffortChoice, EngineEvent, Fixture, GoalInfo, ModelChoice, PermissionMode,
+    ProjectId, ProjectSummary, SessionId, SessionStatus, SessionSummary, SpawnChoices, StreamEvent,
     StreamItem, TodoItem, TodoStatus, TurnId, UsageSnapshot, WorktreeChoice,
 };
 
@@ -300,6 +300,10 @@ pub struct App {
     /// Todo list per session, replaced wholesale by each `write_todos`
     /// stream item; the drawer renders the visible session's entry.
     pub todo_lists: HashMap<SessionId, Vec<TodoItem>>,
+    /// Goal per session, replaced wholesale by each `goal-changed`
+    /// stream event (`None` when the host cleared it); the composer
+    /// strip renders the visible session's entry.
+    pub goals: HashMap<SessionId, Option<GoalInfo>>,
     /// Whether the TODO drawer is a peek strip or open.
     pub todo_drawer: TodoDrawer,
     /// Current width of the side panel; the divider drag rewrites it.
@@ -389,6 +393,7 @@ impl App {
             branch: None,
             branch_workspace: None,
             todo_lists: HashMap::new(),
+            goals: HashMap::new(),
             todo_drawer: TodoDrawer::Peek,
             todo_summary,
             current_todo,
@@ -461,6 +466,7 @@ impl App {
         app.pending = pending::State::default();
         app.visible_session = None;
         app.todo_lists = HashMap::new();
+        app.goals = HashMap::new();
         app.todo_summary = String::from("0 of 0 done");
         app.current_todo = None;
         app.connection = Connection::Connecting;
@@ -509,6 +515,7 @@ impl App {
             }
             self.visible_session = None;
             self.sync_composer_usage();
+            self.sync_composer_goal();
             self.sync_visible_todos();
             return;
         }
@@ -521,6 +528,7 @@ impl App {
         }
         self.transcript = self.transcripts.remove(&selected).unwrap_or_default();
         self.sync_composer_usage();
+        self.sync_composer_goal();
         self.sync_visible_todos();
     }
 
@@ -894,6 +902,24 @@ impl App {
                 self.sync_visible_todos();
             }
         }
+    }
+
+    /// The visible session's goal, when the store holds one. A
+    /// missing entry and a stored clear both read as no goal.
+    fn visible_goal(&self) -> Option<&GoalInfo> {
+        self.visible_session
+            .as_ref()
+            .and_then(|session| self.goals.get(session))
+            .and_then(|goal| goal.as_ref())
+    }
+
+    /// Points the composer's goal strip at the visible session's
+    /// stored goal. Called after goal events and transcript syncs;
+    /// the composer precomputes the strip strings, so the view reads
+    /// without formatting.
+    fn sync_composer_goal(&mut self) {
+        let goal = self.visible_goal().cloned();
+        self.composer.set_goal(goal.as_ref());
     }
 
     /// Points the composer's usage meter at the visible session's
@@ -1524,6 +1550,17 @@ impl App {
                 }
                 false
             }
+            StreamEvent::GoalChanged { session, goal } => {
+                // Source of truth, not a hint: replaces the session's
+                // stored goal wholesale (`None` clears it). Only the
+                // visible session's strip refreshes; background
+                // sessions' goals wait for their select sync.
+                self.goals.insert(session.clone(), goal);
+                if self.is_visible(&session) {
+                    self.sync_composer_goal();
+                }
+                false
+            }
         }
     }
 
@@ -2018,6 +2055,7 @@ impl App {
                                 self.awaiting_spawn = false;
                                 self.pending_spawn = None;
                                 self.sync_composer_usage();
+                                self.sync_composer_goal();
                                 // The fresh session owns a catalog: list
                                 // it now that the visible session names
                                 // a host. Any in-flight load belongs to
@@ -4796,6 +4834,86 @@ mod tests {
                 manifest_domain::TurnInput::Text(String::from("/nope fix it"))
             )]
         );
+    }
+
+    #[test]
+    fn goal_changed_shows_visible_goal_in_composer() {
+        let (mut app, _) = slash_app();
+        assert!(app.composer.goal_display.is_none());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: Some(String::from("Wiring the mapper")),
+                    next_work: None,
+                }),
+            },
+        );
+        let display = app.composer.goal_display.as_ref().expect("strip shows");
+        assert_eq!(display.objective, "Ship the slice");
+        assert_eq!(display.percent, 42.0);
+        assert_eq!(display.percent_label, "42%");
+        assert_eq!(
+            display.current_work,
+            Some(String::from("Wiring the mapper"))
+        );
+    }
+
+    #[test]
+    fn goal_changed_for_other_session_does_not_clobber_visible() {
+        let (mut app, _) = slash_app();
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-9"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Other work"),
+                    percent_complete: 10.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+        assert!(app.composer.goal_display.is_none());
+        assert_eq!(
+            app.goals
+                .get(&SessionId::new("s-9"))
+                .and_then(|goal| goal.as_ref())
+                .map(|goal| goal.objective.as_str()),
+            Some("Other work")
+        );
+    }
+
+    #[test]
+    fn goal_changed_clear_removes_the_strip() {
+        let (mut app, _) = slash_app();
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+        assert!(app.composer.goal_display.is_some());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: None,
+            },
+        );
+        assert!(app.composer.goal_display.is_none());
     }
 
     #[test]

@@ -9,10 +9,10 @@
 
 use crate::error::Error;
 use manifest_domain::{
-    ApprovalChoiceSummary, ApprovalRequest, EngineEvent, ItemStatus, ModelInfo, PendingKind,
-    PendingPhase, PendingRequest, Question, QuestionOption, QuestionRequest, SessionId,
-    SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem, TodoItem, TodoStatus,
-    TurnId, UsageKind, UsageSnapshot,
+    ApprovalChoiceSummary, ApprovalRequest, EngineEvent, GoalInfo, GoalStatus, ItemStatus,
+    ModelInfo, PendingKind, PendingPhase, PendingRequest, Question, QuestionOption,
+    QuestionRequest, SessionId, SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem,
+    TodoItem, TodoStatus, TurnId, UsageKind, UsageSnapshot,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -222,6 +222,36 @@ fn unwrap_output(raw: &str) -> String {
         return text.to_string();
     }
     raw.to_string()
+}
+
+/// Parse one host goal block into a [`GoalInfo`].
+///
+/// `objective` is required and non-empty (a malformed block, like the
+/// other required wire fields, fails the event); `percentComplete`
+/// must be a JSON number and rides verbatim, even past 100 (the
+/// renderer clamps). `status` parses leniently with
+/// [`GoalStatus::parse`], defaulting to an empty [`GoalStatus::Other`]
+/// when absent; `currentWork` and `nextWork` ride when present.
+fn parse_goal(block: &Value) -> Result<GoalInfo, String> {
+    let objective = match block.get("objective").and_then(Value::as_str) {
+        Some(objective) if !objective.is_empty() => objective.to_string(),
+        _ => return Err(String::from("stream event is missing goal objective")),
+    };
+    let percent_complete = match block.get("percentComplete").and_then(Value::as_f64) {
+        Some(percent) => percent,
+        None => return Err(String::from("stream event is missing goal percent")),
+    };
+    Ok(GoalInfo {
+        objective,
+        percent_complete,
+        status: block
+            .get("status")
+            .and_then(Value::as_str)
+            .map(GoalStatus::parse)
+            .unwrap_or(GoalStatus::Other(String::new())),
+        current_work: opt_string(block, "currentWork"),
+        next_work: opt_string(block, "nextWork"),
+    })
 }
 
 /// Wire status text into an [`ItemStatus`]; unknown or absent stays a value.
@@ -447,6 +477,16 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
         "catalog-changed" => {
             let session = SessionId::new(req_string(params, "sessionId")?);
             Ok(Some(StreamEvent::CatalogChanged { session }))
+        }
+        "goal-changed" => {
+            let session = SessionId::new(req_string(params, "sessionId")?);
+            let goal = match params.get("goal") {
+                // An absent or explicit-null goal clears the session's
+                // goal, mirroring the host's nullable Goal block.
+                None | Some(Value::Null) => None,
+                Some(block) => Some(parse_goal(block)?),
+            };
+            Ok(Some(StreamEvent::GoalChanged { session, goal }))
         }
         _ => Ok(None),
     }
@@ -2399,6 +2439,117 @@ mod tests {
         assert_eq!(map_skills_result(&no_skills), Err(String::from(generic)));
         let empty = json!({"content": [], "isError": true});
         assert_eq!(map_skills_result(&empty), Err(String::from(generic)));
+    }
+
+    #[test]
+    fn stream_goal_changed_maps_full_block() {
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {
+                "objective": "Ship the slice",
+                "percentComplete": 42,
+                "status": "active",
+                "currentWork": "Wiring the mapper",
+                "nextWork": "Writing tests",
+            },
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: Some(GoalInfo {
+                    objective: String::from("Ship the slice"),
+                    percent_complete: 42.0,
+                    status: GoalStatus::Active,
+                    current_work: Some(String::from("Wiring the mapper")),
+                    next_work: Some(String::from("Writing tests")),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn stream_goal_changed_null_clears() {
+        // An explicit-null goal clears the session's goal.
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": null,
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: None,
+            }
+        );
+        // An absent goal clears too.
+        let event = map_stream_event(&json!({"type": "goal-changed", "sessionId": "sess-1"}))
+            .expect("ok")
+            .expect("known");
+        assert_eq!(
+            event,
+            StreamEvent::GoalChanged {
+                session: SessionId::new("sess-1"),
+                goal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_goal_changed_carries_over_100_verbatim() {
+        let event = map_stream_event(&json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "Ship it", "percentComplete": 150, "status": "weird"},
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::GoalChanged {
+                goal: Some(goal), ..
+            } => {
+                assert_eq!(goal.percent_complete, 150.0);
+                assert_eq!(goal.clamped_percent(), 100.0);
+                assert_eq!(goal.status, GoalStatus::Other(String::from("weird")));
+                assert_eq!(goal.current_work, None);
+            }
+            other => panic!("expected a goal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_goal_changed_malformed_block_is_err() {
+        // Missing or empty objective fails, like the other required
+        // wire fields.
+        let missing_objective = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"percentComplete": 10, "status": "active"},
+        });
+        assert!(map_stream_event(&missing_objective).is_err());
+        let empty_objective = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "", "percentComplete": 10},
+        });
+        assert!(map_stream_event(&empty_objective).is_err());
+        let missing_percent = json!({
+            "type": "goal-changed",
+            "sessionId": "sess-1",
+            "goal": {"objective": "Ship it"},
+        });
+        assert!(map_stream_event(&missing_percent).is_err());
+        let missing_session = json!({
+            "type": "goal-changed",
+            "goal": {"objective": "Ship it", "percentComplete": 10},
+        });
+        assert!(map_stream_event(&missing_session).is_err());
     }
 
     #[test]

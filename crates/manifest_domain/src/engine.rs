@@ -145,6 +145,70 @@ impl StreamItem {
     }
 }
 
+/// A session goal's lifecycle situation, parsed leniently from the
+/// host's free status string.
+///
+/// Known situations name themselves; anything else stays a value,
+/// never a parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalStatus {
+    /// The goal is being worked on.
+    Active,
+    /// The goal is paused; progress is frozen as sent.
+    Paused,
+    /// The goal is done; progress renders as complete.
+    Completed,
+    /// Any other status, carried verbatim for forward compatibility.
+    ///
+    /// Holds the raw status text, or an empty string when the wire
+    /// sent none. Unknown statuses stay values, never parse failures.
+    Other(String),
+}
+
+impl GoalStatus {
+    /// Parse the host's free status string: `active`, `paused`, and
+    /// `completed` (any case, surrounding whitespace ignored) name
+    /// themselves; anything else stays an [`GoalStatus::Other`] value.
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "completed" => Self::Completed,
+            _ => Self::Other(text.to_string()),
+        }
+    }
+}
+
+/// One session goal, translated from the host's goal block.
+///
+/// The renderer clamps the percent for display; the carried value
+/// stays verbatim (it may exceed 100).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalInfo {
+    /// The goal objective; never empty (the mapper rejects blocks
+    /// without one, mirroring the other required wire fields).
+    pub objective: String,
+    /// Completion percent, verbatim from the wire; may exceed 100.
+    pub percent_complete: f64,
+    /// Lifecycle situation, parsed leniently from the free string.
+    pub status: GoalStatus,
+    /// What the agent is doing now, when reported.
+    pub current_work: Option<String>,
+    /// What comes next, when reported.
+    pub next_work: Option<String>,
+}
+
+impl GoalInfo {
+    /// Display percent in `0.0..=100.0` for rendering. Non-finite
+    /// values read as zero; the carried value is untouched.
+    pub fn clamped_percent(&self) -> f32 {
+        if !self.percent_complete.is_finite() {
+            return 0.0;
+        }
+        (self.percent_complete as f32).clamp(0.0, 100.0)
+    }
+}
+
 /// The named connection situations the shell renders.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Connection {
@@ -579,7 +643,10 @@ impl PendingAnswer {
 }
 
 /// One server stream event, translated to domain values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` without `Eq`: [`StreamEvent::GoalChanged`] carries a
+/// float percent, which has no total equality.
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// A turn started.
     TurnStarted {
@@ -678,6 +745,14 @@ pub enum StreamEvent {
     CatalogChanged {
         /// Session whose catalog changed.
         session: SessionId,
+    },
+    /// The session's goal changed: the new goal, or `None` when the
+    /// host cleared it. Replaces the stored goal wholesale.
+    GoalChanged {
+        /// Session whose goal changed.
+        session: SessionId,
+        /// The new goal, or `None` when cleared.
+        goal: Option<GoalInfo>,
     },
 }
 
@@ -1309,7 +1384,11 @@ pub enum FailedCommand {
 }
 
 /// Everything an engine reports to the presentation layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` without `Eq`: [`StreamEvent`] (carried by
+/// [`EngineEvent::Stream`]) holds a float goal percent, which has no
+/// total equality.
+#[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     /// The engine connection state changed.
     ConnectionChanged(Connection),
@@ -1597,6 +1676,35 @@ mod tests {
         for (item, want) in items {
             assert_eq!(item.item_id(), want);
         }
+    }
+
+    #[test]
+    fn goal_status_parses_known_leniently_and_keeps_unknown() {
+        assert_eq!(GoalStatus::parse("active"), GoalStatus::Active);
+        assert_eq!(GoalStatus::parse(" Paused "), GoalStatus::Paused);
+        assert_eq!(GoalStatus::parse("COMPLETED"), GoalStatus::Completed);
+        assert_eq!(
+            GoalStatus::parse("archived"),
+            GoalStatus::Other(String::from("archived"))
+        );
+        assert_eq!(GoalStatus::parse(""), GoalStatus::Other(String::from("")));
+    }
+
+    #[test]
+    fn goal_clamped_percent_bounds_the_range() {
+        let goal = |percent_complete: f64| GoalInfo {
+            objective: String::from("ship it"),
+            percent_complete,
+            status: GoalStatus::Active,
+            current_work: None,
+            next_work: None,
+        };
+        assert_eq!(goal(42.0).clamped_percent(), 42.0);
+        assert_eq!(goal(150.0).clamped_percent(), 100.0);
+        assert_eq!(goal(-3.0).clamped_percent(), 0.0);
+        assert_eq!(goal(f64::NAN).clamped_percent(), 0.0);
+        // The carried value stays verbatim past 100.
+        assert_eq!(goal(150.0).percent_complete, 150.0);
     }
 
     #[test]
