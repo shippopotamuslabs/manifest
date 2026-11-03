@@ -235,6 +235,13 @@ impl SessionEngine for MuseEngine {
             .worker_tx
             .send(WorkerMsg::Command(Command::ListSkills { session }));
     }
+
+    fn load_history(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::LoadHistory { session }));
+    }
 }
 
 impl Drop for MuseEngine {

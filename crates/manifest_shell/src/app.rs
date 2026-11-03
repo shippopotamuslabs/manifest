@@ -272,6 +272,15 @@ pub struct App {
     /// Orphaned sessions with a resume in flight; gates duplicate
     /// resumes and the send button.
     pub resuming: HashSet<SessionId>,
+    /// Sessions whose stored history was requested; kept once
+    /// requested (even when the fetch returns empty) so a session
+    /// never refetches in a loop. A history-tagged `CommandFailed`
+    /// releases the entry so the next select retries.
+    pub history_requested: HashSet<SessionId>,
+    /// Sessions spawned this run; their transcripts start with the
+    /// optimistic echo, so no history backfill is ever requested
+    /// for them.
+    pub spawned_sessions: HashSet<SessionId>,
     /// A new session being composed in a project's workspace; set by
     /// the project's Plus icon button, cleared on send (which spawns it) or
     /// on session select. While set, the visible transcript is the
@@ -385,6 +394,8 @@ impl App {
             awaiting_spawn: false,
             pending_spawn: None,
             resuming: HashSet::new(),
+            history_requested: HashSet::new(),
+            spawned_sessions: HashSet::new(),
             new_session: None,
             pending: pending::State::default(),
             composer: composer::State::new(),
@@ -755,6 +766,44 @@ impl App {
         if let (Some(session), Some(engine)) = (self.visible_session.clone(), &self.engine) {
             engine.list_skills(session);
             self.skills_pending = true;
+        }
+    }
+
+    /// Whether `session`'s transcript holds no host content: no
+    /// entries, or only local error notes. Errors never stand in for
+    /// history, so a failure still leaves the session refetchable.
+    fn transcript_is_empty(&self, session: &SessionId) -> bool {
+        let entries = if self.is_visible(session) {
+            &self.transcript.entries
+        } else {
+            match self.transcripts.get(session) {
+                Some(state) => &state.entries,
+                None => return true,
+            }
+        };
+        entries
+            .iter()
+            .all(|entry| matches!(entry.kind, transcript::EntryKind::Error { .. }))
+    }
+
+    /// Request `session`'s stored history once: skipped when already
+    /// requested, when the session spawned this run (fresh
+    /// transcripts need no backfill), or when its transcript already
+    /// holds host content. Marks the session before sending so the
+    /// loaded event cannot refetch.
+    fn maybe_request_history(&mut self, session: &SessionId) {
+        if self.history_requested.contains(session)
+            || self.spawned_sessions.contains(session)
+            || !self.transcript_is_empty(session)
+        {
+            return;
+        }
+        if self.connection != Connection::Connected {
+            return;
+        }
+        if let Some(engine) = &self.engine {
+            engine.load_history(session.clone());
+            self.history_requested.insert(session.clone());
         }
     }
 
@@ -1611,8 +1660,11 @@ impl App {
                         && let Some(engine) = &self.engine
                     {
                         engine.resume_session(id.clone());
-                        self.resuming.insert(id);
+                        self.resuming.insert(id.clone());
                     }
+                    // Reopening a session backfills its stored
+                    // transcript once; new spawns never fetch.
+                    self.maybe_request_history(&id);
                 }
                 if select {
                     // The sync above moved the visible transcript: the
@@ -1884,6 +1936,19 @@ impl App {
                                 self.request_skills_for_visible();
                             }
                             self.sync_visible_transcript();
+                            // A list load can leave a dormant session
+                            // visible by default (first row after
+                            // replace, no Select and no resume): the
+                            // select arm's backfill never runs for it,
+                            // so backfill here too. The request gates
+                            // on already-requested, spawned-this-run,
+                            // and stored content, so refreshes and the
+                            // select_on_load adoption above never
+                            // double-fetch; only a History failure
+                            // releases the gate for a retry.
+                            if let Some(visible) = self.visible_session.clone() {
+                                self.maybe_request_history(&visible);
+                            }
                             // Usage reconciles against the same
                             // cumulative fold the stream carries: a
                             // carried snapshot replaces the stored one
@@ -1964,6 +2029,14 @@ impl App {
                                     // so the next select retries it.
                                     self.resuming.remove(&session);
                                 }
+                                manifest_domain::FailedCommand::History(session) => {
+                                    // Only this session's history gate
+                                    // releases, so the next select
+                                    // retries it. The transcript line
+                                    // above carries the failure; the
+                                    // session stays sendable.
+                                    self.history_requested.remove(&session);
+                                }
                                 manifest_domain::FailedCommand::Turn(session) => {
                                     // The optimistically started turn
                                     // never began: end it for this
@@ -2031,6 +2104,7 @@ impl App {
                             }
                         }
                         EngineEvent::SessionSpawned { session, turn } => {
+                            self.spawned_sessions.insert(session.clone());
                             self.running.insert(session.clone());
                             if let Some(turn) = turn {
                                 self.running_turns.insert(session.clone(), turn);
@@ -2085,10 +2159,25 @@ impl App {
                         }
                         EngineEvent::SessionResumed { session } => {
                             self.resuming.remove(&session);
+                            // A resumed session shows its stored
+                            // transcript: backfill it when the select
+                            // did not already (or could not yet).
+                            self.maybe_request_history(&session);
                             if self.connection == Connection::Connected
                                 && let Some(engine) = &self.engine
                             {
                                 engine.list_sessions();
+                            }
+                        }
+                        EngineEvent::HistoryLoaded { session, items } => {
+                            // Seeds the owning transcript (visible or
+                            // parked) through the same paths live
+                            // stream events use. An empty fetch still
+                            // counts as requested: no refetch loop.
+                            if self.is_visible(&session) {
+                                appended = self.transcript.seed_history(items);
+                            } else {
+                                self.stored_transcript(&session).seed_history(items);
                             }
                         }
                         EngineEvent::PendingLoaded { requests } => {
@@ -3401,6 +3490,7 @@ mod tests {
         cancels: std::sync::Arc<std::sync::Mutex<Vec<CancelCall>>>,
         models: std::sync::Arc<std::sync::Mutex<Vec<ModelsCall>>>,
         skills: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        histories: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         compacts: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         goals: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
         fetches: std::sync::Arc<std::sync::Mutex<usize>>,
@@ -3466,6 +3556,10 @@ mod tests {
             self.skills.lock().unwrap().push(session);
         }
 
+        fn load_history(&self, session: manifest_domain::SessionId) {
+            self.histories.lock().unwrap().push(session);
+        }
+
         fn compact_session(&self, session: manifest_domain::SessionId) {
             self.compacts.lock().unwrap().push(session);
         }
@@ -3515,6 +3609,7 @@ mod tests {
             cancels: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            histories: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             compacts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             fetches: std::sync::Arc::new(std::sync::Mutex::new(0)),
@@ -5951,6 +6046,226 @@ mod tests {
         // The gate released: reselecting retries the resume.
         select(&mut app, "sess-orphan");
         assert_eq!(fake.resumes.lock().unwrap().len(), 2);
+    }
+
+    /// Two-turn stored history, oldest first.
+    fn history_items() -> Vec<manifest_domain::StreamItem> {
+        vec![
+            manifest_domain::StreamItem::UserMessage {
+                item_id: String::from("hist-user-1"),
+                text: String::from("First question"),
+            },
+            manifest_domain::StreamItem::AgentMessage {
+                item_id: String::from("hist-agent-1"),
+                text: String::from("First answer."),
+                phase: None,
+            },
+        ]
+    }
+
+    /// User and assistant texts of the visible transcript, in order.
+    fn visible_texts(app: &App) -> Vec<String> {
+        app.transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::User { text } => Some(format!("user:{text}")),
+                crate::transcript::EntryKind::Assistant { text, .. } => {
+                    Some(format!("agent:{text}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resumed_requests_history_once() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert_eq!(
+            *fake.histories.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+        // The resume completing requests nothing further.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionResumed {
+                session: SessionId::new("sess-orphan"),
+            }),
+        );
+        assert_eq!(fake.histories.lock().unwrap().len(), 1);
+        // Reselecting the backfilled session requests nothing further.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::HistoryLoaded {
+                session: SessionId::new("sess-orphan"),
+                items: history_items(),
+            }),
+        );
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.histories.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reopened_session_restores_history_and_send_gate() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.histories.lock().unwrap().len(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionResumed {
+                session: SessionId::new("sess-orphan"),
+            }),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![
+                    status_session("sess-orphan", manifest_domain::SessionStatus::Idle),
+                    live_session("s-idle"),
+                ],
+                usage: Vec::new(),
+            }),
+        );
+        assert!(app.composer.send_enabled);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::HistoryLoaded {
+                session: SessionId::new("sess-orphan"),
+                items: history_items(),
+            }),
+        );
+        assert_eq!(
+            visible_texts(&app),
+            vec![
+                String::from("user:First question"),
+                String::from("agent:First answer."),
+            ]
+        );
+        assert!(app.composer.send_enabled);
+        // A duplicate load seeds nothing twice.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::HistoryLoaded {
+                session: SessionId::new("sess-orphan"),
+                items: history_items(),
+            }),
+        );
+        assert_eq!(visible_texts(&app).len(), 2);
+    }
+
+    #[test]
+    fn history_loaded_for_background_renders_after_switch() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::HistoryLoaded {
+                session: SessionId::new("s-idle"),
+                items: history_items(),
+            }),
+        );
+        // The background seed leaves the visible transcript alone.
+        assert!(visible_texts(&app).is_empty());
+        select(&mut app, "s-idle");
+        assert_eq!(
+            visible_texts(&app),
+            vec![
+                String::from("user:First question"),
+                String::from("agent:First answer."),
+            ]
+        );
+        // The switch found stored content, so it fetched nothing more.
+        assert_eq!(
+            *fake.histories.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+    }
+
+    #[test]
+    fn history_failure_keeps_session_sendable_and_retries_on_reselect() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded_orphan_and_idle(&mut app);
+        select(&mut app, "sess-orphan");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionResumed {
+                session: SessionId::new("sess-orphan"),
+            }),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![
+                    status_session("sess-orphan", manifest_domain::SessionStatus::Idle),
+                    live_session("s-idle"),
+                ],
+                usage: Vec::new(),
+            }),
+        );
+        assert!(app.composer.send_enabled);
+        let message = String::from("history blew up");
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::History(SessionId::new("sess-orphan")),
+                message: message.clone(),
+            }),
+        );
+        assert!(transcript_errors(&app).contains(&message.as_str()));
+        // The failure shows but the session stays sendable.
+        assert!(app.composer.send_enabled);
+        // The history gate released: reselecting retries the fetch.
+        select(&mut app, "sess-orphan");
+        assert_eq!(fake.histories.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn spawned_session_never_fetches_history() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionSpawned {
+                session: SessionId::new("s-new"),
+                turn: None,
+            }),
+        );
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::SessionsLoaded {
+                sessions: vec![live_session("s-new")],
+                usage: Vec::new(),
+            }),
+        );
+        select(&mut app, "s-new");
+        assert!(fake.histories.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sessions_loaded_backfills_visible_session_without_select() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        // No Select and no resume: replace falls back to the
+        // first listed row, so the dormant orphan is visible by
+        // default (the app-reopen shape) and the load backfills
+        // its history once.
+        loaded_orphan_and_idle(&mut app);
+        assert_eq!(app.visible_session, Some(SessionId::new("sess-orphan")));
+        assert_eq!(
+            *fake.histories.lock().unwrap(),
+            vec![SessionId::new("sess-orphan")]
+        );
+        // A second list refresh requests nothing further.
+        loaded_orphan_and_idle(&mut app);
+        assert_eq!(fake.histories.lock().unwrap().len(), 1);
     }
 
     /// Enters a draft, sets its worktree mode and field, and types a
