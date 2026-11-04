@@ -19,9 +19,9 @@ use manifest_domain::{
 use crate::kit::{self, IconButtonKind};
 use crate::theme::{
     ATTACH_POPUP_WIDTH, COMPOSER_MAX_LINES, CONTEXT_POPUP_WIDTH, EFFORT_POPUP_WIDTH,
-    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT,
-    MODEL_POPUP_WIDTH, PERMISSION_POPUP_WIDTH, SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, SUCCESS,
-    TEXT_FAINT, TEXT_SECONDARY, TEXT_TERTIARY,
+    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, GOAL_POPUP_RING_SIZE, GOAL_POPUP_WIDTH,
+    MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH, PERMISSION_POPUP_WIDTH,
+    SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, SUCCESS, TEXT_FAINT, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The attach popup has two real situations, so it is an enum, not a
@@ -68,6 +68,17 @@ pub enum ContextPopover {
     #[default]
     Closed,
     /// The usage-breakdown popover is showing.
+    Open,
+}
+
+/// The goal popover has two real situations, so it is an enum, not
+/// a bool (UI contract §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalPopover {
+    /// No goal popover is showing.
+    #[default]
+    Closed,
+    /// The goal-detail popover is showing.
     Open,
 }
 
@@ -130,38 +141,50 @@ pub enum SlashPick {
     Skill(String),
 }
 
-/// Precomputed goal strip values for the visible session's goal:
-/// the objective line, the clamped percent and its label, and the
-/// current-work line. Computed once in [`State::set_goal`] (from the
-/// App's per-session goal store), so the view reads without
-/// formatting (UI contract §2). A completed goal forces the percent
-/// to 100; every other status shows the sent percent clamped.
+/// Precomputed goal chip values for the visible session's goal:
+/// the objective, the clamped percent and its label, the status
+/// label, and the current-work line. Computed once in
+/// [`State::set_goal`] (from the App's per-session goal store), so
+/// the view reads without formatting (UI contract §2). A completed
+/// goal forces the percent to 100; every other status shows the sent
+/// percent clamped.
 #[derive(Debug, Clone)]
 pub struct GoalDisplay {
-    /// Goal objective, rendered on one line.
+    /// Goal objective, rendered in full in the popover.
     pub objective: String,
     /// Display percent in `0.0..=100.0`; 100.0 when completed.
     pub percent: f32,
     /// Precomputed percent text, e.g. `42%`.
     pub percent_label: String,
+    /// Precomputed status text, e.g. `Active`; an empty `Other`
+    /// reads as `Active`.
+    pub status_label: String,
     /// Current-work line, when the host reported one.
     pub current_work: Option<String>,
-    /// Lifecycle situation; picks the strip's icon and tones.
+    /// Lifecycle situation; picks the chip's icon and tones.
     pub status: GoalStatus,
 }
 
 impl GoalDisplay {
-    /// Precompute the strip values from one goal block.
+    /// Precompute the chip values from one goal block.
     fn from_goal(goal: &GoalInfo) -> Self {
         let percent = if goal.status == GoalStatus::Completed {
             100.0
         } else {
             goal.clamped_percent()
         };
+        let status_label = match &goal.status {
+            GoalStatus::Active => String::from("Active"),
+            GoalStatus::Paused => String::from("Paused"),
+            GoalStatus::Completed => String::from("Completed"),
+            GoalStatus::Other(raw) if raw.is_empty() => String::from("Active"),
+            GoalStatus::Other(raw) => raw.clone(),
+        };
         Self {
             objective: goal.objective.clone(),
             percent,
             percent_label: format!("{}%", percent.round() as u64),
+            status_label,
             current_work: goal.current_work.clone(),
             status: goal.status.clone(),
         }
@@ -228,6 +251,10 @@ pub enum Message {
     ContextPressed,
     /// A press landed outside the floating context popup; closes it.
     ContextDismissed,
+    /// The goal chip was pressed; toggles the popover.
+    GoalPressed,
+    /// A press landed outside the floating goal popup; closes it.
+    GoalDismissed,
     /// The selection moved down one slash row (wraps); no-op while
     /// the menu is closed or has no rows.
     SlashNext,
@@ -277,6 +304,8 @@ pub struct State {
     pub model_menu: ModelMenu,
     /// Whether the context popover is showing.
     pub context_popover: ContextPopover,
+    /// Whether the goal popover is showing.
+    pub goal_popover: GoalPopover,
     /// The posture new sessions spawn with.
     pub permission: PermissionMode,
     /// The model new sessions spawn with.
@@ -303,8 +332,8 @@ pub struct State {
     pub attachments: Vec<String>,
     /// The visible session's latest usage snapshot, when reported.
     pub usage: Option<UsageSnapshot>,
-    /// Precomputed goal strip for the visible session's goal; `None`
-    /// hides the strip entirely. Written by the App from its
+    /// Precomputed goal chip for the visible session's goal; `None`
+    /// hides the chip entirely. Written by the App from its
     /// per-session goal store, so the view reads without formatting
     /// (UI contract §2).
     pub goal_display: Option<GoalDisplay>,
@@ -332,6 +361,7 @@ impl State {
             permission_menu: PermissionMenu::Closed,
             model_menu: ModelMenu::Closed,
             context_popover: ContextPopover::Closed,
+            goal_popover: GoalPopover::Closed,
             permission: PermissionMode::default(),
             model: ModelChoice::default(),
             effort: EffortChoice::default(),
@@ -368,6 +398,7 @@ impl State {
         self.permission_menu = PermissionMenu::Closed;
         self.model_menu = ModelMenu::Closed;
         self.context_popover = ContextPopover::Closed;
+        self.goal_popover = GoalPopover::Closed;
         self.close_slash();
         self.refresh_derived();
     }
@@ -458,6 +489,7 @@ impl State {
                         self.permission_menu = PermissionMenu::Closed;
                         self.model_menu = ModelMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
+                        self.goal_popover = GoalPopover::Closed;
                         self.close_slash();
                         AttachPopup::Open
                     }
@@ -472,6 +504,7 @@ impl State {
                     PermissionMenu::Closed => {
                         self.model_menu = ModelMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
+                        self.goal_popover = GoalPopover::Closed;
                         self.attach_popup = AttachPopup::Closed;
                         self.close_slash();
                         PermissionMenu::Open
@@ -491,6 +524,7 @@ impl State {
                     ModelMenu::Closed => {
                         self.permission_menu = PermissionMenu::Closed;
                         self.context_popover = ContextPopover::Closed;
+                        self.goal_popover = GoalPopover::Closed;
                         self.attach_popup = AttachPopup::Closed;
                         self.close_slash();
                         ModelMenu::Open
@@ -525,6 +559,7 @@ impl State {
                     ContextPopover::Closed => {
                         self.permission_menu = PermissionMenu::Closed;
                         self.model_menu = ModelMenu::Closed;
+                        self.goal_popover = GoalPopover::Closed;
                         self.attach_popup = AttachPopup::Closed;
                         self.close_slash();
                         ContextPopover::Open
@@ -534,6 +569,22 @@ impl State {
             }
             Message::ContextDismissed => {
                 self.context_popover = ContextPopover::Closed;
+            }
+            Message::GoalPressed => {
+                self.goal_popover = match self.goal_popover {
+                    GoalPopover::Closed => {
+                        self.permission_menu = PermissionMenu::Closed;
+                        self.model_menu = ModelMenu::Closed;
+                        self.context_popover = ContextPopover::Closed;
+                        self.attach_popup = AttachPopup::Closed;
+                        self.close_slash();
+                        GoalPopover::Open
+                    }
+                    GoalPopover::Open => GoalPopover::Closed,
+                };
+            }
+            Message::GoalDismissed => {
+                self.goal_popover = GoalPopover::Closed;
             }
             Message::SlashNext => {
                 if let SlashMenu::Open { selected } = &mut self.slash_menu
@@ -606,6 +657,7 @@ impl State {
         if matches!(pick, SlashPick::Builtin(BuiltinCommand::Model)) {
             self.permission_menu = PermissionMenu::Closed;
             self.context_popover = ContextPopover::Closed;
+            self.goal_popover = GoalPopover::Closed;
             self.attach_popup = AttachPopup::Closed;
             self.model_menu = ModelMenu::Open;
         }
@@ -701,19 +753,23 @@ impl State {
     }
 
     /// Replaces the visible session's goal display: `Some` precomputes
-    /// the strip values, `None` hides the strip entirely. Called by
-    /// the App from its per-session goal store, so the view reads
-    /// without formatting (UI contract §2).
+    /// the chip values, `None` hides the chip and closes the popover.
+    /// Called by the App from its per-session goal store, so the view
+    /// reads without formatting (UI contract §2).
     pub fn set_goal(&mut self, goal: Option<&GoalInfo>) {
         self.goal_display = goal.map(GoalDisplay::from_goal);
+        if self.goal_display.is_none() {
+            self.goal_popover = GoalPopover::Closed;
+        }
     }
 
     /// Renders the input bar with the inside-bar buttons, the
     /// attachment refs, and the live sub-bar. The attach, model,
-    /// permission, and context popups are not part of this flow; they
-    /// float via [`State::attach_menu_overlay`],
+    /// permission, context, and goal popups are not part of this flow;
+    /// they float via [`State::attach_menu_overlay`],
     /// [`State::model_menu_overlay`], [`State::permission_menu_overlay`],
-    /// and [`State::context_popover_overlay`].
+    /// [`State::context_popover_overlay`], and
+    /// [`State::goal_popover_overlay`].
     pub fn view(&self) -> Element<'_, Message> {
         // While the slash menu is open, arrows/Tab/Enter/Esc fold into
         // menu messages through the editor's key binding, before the
@@ -780,66 +836,8 @@ impl State {
         if !self.attachments.is_empty() {
             column = column.push(self.attachments_view());
         }
-        if let Some(display) = &self.goal_display {
-            column = column.push(Self::goal_strip_view(display));
-        }
         column = column.push(self.sub_bar_view());
         column.width(Length::Fill).into()
-    }
-
-    /// The goal strip: the objective line with its percent, the meter,
-    /// and the current-work line when the host reported one. Display
-    /// only: no pause, clear, or edit controls. A paused goal reads in
-    /// tertiary tones with the sent percent frozen; a completed goal
-    /// reads with the check icon at full percent.
-    fn goal_strip_view(display: &GoalDisplay) -> Element<'_, Message> {
-        let paused = matches!(display.status, GoalStatus::Paused);
-        let completed = matches!(display.status, GoalStatus::Completed);
-        let icon = if completed {
-            lucide_icons::Icon::CircleCheck
-        } else {
-            lucide_icons::Icon::Target
-        };
-        let icon_color = if completed {
-            SUCCESS
-        } else if paused {
-            TEXT_TERTIARY
-        } else {
-            TEXT_SECONDARY
-        };
-        let line_color = if paused {
-            TEXT_TERTIARY
-        } else {
-            TEXT_SECONDARY
-        };
-        let mut strip = iced::widget::column![
-            iced::widget::row![
-                kit::icon(icon, FONT_SIZE_PANEL, icon_color),
-                iced::widget::text(display.objective.as_str())
-                    .size(FONT_SIZE_PANEL)
-                    .color(line_color)
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::None),
-                iced::widget::text(display.percent_label.as_str())
-                    .size(FONT_SIZE_PANEL)
-                    .color(line_color),
-            ]
-            .spacing(SPACE_XS)
-            .align_y(iced::alignment::Vertical::Center),
-            iced::widget::progress_bar(0.0..=100.0, display.percent).length(Length::Fill),
-        ]
-        .spacing(SPACE_XS)
-        .width(Length::Fill);
-        if let Some(current) = &display.current_work {
-            strip = strip.push(
-                iced::widget::text(current.as_str())
-                    .size(FONT_SIZE_PANEL_SMALL)
-                    .color(if paused { TEXT_FAINT } else { TEXT_TERTIARY })
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::None),
-            );
-        }
-        strip.into()
     }
 
     /// The floating model menu for the App to overlay above the
@@ -895,6 +893,20 @@ impl State {
             None
         } else {
             Some(self.context_popover_view())
+        }
+    }
+
+    /// The floating goal popup for the App to overlay above the
+    /// composer, or `None` when the popover is closed. The popup never
+    /// sits in the composer's layout flow, so opening it cannot
+    /// change the composer's height or push the transcript around;
+    /// the App anchors this card at the bottom-right of the window,
+    /// just above the sub-bar.
+    pub(crate) fn goal_popover_overlay(&self) -> Option<Element<'_, Message>> {
+        if matches!(self.goal_popover, GoalPopover::Closed) {
+            None
+        } else {
+            Some(self.goal_popover_view())
         }
     }
 
@@ -960,14 +972,15 @@ impl State {
 
     /// The live sub-bar: the permission text-button on the left, and
     /// the combined model-effort pill plus the clickable context
-    /// ring pinned to the right.
+    /// ring and then the goal pill (when a goal shows) pinned to
+    /// the right.
     fn sub_bar_view(&self) -> Element<'_, Message> {
         let permission_kind = if self.permission == PermissionMode::Muse(MusePermission::Yolo) {
             kit::ButtonKind::DangerGhost
         } else {
             kit::ButtonKind::Ghost
         };
-        iced::widget::row![
+        let mut bar = iced::widget::row![
             kit::pill_button(
                 self.permission.label(),
                 permission_kind,
@@ -979,12 +992,23 @@ impl State {
                 kit::ButtonKind::Ghost,
                 Some(Message::ModelPressed),
             ),
-            kit::context_ring(self.context_percent, Some(Message::ContextPressed)),
         ]
         .spacing(SPACE_S)
         .width(Length::Fill)
-        .align_y(iced::alignment::Vertical::Center)
-        .into()
+        .align_y(iced::alignment::Vertical::Center);
+        bar = bar.push(kit::context_ring(
+            self.context_percent,
+            Some(Message::ContextPressed),
+        ));
+        if let Some(display) = &self.goal_display {
+            bar = bar.push(kit::goal_chip(
+                display.percent,
+                display.percent_label.as_str(),
+                &display.status,
+                Some(Message::GoalPressed),
+            ));
+        }
+        bar.into()
     }
 
     /// The permission menu: every posture with its one-line account.
@@ -1129,6 +1153,69 @@ impl State {
             }
         }
         kit::popup_card(popover.width(Length::Fill), CONTEXT_POPUP_WIDTH)
+    }
+
+    /// The goal popover: the larger ring readout beside the percent
+    /// and status labels, the full objective wrapped over lines, and
+    /// the current-work line when the host reported one. Display
+    /// only: no pause, clear, or edit controls, and no linear meter.
+    /// A paused goal reads in tertiary tones with the sent percent
+    /// frozen; a completed goal reads green at full percent.
+    fn goal_popover_view(&self) -> Element<'_, Message> {
+        let mut popover = iced::widget::column![].spacing(SPACE_XS);
+        match &self.goal_display {
+            None => {
+                popover = popover.push(kit::popup_note("No goal for this session."));
+            }
+            Some(display) => {
+                let paused = matches!(display.status, GoalStatus::Paused);
+                let completed = matches!(display.status, GoalStatus::Completed);
+                let tone = if completed {
+                    SUCCESS
+                } else if paused {
+                    TEXT_TERTIARY
+                } else {
+                    TEXT_SECONDARY
+                };
+                popover = popover.push(
+                    iced::widget::row![
+                        kit::goal_ring_content(
+                            display.percent,
+                            &display.status,
+                            GOAL_POPUP_RING_SIZE
+                        ),
+                        iced::widget::column![
+                            iced::widget::text(display.percent_label.as_str())
+                                .size(FONT_SIZE_PANEL)
+                                .color(tone),
+                            iced::widget::text(display.status_label.as_str())
+                                .size(crate::theme::FONT_SIZE_SMALL)
+                                .color(tone),
+                        ]
+                        .spacing(SPACE_XS),
+                    ]
+                    .spacing(SPACE_S)
+                    .align_y(iced::alignment::Vertical::Center),
+                );
+                popover = popover.push(
+                    iced::widget::text(display.objective.as_str())
+                        .size(FONT_SIZE_PANEL)
+                        .color(tone)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::Word),
+                );
+                if let Some(current) = &display.current_work {
+                    popover = popover.push(
+                        iced::widget::text(current.as_str())
+                            .size(FONT_SIZE_PANEL_SMALL)
+                            .color(if paused { TEXT_FAINT } else { TEXT_TERTIARY })
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::Word),
+                    );
+                }
+            }
+        }
+        kit::popup_card(popover.width(Length::Fill), GOAL_POPUP_WIDTH)
     }
 
     /// The slash menu: one row per precomputed visible row, newest
@@ -1586,6 +1673,7 @@ mod tests {
         assert_eq!(got.permission_menu, PermissionMenu::Closed);
         assert_eq!(got.model_menu, ModelMenu::Closed);
         assert_eq!(got.context_popover, ContextPopover::Closed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
         assert_eq!(got.permission, PermissionMode::default());
         assert_eq!(got.model, ModelChoice::Default);
         assert_eq!(got.effort, EffortChoice::Default);
@@ -2233,12 +2321,111 @@ mod tests {
     }
 
     #[test]
-    fn goal_display_none_hides_the_strip() {
+    fn goal_display_none_hides_the_chip_and_closes_the_popover() {
         let mut got = State::new();
         got.set_goal(Some(&goal("Ship it", 30.0, GoalStatus::Active)));
         assert!(got.goal_display.is_some());
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
         got.set_goal(None);
         assert!(got.goal_display.is_none());
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+    }
+
+    #[test]
+    fn goal_display_status_label_names_each_situation() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Active)));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").status_label,
+            "Active"
+        );
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Paused)));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").status_label,
+            "Paused"
+        );
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Completed)));
+        assert_eq!(
+            got.goal_display
+                .as_ref()
+                .expect("goal shows")
+                .status_label,
+            "Completed"
+        );
+        got.set_goal(Some(&goal(
+            "Ship it",
+            10.0,
+            GoalStatus::Other(String::from("Reviewing")),
+        )));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").status_label,
+            "Reviewing"
+        );
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Other(String::new()))));
+        assert_eq!(
+            got.goal_display.as_ref().expect("goal shows").status_label,
+            "Active"
+        );
+    }
+
+    #[test]
+    fn goal_pressed_toggles_popover() {
+        let mut got = State::new();
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+    }
+
+    #[test]
+    fn goal_dismissed_closes_popover_and_is_harmless_when_closed() {
+        let mut got = State::new();
+        got.update(Message::GoalDismissed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalDismissed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+    }
+
+    #[test]
+    fn goal_popover_overlay_follows_popover_state() {
+        let mut got = State::new();
+        assert!(got.goal_popover_overlay().is_none());
+        got.update(Message::GoalPressed);
+        assert!(got.goal_popover_overlay().is_some());
+        got.update(Message::GoalDismissed);
+        assert!(got.goal_popover_overlay().is_none());
+    }
+
+    #[test]
+    fn opening_goal_closes_other_popups_and_vice_versa() {
+        let mut got = State::new();
+        got.update(Message::PermissionPressed);
+        assert_eq!(got.permission_menu, PermissionMenu::Open);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert_eq!(got.permission_menu, PermissionMenu::Closed);
+        got.update(Message::ModelPressed);
+        assert_eq!(got.model_menu, ModelMenu::Open);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert_eq!(got.model_menu, ModelMenu::Closed);
+        got.update(Message::AttachPressed);
+        assert_eq!(got.attach_popup, AttachPopup::Open);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert_eq!(got.attach_popup, AttachPopup::Closed);
+        // The context popover closes the goal popover and back.
+        got.update(Message::ContextPressed);
+        assert_eq!(got.context_popover, ContextPopover::Open);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert_eq!(got.context_popover, ContextPopover::Closed);
     }
 
     #[test]

@@ -2380,6 +2380,9 @@ impl App {
         if let Some(popup) = self.composer.context_popover_overlay() {
             stack = stack.push(context_popover_overlay_layer(popup.map(Message::Composer)));
         }
+        if let Some(popup) = self.composer.goal_popover_overlay() {
+            stack = stack.push(goal_popover_overlay_layer(popup.map(Message::Composer)));
+        }
         if let Some(menu) = self.composer.slash_menu_overlay() {
             stack = stack.push(slash_menu_overlay_layer(
                 menu.map(Message::Composer),
@@ -2610,6 +2613,46 @@ fn context_popover_overlay_layer<'a>(popup: Element<'a, Message>) -> Element<'a,
             .height(Length::Fill),
     )
     .on_press(Message::Composer(composer::Message::ContextDismissed));
+    let card = iced::widget::row![
+        iced::widget::column![
+            iced::widget::container(popup)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Bottom),
+            iced::widget::Space::new().height(Length::Fixed(MODEL_MENU_BOTTOM_OFFSET)),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+        iced::widget::Space::new().width(Length::Fixed(SPACE_M)),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+    iced::widget::Stack::new()
+        .push(catcher)
+        .push(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The floating goal popup layer: a transparent click-away catcher
+/// covering the window behind the card, and the card itself anchored
+/// bottom-right. The card's right edge lines up with the main column's
+/// right edge (the window edge minus the main padding), and its
+/// bottom edge floats just above the goal chip in the composer
+/// sub-bar, with the same offset as the context card — the goal
+/// trigger sits in that sub-bar, so no input-bar height enters the
+/// anchor. The catcher carries no fill, so nothing beneath the card
+/// dims, and a press anywhere outside the card dismisses the popup
+/// without reflowing anything beneath it.
+fn goal_popover_overlay_layer<'a>(popup: Element<'a, Message>) -> Element<'a, Message> {
+    let catcher = iced::widget::mouse_area(
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Composer(composer::Message::GoalDismissed));
     let card = iced::widget::row![
         iced::widget::column![
             iced::widget::container(popup)
@@ -4948,7 +4991,7 @@ mod tests {
                 }),
             },
         );
-        let display = app.composer.goal_display.as_ref().expect("strip shows");
+        let display = app.composer.goal_display.as_ref().expect("chip shows");
         assert_eq!(display.objective, "Ship the slice");
         assert_eq!(display.percent, 42.0);
         assert_eq!(display.percent_label, "42%");
@@ -4985,7 +5028,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_changed_clear_removes_the_strip() {
+    fn goal_changed_clear_removes_the_chip() {
         let (mut app, _) = slash_app();
         stream(
             &mut app,

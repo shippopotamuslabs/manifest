@@ -127,6 +127,14 @@ pub const ATTACH_POPUP_WIDTH: f32 = 260.0;
 // as the model card (MODEL_POPUP_WIDTH): it carries the context meter
 // plus its one-line breakdown.
 pub const CONTEXT_POPUP_WIDTH: f32 = 340.0;
+// Fixed width of the floating goal popup. It is on the same scale as
+// the context card (CONTEXT_POPUP_WIDTH): it carries the goal ring
+// readout plus the full objective text.
+pub const GOAL_POPUP_WIDTH: f32 = 340.0;
+// Diameter of the goal ring readout inside the goal popup: larger
+// than the sub-bar rings (CONTEXT_RING_SIZE) so the percent sweep
+// and status glyph read at card scale.
+pub const GOAL_POPUP_RING_SIZE: f32 = 28.0;
 
 /// Bottom offset of the floating attach menu from the window's bottom
 /// edge for a composer showing `visible_lines` input lines. The attach
