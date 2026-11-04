@@ -67,6 +67,17 @@ pub(crate) enum Command {
         session: SessionId,
         objective: String,
     },
+    /// Pause the session's goal: `muse_raw` with `goal/pause`.
+    PauseGoal { session: SessionId },
+    /// Resume the session's goal: `muse_raw` with `goal/resume`.
+    ResumeGoal { session: SessionId },
+    /// Edit the session's goal: `muse_raw` with `goal/edit`.
+    EditGoal {
+        session: SessionId,
+        objective: String,
+    },
+    /// Clear the session's goal: `muse_raw` with `goal/clear`.
+    ClearGoal { session: SessionId },
     /// List the host model catalog: `muse_models` (read-only query).
     /// Carries the host context the server needs: a workspace, a
     /// session id, or both.
@@ -297,6 +308,44 @@ impl Worker {
         self.next_id = self.next_id.wrapping_add(1);
         self.pending.insert(id, Pending::Goal(session.clone()));
         self.send_line(&wire::goal_call(id, session.as_str(), objective))
+    }
+
+    /// Issue a `goal/pause` round trip through `muse_raw` with a
+    /// fresh id. Like every goal verb, it parks under
+    /// [`Pending::Goal`] so the failure arrives as
+    /// [`FailedCommand::Goal`].
+    fn send_goal_pause_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Goal(session.clone()));
+        self.send_line(&wire::goal_pause_call(id, session.as_str()))
+    }
+
+    /// Issue a `goal/resume` round trip through `muse_raw` with a
+    /// fresh id, parking under [`Pending::Goal`] like [`Worker::send_goal_call`].
+    fn send_goal_resume_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Goal(session.clone()));
+        self.send_line(&wire::goal_resume_call(id, session.as_str()))
+    }
+
+    /// Issue a `goal/edit` round trip through `muse_raw` with a
+    /// fresh id, parking under [`Pending::Goal`] like [`Worker::send_goal_call`].
+    fn send_goal_edit_call(&mut self, session: &SessionId, objective: &str) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Goal(session.clone()));
+        self.send_line(&wire::goal_edit_call(id, session.as_str(), objective))
+    }
+
+    /// Issue a `goal/clear` round trip through `muse_raw` with a
+    /// fresh id, parking under [`Pending::Goal`] like [`Worker::send_goal_call`].
+    fn send_goal_clear_call(&mut self, session: &SessionId) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, Pending::Goal(session.clone()));
+        self.send_line(&wire::goal_clear_call(id, session.as_str()))
     }
 
     /// Issue a `muse_pending` round trip with a fresh id.
@@ -565,7 +614,7 @@ impl Worker {
             Pending::Goal(_) => {
                 match map_ack_result(
                     &result,
-                    "Couldn't set that session's goal on the Muse MCP server.",
+                    "Couldn't update that session's goal on the Muse MCP server.",
                 ) {
                     Ok(()) => return true,
                     Err(message) => EngineEvent::CommandFailed { command, message },
@@ -890,6 +939,58 @@ pub(crate) fn run(
                         message: not_connected_message(),
                     })
                 } else if let Err(err) = worker.send_goal_call(&session, &objective) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::PauseGoal { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Goal(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_goal_pause_call(&session) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::ResumeGoal { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Goal(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_goal_resume_call(&session) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::EditGoal { session, objective }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Goal(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_goal_edit_call(&session, &objective) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::ClearGoal { session }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Goal(session.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) = worker.send_goal_clear_call(&session) {
                     let _ = worker.fail(err);
                     false
                 } else {
