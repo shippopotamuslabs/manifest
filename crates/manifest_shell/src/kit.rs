@@ -432,7 +432,7 @@ pub(crate) fn menu_row_colors(selected: bool, status: button::Status) -> (Option
     row_colors(selected, status)
 }
 
-/// Pure data mapping behind the quiet "Edit" text action on a menu
+/// Pure data mapping behind the quiet reasoning-level text action on a menu
 /// row: transparent at rest, a surface-2 step on hover, tertiary text
 /// warming to primary under the pointer.
 pub(crate) fn edit_button_colors(status: button::Status) -> (Option<Color>, Color) {
@@ -456,7 +456,7 @@ fn menu_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
     }
 }
 
-/// Status-aware style for the quiet "Edit" text action.
+/// Status-aware style for the quiet reasoning-level text action.
 fn edit_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = edit_button_colors(status);
     button::Style {
@@ -468,11 +468,13 @@ fn edit_button_style(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 /// A popup menu row: a full-width label button, a separate quiet
-/// "Edit" text button beside it (a sibling, never nested), and a
-/// check slot at the right that shows a check icon only on the selected row.
+/// reasoning-level button with a right chevron beside it (a sibling,
+/// never nested), and a check slot at the right that shows a check
+/// icon only on the selected row.
 pub(crate) fn menu_row<'a, Message: Clone + 'a>(
     label: &'a str,
     selected: bool,
+    reasoning_level: &'a str,
     on_press: Message,
     on_edit: Message,
 ) -> Element<'a, Message> {
@@ -506,11 +508,20 @@ pub(crate) fn menu_row<'a, Message: Clone + 'a>(
         .padding([SPACE_XS, SPACE_S])
         .on_press(on_press)
         .style(menu_row_style(selected)),
-        button(text("Edit").size(FONT_SIZE_PANEL_SMALL))
-            .height(Length::Fixed(MENU_ROW_HEIGHT))
-            .padding([SPACE_XS, SPACE_S])
-            .on_press(on_edit)
-            .style(edit_button_style),
+        button(
+            iced::widget::row![
+                text(reasoning_level).size(FONT_SIZE_PANEL_SMALL),
+                text(char::from(lucide_icons::Icon::ChevronRight).to_string())
+                    .font(iced::Font::with_name("lucide"))
+                    .size(FONT_SIZE_PANEL_SMALL),
+            ]
+            .spacing(SPACE_XXS)
+            .align_y(iced::alignment::Vertical::Center),
+        )
+        .height(Length::Fixed(MENU_ROW_HEIGHT))
+        .padding([SPACE_XS, SPACE_S])
+        .on_press(on_edit)
+        .style(edit_button_style),
         container(check)
             .width(Length::Fixed(SPACE_L))
             .align_x(iced::alignment::Horizontal::Center),

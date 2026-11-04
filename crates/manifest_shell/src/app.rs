@@ -817,25 +817,41 @@ impl App {
         }
     }
 
-    /// Requests the model catalog for the selected session when the
-    /// catalog is still loading and no request is in flight. Called on
-    /// session-list loads: cold start has no host until a session (or a
-    /// draft workspace) names one, so a bare request would fail. The
-    /// single writer of [`App::models_pending`] beside the draft entry
-    /// point and the event arms.
+    /// Requests the model catalog for the selected session's
+    /// workspace while the catalog is unresolved and no request is in
+    /// flight. Called on session-list loads and session selects: the
+    /// workspace names the host, so listing models never resumes a
+    /// (usually orphaned) session, and a failed catalog re-requests
+    /// on the next list load or session select. The single writer of
+    /// [`App::models_pending`] beside the draft entry point and the
+    /// event arms.
     fn request_models_for_selection(&mut self) {
-        if !matches!(self.composer.catalog, composer::ModelCatalog::Loading)
+        if matches!(self.composer.catalog, composer::ModelCatalog::Ready(_))
             || self.models_pending
             || self.connection != Connection::Connected
         {
             return;
         }
-        let selected = self
+        let Some(workspace) = self
             .sessions
             .selected_summary()
-            .map(|summary| summary.id.clone());
-        if let (Some(session), Some(engine)) = (selected, &self.engine) {
-            engine.list_models(None, Some(session));
+            .map(|summary| summary.workspace.clone())
+        else {
+            return;
+        };
+        if workspace.is_empty() {
+            return;
+        }
+        // A failed catalog shows loading while the retry is in flight.
+        if matches!(
+            self.composer.catalog,
+            composer::ModelCatalog::Failed(_)
+        ) {
+            self.composer
+                .set_catalog(composer::ModelCatalog::Loading);
+        }
+        if let Some(engine) = &self.engine {
+            engine.list_models(Some(workspace), None);
             self.models_pending = true;
         }
     }
@@ -1799,6 +1815,8 @@ impl App {
                     // The sync above moved the visible transcript: the
                     // composer's catalog belongs to the new session.
                     self.request_skills_for_visible();
+                    // Navigation is a retry point for an unresolved catalog.
+                    self.request_models_for_selection();
                 }
                 self.refresh_send_gate();
                 if select {
@@ -2149,7 +2167,7 @@ impl App {
                             self.sync_composer_usage();
                             // Cold start names no host until a session is
                             // listed: request the catalog now, with the
-                            // selected session as its context.
+                            // selected session's workspace as its context.
                             self.request_models_for_selection();
                             // The skill catalog follows the visible
                             // session, which the sync above just set.
@@ -7362,13 +7380,13 @@ mod tests {
     }
 
     #[test]
-    fn sessions_loaded_requests_catalog_with_selected_session() {
+    fn sessions_loaded_requests_catalog_with_selected_workspace() {
         let (mut app, fake) = live_app();
         deliver_connected(&mut app);
         loaded(&mut app, &["s-1", "s-2"]);
         assert_eq!(
             *fake.models.lock().unwrap(),
-            vec![(None, Some(SessionId::new("s-1")))]
+            vec![(Some(String::from("/live/workspace")), None)]
         );
         assert!(app.models_pending);
         // A second load while the request is in flight sends no duplicate.
@@ -7413,6 +7431,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_catalog_retries_on_next_sessions_loaded() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        assert!(app.models_pending);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Models,
+                message: String::from("models down"),
+            }),
+        );
+        assert!(!app.models_pending);
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Failed(_)
+        ));
+        // The next list load retries with the selected workspace, and
+        // the menu shows loading while the retry is in flight.
+        loaded(&mut app, &["s-1"]);
+        assert!(app.models_pending);
+        assert_eq!(fake.models.lock().unwrap().len(), 2);
+        assert_eq!(app.composer.catalog, composer::ModelCatalog::Loading);
+        deliver(&mut app, models_event());
+        assert!(!app.models_pending);
+        assert!(matches!(
+            app.composer.catalog,
+            composer::ModelCatalog::Ready(_)
+        ));
+    }
+
+    #[test]
     fn failed_connection_clears_pending_catalog_request() {
         let (mut app, _) = live_app();
         deliver_connected(&mut app);
@@ -7432,10 +7482,10 @@ mod tests {
         let (mut app, fake) = live_app();
         deliver_connected(&mut app);
         loaded_with_workspace(&mut app);
-        // The list load requested with the selected session.
+        // The list load requested with the selected workspace.
         assert_eq!(
             *fake.models.lock().unwrap(),
-            vec![(None, Some(SessionId::new("s-1")))]
+            vec![(Some(String::from("/live/workspace")), None)]
         );
         // The request fails, so the catalog stays unresolved.
         deliver(
@@ -7455,7 +7505,7 @@ mod tests {
         assert_eq!(
             *fake.models.lock().unwrap(),
             vec![
-                (None, Some(SessionId::new("s-1"))),
+                (Some(String::from("/live/workspace")), None),
                 (Some(String::from("/live/workspace")), None),
             ]
         );
