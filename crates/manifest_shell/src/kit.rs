@@ -14,7 +14,7 @@
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Rectangle, Theme};
-use manifest_domain::TodoStatus;
+use manifest_domain::{GoalStatus, TodoStatus};
 
 use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
@@ -22,7 +22,7 @@ use crate::theme::{
     CONTEXT_RING_SIZE, CONTEXT_RING_STROKE, DANGER, DIVIDER_HIT_WIDTH, FONT_SIZE_BODY,
     FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, ICON_SIZE,
     MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
-    SPACE_XS, SPACE_XXS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
+    SPACE_XS, SPACE_XXS, SUCCESS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
     TEXT_TERTIARY,
 };
 
@@ -209,11 +209,15 @@ pub(crate) fn ring_fraction(percent: Option<f32>) -> Option<f32> {
     percent.map(|p| (p / 100.0).clamp(0.0, 1.0))
 }
 
-/// The canvas program behind [`context_ring`]: a faint track circle
-/// plus an accent progress arc starting at the top.
+/// The canvas program behind [`context_ring`] and the goal ring: a
+/// faint track circle plus a progress arc starting at the top. The arc
+/// color is a parameter now, so the goal ring can reuse this drawing
+/// with its own tone while the context ring keeps the accent.
 #[derive(Debug, Clone, Copy)]
 struct ContextRingProgram {
     fraction: Option<f32>,
+    /// Arc color: the accent for context, the goal tone for goals.
+    color: Color,
 }
 
 impl<Message> iced::widget::canvas::Program<Message> for ContextRingProgram {
@@ -253,7 +257,7 @@ impl<Message> iced::widget::canvas::Program<Message> for ContextRingProgram {
                 Stroke::default()
                     .with_width(CONTEXT_RING_STROKE)
                     .with_line_cap(iced::widget::canvas::LineCap::Round)
-                    .with_color(ACCENT_BASE),
+                    .with_color(self.color),
             );
         }
         vec![frame.into_geometry()]
@@ -271,10 +275,101 @@ pub(crate) fn context_ring<'a, Message: Clone + 'a>(
     use iced::widget::canvas::Canvas;
     let ring = Canvas::new(ContextRingProgram {
         fraction: ring_fraction(percent),
+        color: ACCENT_BASE,
     })
     .width(Length::Fixed(CONTEXT_RING_SIZE))
     .height(Length::Fixed(CONTEXT_RING_SIZE));
     button(ring)
+        .padding(SPACE_XS)
+        .on_press_maybe(on_press)
+        .style(ghost_style)
+        .into()
+}
+
+/// Pure data behind the goal ring: the centered glyph plus the arc
+/// and glyph colors for a goal status. Non-completed goals carry a
+/// target at center (active goals sweep the accent arc under it);
+/// paused goals freeze the sent percent under a faint arc and a
+/// tertiary target, so the paused distinction is tones only;
+/// completed goals read full and green with a check; anything else
+/// reads like an active goal. Kept as data (not widgets) so the
+/// mapping is unit-testable.
+pub(crate) fn goal_ring_presentation(status: &GoalStatus) -> (lucide_icons::Icon, Color, Color) {
+    match status {
+        GoalStatus::Completed => (
+            lucide_icons::Icon::CircleCheck,
+            SUCCESS,
+            SUCCESS,
+        ),
+        GoalStatus::Paused => (
+            lucide_icons::Icon::Target,
+            TEXT_FAINT,
+            TEXT_TERTIARY,
+        ),
+        GoalStatus::Active | GoalStatus::Other(_) => {
+            (lucide_icons::Icon::Target, ACCENT_BASE, TEXT_SECONDARY)
+        }
+    }
+}
+
+/// The goal ring drawing without its button: the track circle plus
+/// the status-toned arc from [`ContextRingProgram`], with the status
+/// glyph centered on top. Button-less so the sub-bar chip and the
+/// popover readout can each wrap it in their own single press target
+/// instead of nesting buttons.
+pub(crate) fn goal_ring_content<'a, Message: 'a>(
+    percent: f32,
+    status: &GoalStatus,
+    size: f32,
+) -> Element<'a, Message> {
+    use iced::widget::canvas::Canvas;
+    let (glyph, arc, glyph_color) = goal_ring_presentation(status);
+    let ring = Canvas::new(ContextRingProgram {
+        fraction: ring_fraction(Some(percent)),
+        color: arc,
+    })
+    .width(Length::Fixed(size))
+    .height(Length::Fixed(size));
+    let badge = container(icon(glyph, size * 0.55, glyph_color))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center);
+    iced::widget::Stack::new()
+        .push(ring)
+        .push(badge)
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .into()
+}
+
+/// A compact goal pill for the composer's sub-bar: one ghost-style
+/// button (the same [`ghost_style`] treatment as [`context_ring`]
+/// and the sub-bar pills, so hover and press read alike) whose
+/// content is the button-less [`goal_ring_content`] drawing beside
+/// the precomputed percent label. The whole pill — ring, percent,
+/// and background — is a single click target emitting the press
+/// message, so clicking anywhere on it opens the goal popover. The
+/// ring stays button-less inside: a button in a button is illegal,
+/// so the shared drawing is composed directly into the content row.
+/// A paused percent reads tertiary; every other status reads
+/// secondary.
+pub(crate) fn goal_chip<'a, Message: Clone + 'a>(
+    percent: f32,
+    percent_label: &'a str,
+    status: &GoalStatus,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let paused = matches!(status, GoalStatus::Paused);
+    let content = iced::widget::row![
+        goal_ring_content(percent, status, CONTEXT_RING_SIZE),
+        text(percent_label)
+            .size(FONT_SIZE_PANEL)
+            .color(if paused { TEXT_TERTIARY } else { TEXT_SECONDARY }),
+    ]
+    .spacing(SPACE_XXS)
+    .align_y(iced::alignment::Vertical::Center);
+    button(content)
         .padding(SPACE_XS)
         .on_press_maybe(on_press)
         .style(ghost_style)
@@ -1735,6 +1830,30 @@ mod tests {
         assert_eq!(super::ring_fraction(Some(100.0)), Some(1.0));
         assert_eq!(super::ring_fraction(Some(140.0)), Some(1.0));
         assert_eq!(super::ring_fraction(Some(-5.0)), Some(0.0));
+    }
+
+    #[test]
+    fn goal_ring_presentation_tones_each_status() {
+        use manifest_domain::GoalStatus;
+        let (icon, arc, glyph) = super::goal_ring_presentation(&GoalStatus::Active);
+        assert!(matches!(icon, lucide_icons::Icon::Target));
+        assert_eq!(arc, crate::theme::ACCENT_BASE);
+        assert_eq!(glyph, crate::theme::TEXT_SECONDARY);
+        let (icon, arc, glyph) = super::goal_ring_presentation(&GoalStatus::Paused);
+        assert!(matches!(icon, lucide_icons::Icon::Target));
+        assert_eq!(arc, crate::theme::TEXT_FAINT);
+        assert_eq!(glyph, crate::theme::TEXT_TERTIARY);
+        let (icon, arc, glyph) = super::goal_ring_presentation(&GoalStatus::Completed);
+        assert!(matches!(icon, lucide_icons::Icon::CircleCheck));
+        assert_eq!(arc, crate::theme::SUCCESS);
+        assert_eq!(glyph, crate::theme::SUCCESS);
+        let (icon, arc, glyph) =
+            super::goal_ring_presentation(&GoalStatus::Other(String::from("Reviewing")));
+        assert!(matches!(icon, lucide_icons::Icon::Target));
+        assert_eq!(arc, crate::theme::ACCENT_BASE);
+        assert_eq!(glyph, crate::theme::TEXT_SECONDARY);
+        let (icon, _, _) = super::goal_ring_presentation(&GoalStatus::Other(String::new()));
+        assert!(matches!(icon, lucide_icons::Icon::Target));
     }
 
     #[test]
