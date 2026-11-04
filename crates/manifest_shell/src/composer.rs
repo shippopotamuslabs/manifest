@@ -20,8 +20,9 @@ use crate::kit::{self, IconButtonKind};
 use crate::theme::{
     ATTACH_POPUP_WIDTH, COMPOSER_MAX_LINES, CONTEXT_POPUP_WIDTH, EFFORT_POPUP_WIDTH,
     FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, GOAL_POPUP_RING_SIZE, GOAL_POPUP_WIDTH,
-    MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH, PERMISSION_POPUP_WIDTH,
-    SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, SUCCESS, TEXT_FAINT, TEXT_SECONDARY, TEXT_TERTIARY,
+    GOAL_POPUP_WIDTH_EXPANDED, MENU_ROW_HEIGHT, MODEL_LIST_MAX_HEIGHT, MODEL_POPUP_WIDTH,
+    PERMISSION_POPUP_WIDTH, SLASH_POPUP_WIDTH, SPACE_S, SPACE_XS, SUCCESS, TEXT_FAINT,
+    TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The attach popup has two real situations, so it is an enum, not a
@@ -71,15 +72,32 @@ pub enum ContextPopover {
     Open,
 }
 
-/// The goal popover has two real situations, so it is an enum, not
+/// A goal draft preserved across a dirty click-away close: the
+/// text, so reopening Edit restores it. The editor is always
+/// expanded, so no width travels with the park.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedGoalEdit {
+    /// Unsent objective text at close time.
+    pub draft: String,
+}
+
+/// The goal popover has four real situations, so it is an enum, not
 /// a bool (UI contract §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GoalPopover {
     /// No goal popover is showing.
     #[default]
     Closed,
-    /// The goal-detail popover is showing.
+    /// The goal-detail card is showing.
     Open,
+    /// The inline objective editor is showing, carrying its draft.
+    /// The editor always fills the expanded card.
+    Editing {
+        /// Unsent objective text, mirrored from the editor content.
+        draft: String,
+    },
+    /// The inline clear confirmation is showing.
+    ConfirmingClear,
 }
 
 /// The model catalog has three real situations, so it is an enum, not
@@ -163,6 +181,56 @@ pub struct GoalDisplay {
     pub current_work: Option<String>,
     /// Lifecycle situation; picks the chip's icon and tones.
     pub status: GoalStatus,
+}
+
+/// Which lifecycle controls the goal card shows for one status.
+/// Pure data behind the card buttons, so the gating is
+/// unit-testable without constructing widgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GoalActions {
+    /// Whether the Pause button shows.
+    pub pause: bool,
+    /// Whether the Resume button shows.
+    pub resume: bool,
+    /// Whether the Edit button shows.
+    pub edit: bool,
+    /// Whether the Clear button shows.
+    pub clear: bool,
+}
+
+/// Lifecycle controls for one goal status: an active goal pauses,
+/// edits, and clears; a paused goal resumes, edits, and clears; a
+/// completed goal shows none (clear-on-completed is uncontracted on
+/// the host, so the card offers no lifecycle there); any other
+/// status edits and clears only, never pausing or resuming an
+/// unknown lifecycle.
+pub(crate) fn goal_actions(status: &GoalStatus) -> GoalActions {
+    match status {
+        GoalStatus::Active => GoalActions {
+            pause: true,
+            resume: false,
+            edit: true,
+            clear: true,
+        },
+        GoalStatus::Paused => GoalActions {
+            pause: false,
+            resume: true,
+            edit: true,
+            clear: true,
+        },
+        GoalStatus::Completed => GoalActions {
+            pause: false,
+            resume: false,
+            edit: false,
+            clear: false,
+        },
+        GoalStatus::Other(_) => GoalActions {
+            pause: false,
+            resume: false,
+            edit: true,
+            clear: true,
+        },
+    }
 }
 
 impl GoalDisplay {
@@ -255,6 +323,31 @@ pub enum Message {
     GoalPressed,
     /// A press landed outside the floating goal popup; closes it.
     GoalDismissed,
+    /// The Pause button was pressed; the App pauses the goal. No
+    /// confirm: pausing reverses through Resume.
+    GoalPausePressed,
+    /// The Resume button was pressed; the App resumes the goal.
+    GoalResumePressed,
+    /// The Edit button was pressed; opens the inline editor
+    /// prefilled with the shown objective, or with the preserved
+    /// draft when a dirty close parked one.
+    GoalEditPressed,
+    /// The inline editor performed an editing action; folds into the
+    /// editor content and mirrors its text into the draft.
+    GoalEditAction(text_editor::Action),
+    /// The editor Save was pressed; the App sends the draft when it
+    /// is non-empty-after-trim. Empty-after-trim is a no-op: Save
+    /// renders disabled there.
+    GoalEditSave,
+    /// The editor Cancel was pressed; returns to the card and drops
+    /// any preserved draft.
+    GoalEditCancel,
+    /// The Clear button was pressed; opens the inline confirm.
+    GoalClearPressed,
+    /// The inline clear confirm was pressed; the App clears the goal.
+    GoalClearConfirm,
+    /// The inline clear cancel was pressed; returns to the card.
+    GoalClearCancel,
     /// The selection moved down one slash row (wraps); no-op while
     /// the menu is closed or has no rows.
     SlashNext,
@@ -304,8 +397,21 @@ pub struct State {
     pub model_menu: ModelMenu,
     /// Whether the context popover is showing.
     pub context_popover: ContextPopover,
-    /// Whether the goal popover is showing.
+    /// Which goal popover situation holds: the card, the inline
+    /// editor, or the inline clear confirm.
     pub goal_popover: GoalPopover,
+    /// The inline editor's live content, mirrored into the
+    /// [`GoalPopover::Editing`] draft on every action. The view reads
+    /// this (never a per-frame rebuild), so the caret and scroll
+    /// survive rebuilds; `update` is its single writer. Meaningful
+    /// only while editing.
+    pub goal_editor: text_editor::Content,
+    /// A dirty draft parked by a click-away close instead of being
+    /// discarded. Reopening Edit restores it; an explicit Cancel or
+    /// Save, a clean close, or a cleared or replaced goal drops it.
+    /// Chat sends ([`State::clear`]) never touch the goal, so they
+    /// keep it.
+    pub preserved_goal_edit: Option<PreservedGoalEdit>,
     /// The posture new sessions spawn with.
     pub permission: PermissionMode,
     /// The model new sessions spawn with.
@@ -337,6 +443,11 @@ pub struct State {
     /// per-session goal store, so the view reads without formatting
     /// (UI contract §2).
     pub goal_display: Option<GoalDisplay>,
+    /// Whether the visible session has a goal resume queued behind
+    /// its in-flight turn. Written by the App alongside the goal
+    /// display, so the card reads queued only for the session that
+    /// queued it. The view reads this without formatting.
+    pub goal_resume_queued: bool,
     /// Precomputed "model · effort" pill text.
     pub model_effort_label: String,
     /// Precomputed meter fill in percent, when the window is known.
@@ -362,6 +473,8 @@ impl State {
             model_menu: ModelMenu::Closed,
             context_popover: ContextPopover::Closed,
             goal_popover: GoalPopover::Closed,
+            goal_editor: text_editor::Content::new(),
+            preserved_goal_edit: None,
             permission: PermissionMode::default(),
             model: ModelChoice::default(),
             effort: EffortChoice::default(),
@@ -373,6 +486,7 @@ impl State {
             attachments: Vec::new(),
             usage: None,
             goal_display: None,
+            goal_resume_queued: false,
             model_effort_label: String::new(),
             context_percent: None,
         };
@@ -399,6 +513,7 @@ impl State {
         self.model_menu = ModelMenu::Closed;
         self.context_popover = ContextPopover::Closed;
         self.goal_popover = GoalPopover::Closed;
+        self.goal_editor = text_editor::Content::new();
         self.close_slash();
         self.refresh_derived();
     }
@@ -571,20 +686,99 @@ impl State {
                 self.context_popover = ContextPopover::Closed;
             }
             Message::GoalPressed => {
-                self.goal_popover = match self.goal_popover {
-                    GoalPopover::Closed => {
-                        self.permission_menu = PermissionMenu::Closed;
-                        self.model_menu = ModelMenu::Closed;
-                        self.context_popover = ContextPopover::Closed;
-                        self.attach_popup = AttachPopup::Closed;
-                        self.close_slash();
-                        GoalPopover::Open
-                    }
-                    GoalPopover::Open => GoalPopover::Closed,
-                };
+                // A dirty editor parks its draft instead of
+                // discarding it; every other situation toggles.
+                if matches!(self.goal_popover, GoalPopover::Editing { .. }) {
+                    self.preserve_goal_draft();
+                    self.goal_popover = GoalPopover::Closed;
+                } else {
+                    self.goal_popover = match self.goal_popover {
+                        GoalPopover::Closed => {
+                            self.permission_menu = PermissionMenu::Closed;
+                            self.model_menu = ModelMenu::Closed;
+                            self.context_popover = ContextPopover::Closed;
+                            self.attach_popup = AttachPopup::Closed;
+                            self.close_slash();
+                            GoalPopover::Open
+                        }
+                        GoalPopover::Open | GoalPopover::ConfirmingClear => GoalPopover::Closed,
+                        // Handled above.
+                        GoalPopover::Editing { .. } => GoalPopover::Closed,
+                    };
+                }
             }
             Message::GoalDismissed => {
+                // Click-away never silently discards a dirty draft.
+                self.preserve_goal_draft();
                 self.goal_popover = GoalPopover::Closed;
+            }
+            Message::GoalPausePressed | Message::GoalResumePressed => {
+                // The App dispatches the engine call from its own
+                // message arm; the popover stays on the card until
+                // the new goal streams in as `GoalChanged`.
+            }
+            Message::GoalEditPressed => {
+                if !self
+                    .goal_display
+                    .as_ref()
+                    .is_some_and(|display| goal_actions(&display.status).edit)
+                {
+                    return;
+                }
+                // A parked dirty draft wins over the display: the
+                // click-away close promised no silent loss.
+                if let Some(preserved) = self.preserved_goal_edit.take() {
+                    self.goal_editor = text_editor::Content::with_text(&preserved.draft);
+                    self.goal_popover = GoalPopover::Editing {
+                        draft: preserved.draft,
+                    };
+                } else if let Some(objective) = self
+                    .goal_display
+                    .as_ref()
+                    .map(|display| display.objective.clone())
+                {
+                    self.goal_editor = text_editor::Content::with_text(&objective);
+                    self.goal_popover = GoalPopover::Editing { draft: objective };
+                }
+            }
+            Message::GoalEditAction(action) => {
+                if matches!(self.goal_popover, GoalPopover::Editing { .. }) {
+                    self.goal_editor.perform(action);
+                    if let GoalPopover::Editing { draft, .. } = &mut self.goal_popover {
+                        *draft = self.goal_editor.text();
+                    }
+                }
+            }
+            Message::GoalEditSave => {
+                if let GoalPopover::Editing { draft, .. } = &self.goal_popover
+                    && !draft.trim().is_empty()
+                {
+                    self.goal_popover = GoalPopover::Open;
+                    self.preserved_goal_edit = None;
+                }
+            }
+            Message::GoalEditCancel => {
+                if matches!(self.goal_popover, GoalPopover::Editing { .. }) {
+                    self.goal_popover = GoalPopover::Open;
+                    self.preserved_goal_edit = None;
+                }
+            }
+            Message::GoalClearPressed => {
+                if let Some(display) = self.goal_display.as_ref()
+                    && goal_actions(&display.status).clear
+                {
+                    self.goal_popover = GoalPopover::ConfirmingClear;
+                }
+            }
+            Message::GoalClearConfirm => {
+                if matches!(self.goal_popover, GoalPopover::ConfirmingClear) {
+                    self.goal_popover = GoalPopover::Open;
+                }
+            }
+            Message::GoalClearCancel => {
+                if matches!(self.goal_popover, GoalPopover::ConfirmingClear) {
+                    self.goal_popover = GoalPopover::Open;
+                }
             }
             Message::SlashNext => {
                 if let SlashMenu::Open { selected } = &mut self.slash_menu
@@ -752,14 +946,73 @@ impl State {
         self.refresh_derived();
     }
 
+    /// Whether an inline draft differs from the shown objective:
+    /// only a dirty draft is worth preserving across a click-away
+    /// close. A clean editor closes normally.
+    fn is_goal_draft_dirty(&self, draft: &str) -> bool {
+        self.goal_display
+            .as_ref()
+            .is_some_and(|display| display.objective != draft)
+    }
+
+    /// Parks a dirty inline draft instead of discarding it: when the
+    /// editor holds text that differs from the shown objective, the
+    /// draft moves to [`State::preserved_goal_edit`]; a clean editor
+    /// parks nothing and drops any stale park. A no-op outside the
+    /// editor. The popover close itself stays with the caller.
+    fn preserve_goal_draft(&mut self) {
+        let preserved = match &self.goal_popover {
+            GoalPopover::Editing { draft } if self.is_goal_draft_dirty(draft) => {
+                Some(PreservedGoalEdit {
+                    draft: draft.clone(),
+                })
+            }
+            GoalPopover::Editing { .. } => None,
+            _ => return,
+        };
+        self.preserved_goal_edit = preserved;
+    }
+
     /// Replaces the visible session's goal display: `Some` precomputes
-    /// the chip values, `None` hides the chip and closes the popover.
-    /// Called by the App from its per-session goal store, so the view
-    /// reads without formatting (UI contract §2).
+    /// the chip values, `None` hides the chip, closes the popover,
+    /// and drops any preserved draft. Called by the App from its
+    /// per-session goal store, so the view reads without formatting
+    /// (UI contract §2). A preserved draft belongs to the shown
+    /// objective: a clear or a changed objective (session switch,
+    /// host edit) drops it as stale, while a same-objective refresh
+    /// (progress) keeps it. A live edit is never clobbered — only
+    /// its display refreshes.
     pub fn set_goal(&mut self, goal: Option<&GoalInfo>) {
-        self.goal_display = goal.map(GoalDisplay::from_goal);
+        let incoming = goal.map(GoalDisplay::from_goal);
+        let stale = match (&self.goal_display, &incoming) {
+            (Some(old), Some(new)) => old.objective != new.objective,
+            // A clear, or a goal arriving with no display to anchor
+            // a park to, leaves no draft worth keeping.
+            _ => true,
+        };
+        if stale {
+            self.preserved_goal_edit = None;
+        }
+        self.goal_display = incoming;
         if self.goal_display.is_none() {
             self.goal_popover = GoalPopover::Closed;
+        }
+    }
+
+    /// Records whether the visible session has a goal resume
+    /// queued behind its in-flight turn. Written by the App from its
+    /// per-session queue alongside [`State::set_goal`], so the card
+    /// reads queued only for the session that queued it.
+    pub fn set_goal_resume_queued(&mut self, queued: bool) {
+        self.goal_resume_queued = queued;
+    }
+
+    /// The inline editor draft, when the popover is editing. The App
+    /// reads this to send the save; empty-after-trim never sends.
+    pub fn goal_edit_draft(&self) -> Option<&str> {
+        match &self.goal_popover {
+            GoalPopover::Editing { draft, .. } => Some(draft.as_str()),
+            _ => None,
         }
     }
 
@@ -1156,11 +1409,14 @@ impl State {
     }
 
     /// The goal popover: the larger ring readout beside the percent
-    /// and status labels, the full objective wrapped over lines, and
-    /// the current-work line when the host reported one. Display
-    /// only: no pause, clear, or edit controls, and no linear meter.
-    /// A paused goal reads in tertiary tones with the sent percent
-    /// frozen; a completed goal reads green at full percent.
+    /// and status labels, the full objective wrapped over lines, the
+    /// current-work line when the host reported one, and the
+    /// lifecycle controls the status allows (pause or resume, edit,
+    /// clear). Edit folds out an always-expanded inline multi-line
+    /// editor with Save and Cancel; Clear folds out an inline
+    /// two-step confirm. No linear meter. A paused goal reads in
+    /// tertiary tones with the sent percent frozen; a completed goal
+    /// reads green at full percent and offers no controls.
     fn goal_popover_view(&self) -> Element<'_, Message> {
         let mut popover = iced::widget::column![].spacing(SPACE_XS);
         match &self.goal_display {
@@ -1213,9 +1469,127 @@ impl State {
                             .wrapping(iced::widget::text::Wrapping::Word),
                     );
                 }
+                match &self.goal_popover {
+                    GoalPopover::Open => popover = popover.push(self.goal_action_row(display)),
+                    GoalPopover::Editing { draft } => {
+                        popover = popover.push(kit::goal_editor(
+                            &self.goal_editor,
+                            Message::GoalEditAction,
+                            Box::new(goal_key_binding),
+                        ));
+                        popover = popover.push(
+                            iced::widget::container(Self::goal_edit_row(draft))
+                                .padding(iced::Padding::new(0.0).top(SPACE_S)),
+                        );
+                    }
+                    GoalPopover::ConfirmingClear => {
+                        popover = popover.push(
+                            iced::widget::text(
+                                "Clear this goal? The chip hides once the host confirms.",
+                            )
+                            .size(crate::theme::FONT_SIZE_SMALL)
+                            .color(TEXT_TERTIARY)
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::Word),
+                        );
+                        popover = popover.push(
+                            iced::widget::row![
+                                kit::pill_button(
+                                    "Confirm clear",
+                                    kit::ButtonKind::Danger,
+                                    Some(Message::GoalClearConfirm),
+                                ),
+                                kit::pill_button(
+                                    "Cancel",
+                                    kit::ButtonKind::Ghost,
+                                    Some(Message::GoalClearCancel),
+                                ),
+                            ]
+                            .spacing(SPACE_XS),
+                        );
+                    }
+                    // The overlay never renders while closed.
+                    GoalPopover::Closed => {}
+                }
             }
         }
-        kit::popup_card(popover.width(Length::Fill), GOAL_POPUP_WIDTH)
+        kit::popup_card(
+            popover.width(Length::Fill),
+            goal_popover_width(&self.goal_popover),
+        )
+    }
+
+    /// The lifecycle button row for one goal card: Pause or Resume,
+    /// Edit, and Clear, each only when [`goal_actions`] allows it. A
+    /// completed goal renders no row at all. A queued resume reads as
+    /// a disabled "Resume queued" pill, so the press visibly waits
+    /// behind the in-flight turn.
+    fn goal_action_row(&self, display: &GoalDisplay) -> Element<'_, Message> {
+        let actions = goal_actions(&display.status);
+        let mut row = iced::widget::row![].spacing(SPACE_XS);
+        if actions.pause {
+            row = row.push(kit::pill_button(
+                "Pause",
+                kit::ButtonKind::Ghost,
+                Some(Message::GoalPausePressed),
+            ));
+        }
+        if actions.resume {
+            if self.goal_resume_queued {
+                row = row.push(kit::pill_button(
+                    "Resume queued",
+                    kit::ButtonKind::Ghost,
+                    None,
+                ));
+            } else {
+                row = row.push(kit::pill_button(
+                    "Resume",
+                    kit::ButtonKind::Ghost,
+                    Some(Message::GoalResumePressed),
+                ));
+            }
+        }
+        if actions.edit {
+            row = row.push(kit::pill_button(
+                "Edit",
+                kit::ButtonKind::Ghost,
+                Some(Message::GoalEditPressed),
+            ));
+        }
+        if actions.clear {
+            row = row.push(kit::pill_button(
+                "Clear",
+                kit::ButtonKind::DangerGhost,
+                Some(Message::GoalClearPressed),
+            ));
+        }
+        row.into()
+    }
+
+    /// The editor Save/Cancel row for one draft: Save renders
+    /// disabled while the draft is empty-after-trim, so an empty
+    /// objective can never send.
+    fn goal_edit_row(draft: &str) -> Element<'_, Message> {
+        let save = if draft.trim().is_empty() {
+            kit::pill_button("Save", kit::ButtonKind::Primary, None)
+        } else {
+            kit::pill_button(
+                "Save",
+                kit::ButtonKind::Primary,
+                Some(Message::GoalEditSave),
+            )
+        };
+        iced::widget::row![
+            save,
+            kit::pill_button(
+                "Cancel",
+                kit::ButtonKind::Ghost,
+                Some(Message::GoalEditCancel),
+            ),
+        ]
+        .spacing(SPACE_XS)
+        .align_y(iced::alignment::Vertical::Center)
+        .into()
     }
 
     /// The slash menu: one row per precomputed visible row, newest
@@ -1320,6 +1694,36 @@ fn popup_list_height(row_count: usize) -> f32 {
     let rows = row_count.max(1);
     let spacing = (rows - 1) as f32 * SPACE_XS;
     (rows as f32 * MENU_ROW_HEIGHT + spacing).min(MODEL_LIST_MAX_HEIGHT)
+}
+
+/// Width of the goal popup card for one popover situation: the
+/// editor always fills the expanded near-composer-width card, so
+/// long objectives edit at full width; every other situation rests
+/// at the card width. Pure so the always-expanded contract is
+/// unit-testable without rendering.
+fn goal_popover_width(popover: &GoalPopover) -> f32 {
+    match popover {
+        GoalPopover::Editing { .. } => GOAL_POPUP_WIDTH_EXPANDED,
+        _ => GOAL_POPUP_WIDTH,
+    }
+}
+
+/// The goal editor key binding: Enter stays the editor default (a
+/// newline); Cmd/Ctrl+Enter saves through the existing
+/// [`Message::GoalEditSave`] path; Esc cancels back to the card
+/// through [`Message::GoalEditCancel`]. Every other key falls back
+/// to the editor defaults. `command()` is the platform-aware command
+/// key (Cmd on macOS, Ctrl elsewhere); the explicit `control()` also
+/// covers Ctrl+Enter on macOS.
+fn goal_key_binding(press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, key::Named};
+    match &press.key {
+        Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::GoalEditCancel)),
+        Key::Named(Named::Enter) if press.modifiers.command() || press.modifiers.control() => {
+            Some(text_editor::Binding::Custom(Message::GoalEditSave))
+        }
+        _ => text_editor::Binding::from_key_press(press),
+    }
 }
 
 /// Selectors highlighted as a leading token before any catalog
@@ -1652,6 +2056,26 @@ mod tests {
         }
     }
 
+    /// Replaces the goal editor text through edit actions (select
+    /// all, then paste), so the mirrored draft and the editor content
+    /// stay in sync exactly as live typing keeps them.
+    fn set_goal_text(state: &mut State, text: &str) {
+        state.update(Message::GoalEditAction(text_editor::Action::SelectAll));
+        state.update(Message::GoalEditAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new(text.to_string())),
+        )));
+    }
+
+    /// Opens the goal editor for one active goal, prefilled from its
+    /// objective.
+    fn editing_goal(objective: &str) -> State {
+        let mut got = State::new();
+        got.set_goal(Some(&goal(objective, 42.0, GoalStatus::Active)));
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        got
+    }
+
     #[test]
     fn default_matches_new() {
         let got = State::default();
@@ -1976,6 +2400,17 @@ mod tests {
             modifiers: iced::keyboard::Modifiers::empty(),
             text: None,
             status: text_editor::Status::Focused { is_hovered: true },
+        }
+    }
+
+    /// One key press for `named` with `modifiers` held.
+    fn modified_key_press(
+        named: iced::keyboard::key::Named,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            modifiers,
+            ..key_press(named)
         }
     }
 
@@ -2426,6 +2861,373 @@ mod tests {
         got.update(Message::GoalPressed);
         assert_eq!(got.goal_popover, GoalPopover::Open);
         assert_eq!(got.context_popover, ContextPopover::Closed);
+    }
+
+    #[test]
+    fn goal_actions_gate_each_status() {
+        let active = goal_actions(&GoalStatus::Active);
+        assert!(active.pause && !active.resume && active.edit && active.clear);
+        let paused = goal_actions(&GoalStatus::Paused);
+        assert!(!paused.pause && paused.resume && paused.edit && paused.clear);
+        let completed = goal_actions(&GoalStatus::Completed);
+        assert!(
+            !completed.pause && !completed.resume && !completed.edit && !completed.clear,
+            "completed offers no lifecycle: clear-on-completed is uncontracted"
+        );
+        let other = goal_actions(&GoalStatus::Other(String::from("reviewing")));
+        assert!(!other.pause && !other.resume && other.edit && other.clear);
+    }
+
+    #[test]
+    fn goal_pause_and_resume_presses_keep_the_card() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Active)));
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalPausePressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert!(got.goal_display.is_some());
+        got.update(Message::GoalResumePressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+    }
+
+    #[test]
+    fn goal_edit_flow_prefills_saves_and_cancels() {
+        let mut got = editing_goal("Ship the slice");
+        assert_eq!(
+            got.goal_popover,
+            GoalPopover::Editing {
+                draft: String::from("Ship the slice"),
+            }
+        );
+        assert_eq!(got.goal_edit_draft(), Some("Ship the slice"));
+        // The editor content and the mirrored draft agree.
+        assert_eq!(got.goal_editor.text(), "Ship the slice");
+        set_goal_text(&mut got, "Ship it all");
+        assert_eq!(got.goal_edit_draft(), Some("Ship it all"));
+        assert_eq!(got.goal_editor.text(), "Ship it all");
+        got.update(Message::GoalEditSave);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert!(got.goal_edit_draft().is_none());
+        // Cancel returns to the card with the display untouched.
+        got.update(Message::GoalEditPressed);
+        set_goal_text(&mut got, "abandoned");
+        got.update(Message::GoalEditCancel);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert_eq!(
+            got.goal_display.as_ref().expect("display kept").objective,
+            "Ship the slice"
+        );
+    }
+
+    #[test]
+    fn goal_edit_save_blocked_on_empty_after_trim() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "   ");
+        got.update(Message::GoalEditSave);
+        assert!(
+            matches!(got.goal_popover, GoalPopover::Editing { .. }),
+            "empty-after-trim save stays editing"
+        );
+        assert_eq!(
+            got.goal_display.as_ref().expect("display kept").objective,
+            "Ship it"
+        );
+    }
+
+    #[test]
+    fn goal_edit_reopens_prefilled_from_the_display() {
+        let mut got = editing_goal("First");
+        set_goal_text(&mut got, "abandoned");
+        got.update(Message::GoalEditCancel);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(
+            got.goal_popover,
+            GoalPopover::Editing {
+                draft: String::from("First"),
+            },
+            "reopening refills the draft from the display"
+        );
+    }
+
+    #[test]
+    fn goal_editing_keeps_a_multiline_draft_in_the_editor() {
+        let mut got = editing_goal("First line");
+        let draft = String::from("First line\nsecond line\nthird line");
+        set_goal_text(&mut got, draft.as_str());
+        assert_eq!(got.goal_edit_draft(), Some(draft.as_str()));
+        assert_eq!(got.goal_editor.text(), draft);
+    }
+
+    #[test]
+    fn goal_popover_width_is_expanded_while_editing() {
+        assert_eq!(goal_popover_width(&GoalPopover::Closed), GOAL_POPUP_WIDTH);
+        assert_eq!(goal_popover_width(&GoalPopover::Open), GOAL_POPUP_WIDTH);
+        assert_eq!(
+            goal_popover_width(&GoalPopover::Editing {
+                draft: String::from("x"),
+            }),
+            GOAL_POPUP_WIDTH_EXPANDED,
+            "editing always fills the expanded card: no toggle"
+        );
+        assert_eq!(
+            goal_popover_width(&GoalPopover::ConfirmingClear),
+            GOAL_POPUP_WIDTH
+        );
+        let editing = editing_goal("Ship it");
+        assert_eq!(
+            goal_popover_width(&editing.goal_popover),
+            GOAL_POPUP_WIDTH_EXPANDED
+        );
+    }
+
+    #[test]
+    fn goal_dirty_dismiss_preserves_draft_and_reopens_with_it() {
+        let mut got = editing_goal("Ship it");
+        let draft = String::from("Ship it all\nand more");
+        set_goal_text(&mut got, draft.as_str());
+        got.update(Message::GoalDismissed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        assert_eq!(
+            got.preserved_goal_edit,
+            Some(PreservedGoalEdit {
+                draft: draft.clone(),
+            })
+        );
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(
+            got.goal_popover,
+            GoalPopover::Editing {
+                draft: draft.clone(),
+            },
+            "reopening restores the parked draft, not the display"
+        );
+        assert_eq!(got.goal_editor.text(), draft);
+        assert!(got.preserved_goal_edit.is_none());
+    }
+
+    #[test]
+    fn goal_dirty_chip_press_preserves_draft() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "Ship it all");
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        assert_eq!(
+            got.preserved_goal_edit
+                .as_ref()
+                .map(|preserved| preserved.draft.as_str()),
+            Some("Ship it all"),
+            "chip-press never silently discards a dirty draft"
+        );
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("Ship it all"));
+    }
+
+    #[test]
+    fn goal_clean_dismiss_closes_without_preserving() {
+        // An untouched editor is clean.
+        let mut got = editing_goal("Ship it");
+        got.update(Message::GoalDismissed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        assert!(got.preserved_goal_edit.is_none());
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("Ship it"));
+        // So is one edited back to exactly the shown objective.
+        let mut rewritten = editing_goal("Ship it");
+        set_goal_text(&mut rewritten, "changed");
+        set_goal_text(&mut rewritten, "Ship it");
+        rewritten.update(Message::GoalDismissed);
+        assert_eq!(rewritten.goal_popover, GoalPopover::Closed);
+        assert!(rewritten.preserved_goal_edit.is_none());
+    }
+
+    #[test]
+    fn goal_cancel_drops_the_preserved_draft() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "abandoned");
+        got.update(Message::GoalDismissed);
+        assert!(got.preserved_goal_edit.is_some());
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("abandoned"));
+        // Cancel is an explicit discard: the next open prefills.
+        got.update(Message::GoalEditCancel);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert!(got.preserved_goal_edit.is_none());
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("Ship it"));
+    }
+
+    #[test]
+    fn goal_save_drops_the_preserved_draft() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "Ship it all");
+        got.update(Message::GoalDismissed);
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        got.update(Message::GoalEditSave);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert!(got.preserved_goal_edit.is_none());
+        assert_eq!(
+            got.goal_display.as_ref().expect("display kept").objective,
+            "Ship it",
+            "no optimistic update: the display waits for the host"
+        );
+    }
+
+    #[test]
+    fn goal_preserved_dropped_when_goal_clears() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "Ship it all");
+        got.update(Message::GoalDismissed);
+        assert!(got.preserved_goal_edit.is_some());
+        got.set_goal(None);
+        assert!(got.goal_display.is_none());
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
+        assert!(got.preserved_goal_edit.is_none());
+    }
+
+    #[test]
+    fn goal_preserved_survives_a_same_objective_refresh() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "Ship it all");
+        got.update(Message::GoalDismissed);
+        // A progress refresh names the same objective: the park stands.
+        got.set_goal(Some(&goal("Ship it", 80.0, GoalStatus::Active)));
+        assert!(got.preserved_goal_edit.is_some());
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("Ship it all"));
+    }
+
+    #[test]
+    fn goal_preserved_dropped_when_the_objective_changes() {
+        let mut got = editing_goal("Ship it");
+        set_goal_text(&mut got, "Ship it all");
+        got.update(Message::GoalDismissed);
+        // A new objective (session switch, host edit) stales the park.
+        got.set_goal(Some(&goal("Something else", 10.0, GoalStatus::Active)));
+        assert!(got.preserved_goal_edit.is_none());
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_edit_draft(), Some("Something else"));
+    }
+
+    #[test]
+    fn goal_editor_caps_height_without_clobbering_text() {
+        // The editor now sizes itself from its laid-out (wrapped)
+        // content instead of a reducer line count: hard breaks still
+        // land in the content, and a long draft survives intact.
+        let mut got = editing_goal("First");
+        let draft = ["line"; 40].join("\n");
+        set_goal_text(&mut got, draft.as_str());
+        assert_eq!(got.goal_edit_draft(), Some(draft.as_str()));
+        assert_eq!(got.goal_editor.text(), draft);
+        assert_eq!(
+            goal_popover_width(&got.goal_popover),
+            GOAL_POPUP_WIDTH_EXPANDED
+        );
+    }
+
+    #[test]
+    fn goal_keys_map_save_and_cancel_before_the_editor() {
+        use iced::keyboard::{Modifiers, key::Named};
+        // Esc cancels back to the card.
+        assert_eq!(
+            goal_key_binding(key_press(Named::Escape)),
+            Some(text_editor::Binding::Custom(Message::GoalEditCancel))
+        );
+        // Cmd/Ctrl+Enter saves through the existing save path.
+        assert_eq!(
+            goal_key_binding(modified_key_press(Named::Enter, Modifiers::CTRL)),
+            Some(text_editor::Binding::Custom(Message::GoalEditSave))
+        );
+        // A plain Enter keeps the editor default: it inserts a newline.
+        assert_eq!(
+            goal_key_binding(key_press(Named::Enter)),
+            text_editor::Binding::from_key_press(key_press(Named::Enter))
+        );
+        assert_ne!(
+            goal_key_binding(key_press(Named::Enter)),
+            Some(text_editor::Binding::Custom(Message::GoalEditSave))
+        );
+    }
+
+    #[test]
+    fn goal_clear_flow_confirms_and_cancels() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Active)));
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalClearPressed);
+        assert_eq!(got.goal_popover, GoalPopover::ConfirmingClear);
+        got.update(Message::GoalClearCancel);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalClearPressed);
+        got.update(Message::GoalClearConfirm);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        assert!(
+            got.goal_display.is_some(),
+            "display stays until GoalChanged clears it"
+        );
+    }
+
+    #[test]
+    fn goal_lifecycle_gated_on_completed() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Done", 100.0, GoalStatus::Completed)));
+        got.update(Message::GoalPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalEditPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalClearPressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+        got.update(Message::GoalPausePressed);
+        got.update(Message::GoalResumePressed);
+        assert_eq!(got.goal_popover, GoalPopover::Open);
+    }
+
+    #[test]
+    fn goal_lifecycle_gated_on_other_status() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal(
+            "Ship it",
+            10.0,
+            GoalStatus::Other(String::from("reviewing")),
+        )));
+        got.update(Message::GoalPressed);
+        got.update(Message::GoalEditPressed);
+        assert!(matches!(got.goal_popover, GoalPopover::Editing { .. }));
+        got.update(Message::GoalEditCancel);
+        got.update(Message::GoalClearPressed);
+        assert_eq!(got.goal_popover, GoalPopover::ConfirmingClear);
+        got.update(Message::GoalClearCancel);
+    }
+
+    #[test]
+    fn goal_chip_toggle_closes_from_every_situation() {
+        let mut got = State::new();
+        got.set_goal(Some(&goal("Ship it", 10.0, GoalStatus::Active)));
+        for open in [
+            GoalPopover::Open,
+            GoalPopover::Editing {
+                draft: String::from("x"),
+            },
+            GoalPopover::ConfirmingClear,
+        ] {
+            got.goal_popover = open;
+            got.update(Message::GoalPressed);
+            assert_eq!(got.goal_popover, GoalPopover::Closed);
+            got.update(Message::GoalPressed);
+            assert_eq!(got.goal_popover, GoalPopover::Open);
+        }
+        got.goal_popover = GoalPopover::Editing {
+            draft: String::from("x"),
+        };
+        got.update(Message::GoalDismissed);
+        assert_eq!(got.goal_popover, GoalPopover::Closed);
     }
 
     #[test]

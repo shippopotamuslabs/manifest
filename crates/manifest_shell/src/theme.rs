@@ -131,6 +131,18 @@ pub const CONTEXT_POPUP_WIDTH: f32 = 340.0;
 // the context card (CONTEXT_POPUP_WIDTH): it carries the goal ring
 // readout plus the full objective text.
 pub const GOAL_POPUP_WIDTH: f32 = 340.0;
+// Fixed width of the floating goal popup while its inline editor is
+// open. It follows the widest existing popup scale (POPUP_WIDTH,
+// PERMISSION_POPUP_WIDTH), so a long objective edits at near-composer
+// width. The editor is always expanded: editing fills this width,
+// and every other situation rests at GOAL_POPUP_WIDTH.
+pub const GOAL_POPUP_WIDTH_EXPANDED: f32 = 480.0;
+// Visible line cap of the goal inline editor: eight lines at the
+// composer line height plus its padding is exactly
+// MODEL_LIST_MAX_HEIGHT, so the editor follows the existing
+// popup-height pattern — it grows with content to this cap, then
+// scrolls internally.
+pub const GOAL_EDITOR_MAX_LINES: usize = 8;
 // Diameter of the goal ring readout inside the goal popup: larger
 // than the sub-bar rings (CONTEXT_RING_SIZE) so the percent sweep
 // and status glyph read at card scale.

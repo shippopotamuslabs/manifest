@@ -188,6 +188,34 @@ impl SessionEngine for MuseEngine {
             .send(WorkerMsg::Command(Command::SetGoal { session, objective }));
     }
 
+    fn pause_goal(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::PauseGoal { session }));
+    }
+
+    fn resume_goal(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::ResumeGoal { session }));
+    }
+
+    fn edit_goal(&self, session: SessionId, objective: String) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::EditGoal { session, objective }));
+    }
+
+    fn clear_goal(&self, session: SessionId) {
+        // A failed send means the worker is gone; the shell has moved on.
+        let _ = self
+            .worker_tx
+            .send(WorkerMsg::Command(Command::ClearGoal { session }));
+    }
+
     fn fetch_pending(&self) {
         let _ = self
             .worker_tx
