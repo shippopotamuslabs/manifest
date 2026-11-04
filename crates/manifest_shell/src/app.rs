@@ -278,6 +278,15 @@ pub struct App {
     /// Orphaned sessions with a resume in flight; gates duplicate
     /// resumes and the send button.
     pub resuming: HashSet<SessionId>,
+    /// Sessions with a goal resume queued behind an in-flight turn.
+    /// A Resume pressed while the session runs records here instead
+    /// of sending (the host would admit a mid-turn resume against the
+    /// busy turn and never wake a new one); `TurnCompleted` flushes
+    /// the entry with exactly one `resume_goal` send. Entries drop
+    /// unsent when they turn moot (goal cleared or un-paused, session
+    /// unlisted, connection lost). One entry per session: repeated
+    /// presses while queued stay idempotent.
+    pub queued_goal_resumes: HashSet<SessionId>,
     /// Sessions whose stored history was requested; kept once
     /// requested (even when the fetch returns empty) so a session
     /// never refetches in a loop. A history-tagged `CommandFailed`
@@ -395,6 +404,7 @@ impl App {
             awaiting_spawn: false,
             pending_spawn: None,
             resuming: HashSet::new(),
+            queued_goal_resumes: HashSet::new(),
             history_requested: HashSet::new(),
             spawned_sessions: HashSet::new(),
             new_session: None,
@@ -965,10 +975,16 @@ impl App {
     /// Points the composer's goal strip at the visible session's
     /// stored goal. Called after goal events and transcript syncs;
     /// the composer precomputes the strip strings, so the view reads
-    /// without formatting.
+    /// without formatting. Also syncs the queued-resume flag, so the
+    /// card reads queued only for the session that queued it.
     fn sync_composer_goal(&mut self) {
         let goal = self.visible_goal().cloned();
         self.composer.set_goal(goal.as_ref());
+        let queued = self
+            .visible_session
+            .as_ref()
+            .is_some_and(|session| self.queued_goal_resumes.contains(session));
+        self.composer.set_goal_resume_queued(queued);
     }
 
     /// Points the composer's usage meter at the visible session's
@@ -1439,6 +1455,101 @@ impl App {
         Task::none()
     }
 
+    /// Pauses the visible session's goal. Without a visible session
+    /// the transcript explains and nothing sends; otherwise the
+    /// engine pauses and the popover stays on the card until the new
+    /// goal streams in. No optimistic update: the display changes
+    /// only through [`StreamEvent::GoalChanged`](manifest_domain::StreamEvent::GoalChanged).
+    /// Failures arrive as `CommandFailed(Goal)` on the transcript
+    /// channel every command failure already uses.
+    fn dispatch_pause_goal(&mut self) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self.transcript.push_error(String::from(
+                "There is no visible session to pause a goal for yet.",
+            ));
+            return scroll_transcript_to_end(appended);
+        };
+        // Pause wins over a queued resume: a fresh pause means the
+        // goal is active again, so a pending resume is moot. The card
+        // only offers Pause on active goals while a queue needs a
+        // paused one, so this is normally unreachable.
+        if self.queued_goal_resumes.remove(&session) {
+            self.sync_composer_goal();
+        }
+        if let Some(engine) = self.engine.clone() {
+            engine.pause_goal(session);
+        }
+        Task::none()
+    }
+
+    /// Resumes the visible session's goal, mirroring
+    /// [`App::dispatch_pause_goal`]: no visible session explains on
+    /// the transcript. While the session's turn is in flight the
+    /// resume queues behind it (the host would admit a mid-turn
+    /// resume against the busy turn and never wake a new one) and
+    /// flushes on `TurnCompleted`; otherwise the engine resumes with
+    /// no optimistic update. Repeated presses while queued stay
+    /// idempotent: one entry, one eventual send.
+    fn dispatch_resume_goal(&mut self) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self.transcript.push_error(String::from(
+                "There is no visible session to resume a goal for yet.",
+            ));
+            return scroll_transcript_to_end(appended);
+        };
+        if self.running.contains(&session) {
+            if self.queued_goal_resumes.insert(session) {
+                self.sync_composer_goal();
+            }
+            return Task::none();
+        }
+        if let Some(engine) = self.engine.clone() {
+            engine.resume_goal(session);
+        }
+        Task::none()
+    }
+
+    /// Edits the visible session's goal objective, mirroring
+    /// [`App::dispatch_pause_goal`]: no visible session explains on
+    /// the transcript, otherwise the engine edits with no optimistic
+    /// update. The caller passes a non-empty-after-trim objective;
+    /// the host rejects empty-after-trim, so empty drafts never send.
+    fn dispatch_edit_goal(&mut self, objective: String) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self.transcript.push_error(String::from(
+                "There is no visible session to edit a goal for yet.",
+            ));
+            return scroll_transcript_to_end(appended);
+        };
+        if let Some(engine) = self.engine.clone() {
+            engine.edit_goal(session, objective);
+        }
+        Task::none()
+    }
+
+    /// Clears the visible session's goal, mirroring
+    /// [`App::dispatch_pause_goal`]: no visible session explains on
+    /// the transcript, otherwise the engine clears with no
+    /// optimistic update (the chip hides when `GoalChanged` arrives
+    /// with no goal).
+    fn dispatch_clear_goal(&mut self) -> Task<Message> {
+        let Some(session) = self.visible_session.clone() else {
+            let appended = self.transcript.push_error(String::from(
+                "There is no visible session to clear a goal for yet.",
+            ));
+            return scroll_transcript_to_end(appended);
+        };
+        // A cleared goal leaves nothing to resume: a queued resume
+        // for this session drops unsent.
+        if self.queued_goal_resumes.remove(&session) {
+            self.sync_composer_goal();
+        }
+        if let Some(engine) = self.engine.clone() {
+            engine.clear_goal(session);
+        }
+        Task::none()
+    }
+
     /// Stops the running turn of the selected session: cancels it on
     /// the engine with the tracked turn id. A no-op without a running
     /// selection; the Stop control only shows while one runs.
@@ -1519,6 +1630,19 @@ impl App {
                 self.running.remove(&session);
                 self.running_turns.remove(&session);
                 self.refresh_send_gate();
+                // A resume queued behind this turn flushes now, once,
+                // after the running bookkeeping is gone. The queue is
+                // per-session, so this fires even when the user has
+                // since switched sessions. Without an engine (fixture
+                // mode, dropped connection) the entry just drops.
+                if self.queued_goal_resumes.remove(&session) {
+                    if let Some(engine) = self.engine.clone() {
+                        engine.resume_goal(session.clone());
+                    }
+                    if self.is_visible(&session) {
+                        self.sync_composer_goal();
+                    }
+                }
                 let mut appended = false;
                 if dropped_deltas > 0 {
                     let message = dropped_deltas_message(dropped_deltas);
@@ -1591,7 +1715,16 @@ impl App {
                 // Source of truth, not a hint: replaces the session's
                 // stored goal wholesale (`None` clears it). Only the
                 // visible session's strip refreshes; background
-                // sessions' goals wait for their select sync.
+                // sessions' goals wait for their select sync. A queued
+                // resume turns moot unless the goal is still paused
+                // (cleared, resumed elsewhere, or completed goals leave
+                // nothing to resume) and drops unsent.
+                let still_paused = goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status == manifest_domain::GoalStatus::Paused);
+                if !still_paused {
+                    self.queued_goal_resumes.remove(&session);
+                }
                 self.goals.insert(session.clone(), goal);
                 if self.is_visible(&session) {
                     self.sync_composer_goal();
@@ -1750,6 +1883,42 @@ impl App {
                 self.refresh_send_gate();
                 Task::none()
             }
+            Message::Composer(composer::Message::GoalPausePressed) => {
+                let task = self.dispatch_pause_goal();
+                self.composer.update(composer::Message::GoalPausePressed);
+                self.refresh_send_gate();
+                task
+            }
+            Message::Composer(composer::Message::GoalResumePressed) => {
+                let task = self.dispatch_resume_goal();
+                self.composer.update(composer::Message::GoalResumePressed);
+                self.refresh_send_gate();
+                task
+            }
+            Message::Composer(composer::Message::GoalEditSave) => {
+                // The reducer keeps empty-after-trim on the editor;
+                // the engine never sees one.
+                let draft = self
+                    .composer
+                    .goal_edit_draft()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let task = if draft.is_empty() {
+                    Task::none()
+                } else {
+                    self.dispatch_edit_goal(draft)
+                };
+                self.composer.update(composer::Message::GoalEditSave);
+                self.refresh_send_gate();
+                task
+            }
+            Message::Composer(composer::Message::GoalClearConfirm) => {
+                let task = self.dispatch_clear_goal();
+                self.composer.update(composer::Message::GoalClearConfirm);
+                self.refresh_send_gate();
+                task
+            }
             Message::Composer(child) => {
                 // The menus edit the draft's spawn choices while one is
                 // open, so the first send spawns with the shown picks.
@@ -1889,6 +2058,11 @@ impl App {
                                 self.engine = None;
                                 self.running.clear();
                                 self.running_turns.clear();
+                                // Queued resumes must not fire into a
+                                // dead connection later: drop them with
+                                // the running state.
+                                self.queued_goal_resumes.clear();
+                                self.sync_composer_goal();
                             }
                             if self.connection != Connection::Connected {
                                 // An in-flight catalog request dies with
@@ -1969,6 +2143,9 @@ impl App {
                                 self.current_sessions().into_iter().map(|s| s.id).collect();
                             self.usage.retain(|id, _| listed.contains(id));
                             self.session_names.retain(|id, _| listed.contains(id));
+                            // A removed session's queued resume turns
+                            // moot with it: drop it unsent.
+                            self.queued_goal_resumes.retain(|id| listed.contains(id));
                             self.sync_composer_usage();
                             // Cold start names no host until a session is
                             // listed: request the catalog now, with the
@@ -3536,6 +3713,10 @@ mod tests {
         histories: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         compacts: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         goals: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
+        goal_pauses: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        goal_resumes: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        goal_edits: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
+        goal_clears: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         fetches: std::sync::Arc<std::sync::Mutex<usize>>,
         decides: std::sync::Arc<std::sync::Mutex<Vec<DecideCall>>>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<AnswerCall>>>,
@@ -3611,6 +3792,22 @@ mod tests {
             self.goals.lock().unwrap().push((session, objective));
         }
 
+        fn pause_goal(&self, session: manifest_domain::SessionId) {
+            self.goal_pauses.lock().unwrap().push(session);
+        }
+
+        fn resume_goal(&self, session: manifest_domain::SessionId) {
+            self.goal_resumes.lock().unwrap().push(session);
+        }
+
+        fn edit_goal(&self, session: manifest_domain::SessionId, objective: String) {
+            self.goal_edits.lock().unwrap().push((session, objective));
+        }
+
+        fn clear_goal(&self, session: manifest_domain::SessionId) {
+            self.goal_clears.lock().unwrap().push(session);
+        }
+
         fn fetch_pending(&self) {
             *self.fetches.lock().unwrap() += 1;
         }
@@ -3655,6 +3852,10 @@ mod tests {
             histories: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             compacts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goal_pauses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goal_resumes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goal_edits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goal_clears: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             fetches: std::sync::Arc::new(std::sync::Mutex::new(0)),
             decides: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             answers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5129,6 +5330,473 @@ mod tests {
         assert!(fake.goals.lock().unwrap().is_empty());
         assert!(fake.turns.lock().unwrap().is_empty());
         assert_eq!(app.composer.content.text(), "/goal");
+    }
+
+    /// Drives one composer message through the root reducer, as the
+    /// goal popover buttons would.
+    fn goal_message(app: &mut App, message: composer::Message) {
+        let _ = app.update(Message::Composer(message));
+    }
+
+    /// Replaces the goal editor text through edit actions (select
+    /// all, then paste), as live typing in the inline editor would.
+    fn set_goal_text(app: &mut App, text: &str) {
+        goal_message(
+            app,
+            composer::Message::GoalEditAction(text_editor::Action::SelectAll),
+        );
+        goal_message(
+            app,
+            composer::Message::GoalEditAction(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(String::from(text)),
+            ))),
+        );
+    }
+
+    /// Streams one paused goal into the visible session, as a
+    /// pausable-then-resumable lifecycle test would see it.
+    fn stream_paused_goal(app: &mut App, objective: &str) {
+        stream(
+            app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from(objective),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Paused,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+    }
+
+    /// Streams one active goal into the visible session for
+    /// lifecycle tests.
+    fn stream_active_goal(app: &mut App, objective: &str) {
+        stream(
+            app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: Some(manifest_domain::GoalInfo {
+                    objective: String::from(objective),
+                    percent_complete: 42.0,
+                    status: manifest_domain::GoalStatus::Active,
+                    current_work: None,
+                    next_work: None,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn goal_pause_dispatch_records_call_and_keeps_card() {
+        let (mut app, fake) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalPausePressed);
+        assert_eq!(
+            *fake.goal_pauses.lock().unwrap(),
+            vec![SessionId::new("s-1")]
+        );
+        assert_eq!(app.composer.goal_popover, composer::GoalPopover::Open);
+        assert_eq!(
+            app.composer
+                .goal_display
+                .as_ref()
+                .expect("display kept")
+                .objective,
+            "Ship the slice"
+        );
+    }
+
+    #[test]
+    fn goal_resume_dispatch_records_call() {
+        let (mut app, fake) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert_eq!(
+            *fake.goal_resumes.lock().unwrap(),
+            vec![SessionId::new("s-1")]
+        );
+        assert_eq!(app.composer.goal_popover, composer::GoalPopover::Open);
+    }
+
+    /// Race regression (MFST-41): a Resume pressed while the
+    /// session's turn is in flight must not send into the busy turn
+    /// (the host admits it against the in-flight turn and never wakes
+    /// a new one). It queues behind the turn and flushes exactly once
+    /// when the turn completes.
+    #[test]
+    fn resume_pressed_mid_turn_waits_for_turn_completed() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(
+            fake.goal_resumes.lock().unwrap().is_empty(),
+            "mid-turn resume queues instead of sending"
+        );
+        assert!(
+            app.queued_goal_resumes.contains(&SessionId::new("s-1")),
+            "the press records a queued resume"
+        );
+        assert!(
+            app.composer.goal_resume_queued,
+            "the card reads queued while the turn runs"
+        );
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert_eq!(
+            *fake.goal_resumes.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "the queued resume flushes once the turn ends"
+        );
+        assert!(
+            app.queued_goal_resumes.is_empty(),
+            "the flush consumes the queue entry"
+        );
+        assert!(
+            !app.composer.goal_resume_queued,
+            "the card stops reading queued after the flush"
+        );
+    }
+
+    /// An idle resume still sends immediately, with no queue entry.
+    #[test]
+    fn resume_pressed_while_idle_sends_immediately() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert_eq!(
+            *fake.goal_resumes.lock().unwrap(),
+            vec![SessionId::new("s-1")]
+        );
+        assert!(app.queued_goal_resumes.is_empty());
+        assert!(!app.composer.goal_resume_queued);
+    }
+
+    /// Repeated mid-turn presses stay idempotent: exactly one flush.
+    #[test]
+    fn double_resume_mid_turn_flushes_once() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(fake.goal_resumes.lock().unwrap().is_empty());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert_eq!(
+            *fake.goal_resumes.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "two queued presses flush as one send"
+        );
+    }
+
+    /// A queued resume drops unsent when the goal clears first.
+    #[test]
+    fn queued_resume_dropped_when_goal_clears() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(app.queued_goal_resumes.contains(&SessionId::new("s-1")));
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::GoalChanged {
+                session: SessionId::new("s-1"),
+                goal: None,
+            },
+        );
+        assert!(app.queued_goal_resumes.is_empty());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert!(
+            fake.goal_resumes.lock().unwrap().is_empty(),
+            "no send follows a moot queue"
+        );
+    }
+
+    /// A queued resume drops when the goal un-pauses elsewhere.
+    #[test]
+    fn queued_resume_dropped_when_goal_resumes_elsewhere() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        stream_active_goal(&mut app, "Ship the slice");
+        assert!(app.queued_goal_resumes.is_empty());
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert!(fake.goal_resumes.lock().unwrap().is_empty());
+    }
+
+    /// The flush fires per-session even after a switch, and the
+    /// queued flag never leaks onto the other session's card.
+    #[test]
+    fn queued_resume_flushes_for_background_session() {
+        let (mut app, fake) = slash_app();
+        loaded(&mut app, &["s-1", "s-2"]);
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(app.composer.goal_resume_queued);
+        let _ = app.update(Message::Sessions(sessions::Message::Select(
+            SessionId::new("s-2"),
+        )));
+        assert_eq!(app.visible_session, Some(SessionId::new("s-2")));
+        assert!(
+            !app.composer.goal_resume_queued,
+            "the other session's card reads unqueued"
+        );
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert_eq!(
+            *fake.goal_resumes.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "the background session's queue still flushes"
+        );
+        assert!(!app.composer.goal_resume_queued);
+    }
+
+    /// Pause cancels a queued resume: pause wins.
+    #[test]
+    fn pause_pressed_while_queued_cancels_the_queue() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(app.queued_goal_resumes.contains(&SessionId::new("s-1")));
+        goal_message(&mut app, composer::Message::GoalPausePressed);
+        assert!(app.queued_goal_resumes.is_empty());
+        assert!(!app.composer.goal_resume_queued);
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnCompleted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+                terminal: None,
+                answer: None,
+                dropped_deltas: 0,
+            },
+        );
+        assert!(fake.goal_resumes.lock().unwrap().is_empty());
+        assert_eq!(
+            *fake.goal_pauses.lock().unwrap(),
+            vec![SessionId::new("s-1")],
+            "the pause itself still sends"
+        );
+    }
+
+    /// A disconnect drops queued resumes with the running state.
+    #[test]
+    fn queued_resume_dropped_on_disconnect() {
+        let (mut app, fake) = slash_app();
+        stream_paused_goal(&mut app, "Ship the slice");
+        stream(
+            &mut app,
+            manifest_domain::StreamEvent::TurnStarted {
+                session: SessionId::new("s-1"),
+                turn: None,
+                view_cursor: None,
+            },
+        );
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        assert!(app.queued_goal_resumes.contains(&SessionId::new("s-1")));
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::ConnectionChanged(
+                manifest_domain::Connection::Failed(String::from("boom")),
+            )),
+        );
+        assert!(app.queued_goal_resumes.is_empty());
+        assert!(!app.composer.goal_resume_queued);
+        assert!(fake.goal_resumes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_edit_save_dispatches_trimmed_objective() {
+        let (mut app, fake) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalEditPressed);
+        set_goal_text(&mut app, "  Ship it all  ");
+        goal_message(&mut app, composer::Message::GoalEditSave);
+        assert_eq!(
+            *fake.goal_edits.lock().unwrap(),
+            vec![(SessionId::new("s-1"), String::from("Ship it all"))]
+        );
+        assert_eq!(app.composer.goal_popover, composer::GoalPopover::Open);
+        // No optimistic update: the old objective shows until the
+        // host streams the edit back.
+        assert_eq!(
+            app.composer
+                .goal_display
+                .as_ref()
+                .expect("display kept")
+                .objective,
+            "Ship the slice"
+        );
+    }
+
+    #[test]
+    fn goal_edit_save_empty_sends_nothing() {
+        let (mut app, fake) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalEditPressed);
+        set_goal_text(&mut app, "   ");
+        goal_message(&mut app, composer::Message::GoalEditSave);
+        assert!(fake.goal_edits.lock().unwrap().is_empty());
+        assert!(matches!(
+            app.composer.goal_popover,
+            composer::GoalPopover::Editing { .. }
+        ));
+    }
+
+    #[test]
+    fn goal_clear_confirm_dispatches_and_cancel_sends_nothing() {
+        let (mut app, fake) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        goal_message(&mut app, composer::Message::GoalClearPressed);
+        goal_message(&mut app, composer::Message::GoalClearCancel);
+        assert!(fake.goal_clears.lock().unwrap().is_empty());
+        goal_message(&mut app, composer::Message::GoalClearPressed);
+        goal_message(&mut app, composer::Message::GoalClearConfirm);
+        assert_eq!(
+            *fake.goal_clears.lock().unwrap(),
+            vec![SessionId::new("s-1")]
+        );
+        assert_eq!(app.composer.goal_popover, composer::GoalPopover::Open);
+        assert!(app.composer.goal_display.is_some());
+    }
+
+    #[test]
+    fn goal_lifecycle_without_visible_session_sends_nothing() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        goal_message(&mut app, composer::Message::GoalPausePressed);
+        goal_message(&mut app, composer::Message::GoalResumePressed);
+        goal_message(&mut app, composer::Message::GoalClearConfirm);
+        assert!(fake.goal_pauses.lock().unwrap().is_empty());
+        assert!(fake.goal_resumes.lock().unwrap().is_empty());
+        assert!(fake.goal_edits.lock().unwrap().is_empty());
+        assert!(fake.goal_clears.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_failure_keeps_previous_display() {
+        let (mut app, _) = slash_app();
+        stream_active_goal(&mut app, "Ship the slice");
+        goal_message(&mut app, composer::Message::GoalPressed);
+        command_failed(
+            &mut app,
+            manifest_domain::FailedCommand::Goal(SessionId::new("s-1")),
+            "goal broke",
+        );
+        let display = app.composer.goal_display.as_ref().expect("display kept");
+        assert_eq!(display.objective, "Ship the slice");
+        assert_eq!(display.percent, 42.0);
+        assert_eq!(app.composer.goal_popover, composer::GoalPopover::Open);
     }
 
     #[test]

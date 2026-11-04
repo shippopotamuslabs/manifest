@@ -296,6 +296,63 @@ pub(crate) fn goal_call(id: u64, session_id: &str, objective: &str) -> String {
     )
 }
 
+/// A `tools/call` request pausing `session_id`'s goal through `muse_raw`.
+///
+/// The host method is `goal/pause` with exactly `commandId` (see
+/// [`command_id`]) and `sessionId`: an `objective` on pause is an
+/// unknown field the host rejects.
+pub(crate) fn goal_pause_call(id: u64, session_id: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "goal/pause",
+        json!({"commandId": command_id(), "sessionId": session_id}),
+    )
+}
+
+/// A `tools/call` request resuming `session_id`'s goal through `muse_raw`.
+///
+/// The host method is `goal/resume` with exactly `commandId` (see
+/// [`command_id`]) and `sessionId`, mirroring [`goal_pause_call`].
+pub(crate) fn goal_resume_call(id: u64, session_id: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "goal/resume",
+        json!({"commandId": command_id(), "sessionId": session_id}),
+    )
+}
+
+/// A `tools/call` request editing `session_id`'s goal through `muse_raw`.
+///
+/// The host method is `goal/edit` with `commandId` (see
+/// [`command_id`]), `sessionId`, and the trimmed `objective` (the
+/// host rejects empty-after-trim, so the shell never sends one).
+/// Set and edit differ in their missing-goal precondition, not in
+/// payload shape.
+pub(crate) fn goal_edit_call(id: u64, session_id: &str, objective: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "goal/edit",
+        json!({"commandId": command_id(), "sessionId": session_id, "objective": objective}),
+    )
+}
+
+/// A `tools/call` request clearing `session_id`'s goal through `muse_raw`.
+///
+/// The host method is `goal/clear` with exactly `commandId` (see
+/// [`command_id`]) and `sessionId`: an `objective` on clear is an
+/// unknown field the host rejects.
+pub(crate) fn goal_clear_call(id: u64, session_id: &str) -> String {
+    raw_call(
+        id,
+        session_id,
+        "goal/clear",
+        json!({"commandId": command_id(), "sessionId": session_id}),
+    )
+}
+
 /// A `tools/call` request reading `session_id`'s stored history
 /// through `muse_raw`.
 ///
@@ -828,6 +885,101 @@ mod tests {
             .expect("params present");
         assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
         assert_eq!(params.get("objective"), Some(&json!("ship it")));
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn goal_pause_call_sends_goal_pause_with_id_pair_only() {
+        let value: Value = serde_json::from_str(&goal_pause_call(7, "sess-1")).expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_raw")));
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("goal/pause"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert!(params.get("objective").is_none());
+        assert!(params.get("turnId").is_none());
+        assert_eq!(
+            params.as_object().expect("params is an object").len(),
+            2,
+            "pause carries exactly commandId + sessionId"
+        );
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn goal_resume_call_sends_goal_resume_with_id_pair_only() {
+        let value: Value =
+            serde_json::from_str(&goal_resume_call(7, "sess-1")).expect("valid JSON");
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("goal/resume"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert!(params.get("objective").is_none());
+        assert_eq!(
+            params.as_object().expect("params is an object").len(),
+            2,
+            "resume carries exactly commandId + sessionId"
+        );
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn goal_edit_call_sends_goal_edit_with_objective() {
+        let value: Value =
+            serde_json::from_str(&goal_edit_call(7, "sess-1", "ship it")).expect("valid JSON");
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("goal/edit"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert_eq!(params.get("objective"), Some(&json!("ship it")));
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .expect("commandId present");
+        assert!(is_uuid_v7(command_id), "commandId is UUIDv7: {command_id}");
+    }
+
+    #[test]
+    fn goal_clear_call_sends_goal_clear_with_id_pair_only() {
+        let value: Value = serde_json::from_str(&goal_clear_call(7, "sess-1")).expect("valid JSON");
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("goal/clear"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert!(params.get("objective").is_none());
+        assert_eq!(
+            params.as_object().expect("params is an object").len(),
+            2,
+            "clear carries exactly commandId + sessionId"
+        );
         let command_id = params
             .get("commandId")
             .and_then(Value::as_str)

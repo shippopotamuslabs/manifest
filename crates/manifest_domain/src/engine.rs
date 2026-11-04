@@ -1584,6 +1584,38 @@ pub trait SessionEngine: Send + Sync {
     /// [`EngineEvent::CommandFailed`] with [`FailedCommand::Goal`].
     /// Engines without goals keep the default, which drops the call.
     fn set_goal(&self, _session: SessionId, _objective: String) {}
+    /// Pause `session`'s goal through the server's `muse_raw`
+    /// (`goal/pause`).
+    ///
+    /// Non-blocking; success emits nothing (the new goal streams in
+    /// as [`StreamEvent::GoalChanged`](StreamEvent::GoalChanged)),
+    /// failure arrives as [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Goal`]. Engines without goals keep the
+    /// default, which drops the call.
+    fn pause_goal(&self, _session: SessionId) {}
+    /// Resume `session`'s goal through the server's `muse_raw`
+    /// (`goal/resume`).
+    ///
+    /// Non-blocking; success emits nothing, failure arrives as
+    /// [`EngineEvent::CommandFailed`] with [`FailedCommand::Goal`].
+    /// Engines without goals keep the default, which drops the call.
+    fn resume_goal(&self, _session: SessionId) {}
+    /// Edit `session`'s goal objective through the server's
+    /// `muse_raw` (`goal/edit`).
+    ///
+    /// Non-blocking; success emits nothing, failure arrives as
+    /// [`EngineEvent::CommandFailed`] with [`FailedCommand::Goal`].
+    /// Engines without goals keep the default, which drops the call.
+    fn edit_goal(&self, _session: SessionId, _objective: String) {}
+    /// Clear `session`'s goal through the server's `muse_raw`
+    /// (`goal/clear`).
+    ///
+    /// Non-blocking; success emits nothing (the clear streams in as
+    /// [`StreamEvent::GoalChanged`](StreamEvent::GoalChanged) with no
+    /// goal), failure arrives as [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Goal`]. Engines without goals keep the
+    /// default, which drops the call.
+    fn clear_goal(&self, _session: SessionId) {}
     /// Fetch pending approvals/questions; results arrive as
     /// [`EngineEvent::PendingLoaded`], failures as
     /// [`EngineEvent::CommandFailed`] with
@@ -1939,6 +1971,10 @@ mod tests {
         engine.cancel_turn(SessionId::new("s"), Some(TurnId::new("t")));
         engine.list_models(None, None);
         engine.list_skills(SessionId::new("s"));
+        engine.pause_goal(SessionId::new("s"));
+        engine.resume_goal(SessionId::new("s"));
+        engine.edit_goal(SessionId::new("s"), String::from("ship it"));
+        engine.clear_goal(SessionId::new("s"));
         engine.fetch_pending();
         engine.decide(
             SessionId::new("s"),

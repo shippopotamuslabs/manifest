@@ -127,6 +127,30 @@ impl EngineHandle {
         self.inner.set_goal(session, objective);
     }
 
+    /// Pauses the session's goal; failures arrive as
+    /// `CommandFailed(Goal)`, success emits nothing.
+    pub fn pause_goal(&self, session: SessionId) {
+        self.inner.pause_goal(session);
+    }
+
+    /// Resumes the session's goal; failures arrive as
+    /// `CommandFailed(Goal)`, success emits nothing.
+    pub fn resume_goal(&self, session: SessionId) {
+        self.inner.resume_goal(session);
+    }
+
+    /// Edits the session's goal objective; failures arrive as
+    /// `CommandFailed(Goal)`, success emits nothing.
+    pub fn edit_goal(&self, session: SessionId, objective: String) {
+        self.inner.edit_goal(session, objective);
+    }
+
+    /// Clears the session's goal; failures arrive as
+    /// `CommandFailed(Goal)`, success emits nothing.
+    pub fn clear_goal(&self, session: SessionId) {
+        self.inner.clear_goal(session);
+    }
+
     /// Resumes a session; success arrives as `SessionResumed`.
     pub fn resume_session(&self, session: SessionId) {
         self.inner.resume_session(session);

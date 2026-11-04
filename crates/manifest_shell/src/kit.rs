@@ -7,10 +7,11 @@
 //!
 //! Surfaces are borderless: panels, rows, chips, and buttons keep
 //! their rounded corners but carry no border width, so state reads
-//! through flat background fills alone. Two exceptions: the
+//! through flat background fills alone. Three exceptions: the
 //! single-line text field, whose border marks where typing lands,
-//! and the floating popup cards, whose thin border lifts them off
-//! the surfaces they overlay.
+//! the floating popup cards, whose thin border lifts them off the
+//! surfaces they overlay, and the goal inline editor, whose stepped
+//! surface and border mark where typing lands on its card.
 //!
 use iced::widget::{button, container, text, text_editor, text_input};
 use iced::{Background, Border, Color, Element, Length, Rectangle, Theme};
@@ -20,10 +21,10 @@ use crate::theme::{
     ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, ACCENT_MUTED_BG, BG_BASE,
     BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT,
     CONTEXT_RING_SIZE, CONTEXT_RING_STROKE, DANGER, DIVIDER_HIT_WIDTH, FONT_SIZE_BODY,
-    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, ICON_BUTTON_SIZE, ICON_SIZE,
-    MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
-    SPACE_XS, SPACE_XXS, SUCCESS, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY,
-    TEXT_TERTIARY,
+    FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, GOAL_EDITOR_MAX_LINES,
+    ICON_BUTTON_SIZE, ICON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
+    SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXS, SUCCESS, SURFACE_1, SURFACE_2, TEXT_FAINT,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The pill-button treatments.
@@ -1224,6 +1225,70 @@ pub(crate) fn composer_input<'a, Message: Clone + 'a>(
     editor.style(composer_input_style).into()
 }
 
+/// Pure data mapping behind the goal inline editor style: the
+/// surface-2 step and the border color for an editor status. Kept
+/// as data (not `Style`) so the mapping is unit-testable without
+/// constructing widgets. The card behind the editor is surface-1,
+/// so the editor needs both a stepped fill and a border to read as
+/// a field at rest; focus warms the border to the accent, mirroring
+/// [`field_style`].
+pub(crate) fn goal_editor_colors(status: text_editor::Status) -> (Color, Color) {
+    let border = match status {
+        text_editor::Status::Focused { .. } => ACCENT_BORDER_SUBTLE,
+        _ => BORDER_DEFAULT,
+    };
+    (SURFACE_2, border)
+}
+
+/// Status-aware style for the multi-line goal inline editor: the
+/// surface-2 step over its surface-1 card, a thin border in every
+/// state (accent on focus), faint placeholder, primary value text,
+/// and the muted accent selection wash.
+fn goal_editor_style(_theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let (background, border) = goal_editor_colors(status);
+    text_editor::Style {
+        background: Background::Color(background),
+        border: Border::default()
+            .color(border)
+            .width(1.0)
+            .rounded(RADIUS_PANEL),
+        placeholder: TEXT_FAINT,
+        value: TEXT_PRIMARY,
+        selection: ACCENT_MUTED_BG,
+    }
+}
+
+/// The multi-line goal inline editor: the composer input's line
+/// height and padding with an objective placeholder and no slash
+/// highlighting, on its own stepped [`goal_editor_style`] surface.
+/// Typed sentences soft-wrap at the card width instead of running
+/// one line until Enter. The height tracks the laid-out (wrapped)
+/// content itself: it grows line by line to
+/// [`GOAL_EDITOR_MAX_LINES`], then holds and scrolls internally.
+/// `key_binding` intercepts keys before the editor consumes them
+/// (Cmd/Ctrl+Enter to save, Esc to cancel).
+pub(crate) fn goal_editor<'a, Message: Clone + 'a>(
+    content: &'a text_editor::Content,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+    key_binding: ComposerKeys<'a, Message>,
+) -> Element<'a, Message> {
+    text_editor::TextEditor::new(content)
+        .placeholder("Objective")
+        .on_action(on_action)
+        .size(FONT_SIZE_BODY)
+        .line_height(COMPOSER_LINE_HEIGHT / FONT_SIZE_BODY)
+        .padding(COMPOSER_INPUT_PADDING)
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .height(Length::Shrink)
+        .min_height(COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING)
+        .max_height(
+            GOAL_EDITOR_MAX_LINES as f32 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INPUT_PADDING,
+        )
+        .key_binding(key_binding)
+        .style(goal_editor_style)
+        .into()
+}
+
 /// One slash-menu row: a source icon, the `/selector` in strong text,
 /// and the description on one truncated line. Selected rows read as
 /// the quiet surface-2 step, mirroring [`menu_row`].
@@ -1566,13 +1631,13 @@ pub(crate) fn input_bar<'a, Message: Clone + 'a>(
 mod tests {
     use super::{
         ButtonKind, IconButtonKind, button_colors, drawer_chevron, edit_button_colors, folder_icon,
-        icon_button_colors, maximize_icon, menu_row_colors, row_colors,
+        goal_editor_colors, icon_button_colors, maximize_icon, menu_row_colors, row_colors,
     };
     use crate::theme::{
-        ACCENT_ACTIVE, ACCENT_BASE, ACCENT_HOVER, BG_BASE, DANGER, SURFACE_1, SURFACE_2,
-        TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+        ACCENT_ACTIVE, ACCENT_BASE, ACCENT_BORDER_SUBTLE, ACCENT_HOVER, BG_BASE, BORDER_DEFAULT,
+        DANGER, SURFACE_1, SURFACE_2, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
     };
-    use iced::widget::button;
+    use iced::widget::{button, text_editor};
 
     #[test]
     fn primary_colors_follow_status() {
@@ -1869,6 +1934,29 @@ mod tests {
         assert_eq!(
             button_colors(ButtonKind::Ghost, button::Status::Disabled),
             (None, TEXT_FAINT)
+        );
+    }
+
+    #[test]
+    fn goal_editor_reads_as_a_field_at_rest() {
+        // The card behind the editor is surface-1, so the editor
+        // steps to surface-2 with a border in every state — it never
+        // blends into the card, even unfocused.
+        assert_eq!(
+            goal_editor_colors(text_editor::Status::Active),
+            (SURFACE_2, BORDER_DEFAULT)
+        );
+        assert_eq!(
+            goal_editor_colors(text_editor::Status::Hovered),
+            (SURFACE_2, BORDER_DEFAULT)
+        );
+        assert_eq!(
+            goal_editor_colors(text_editor::Status::Focused { is_hovered: false }),
+            (SURFACE_2, ACCENT_BORDER_SUBTLE)
+        );
+        assert_eq!(
+            goal_editor_colors(text_editor::Status::Focused { is_hovered: true }),
+            (SURFACE_2, ACCENT_BORDER_SUBTLE)
         );
     }
 }
