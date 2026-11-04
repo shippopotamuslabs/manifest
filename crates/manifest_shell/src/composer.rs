@@ -418,6 +418,11 @@ pub struct State {
     pub model: ModelChoice,
     /// The reasoning effort new sessions spawn with.
     pub effort: EffortChoice,
+    /// Remembered effort per model choice left behind: switching
+    /// away parks the old pair here, switching back restores it.
+    /// A small vec with linear lookup; `ModelChoice` has no `Hash`
+    /// derive and the row count stays tiny.
+    pub model_efforts: Vec<(ModelChoice, EffortChoice)>,
     /// The host model catalog.
     pub catalog: ModelCatalog,
     /// The host skill catalog.
@@ -478,6 +483,7 @@ impl State {
             permission: PermissionMode::default(),
             model: ModelChoice::default(),
             effort: EffortChoice::default(),
+            model_efforts: Vec::new(),
             catalog: ModelCatalog::Loading,
             skill_catalog: SkillCatalog::Loading,
             slash_menu: SlashMenu::Closed,
@@ -572,17 +578,50 @@ impl State {
 
     /// Short human name of the selected effort.
     fn effort_name(&self) -> &'static str {
-        match self.effort {
-            EffortChoice::Default => "Default",
-            EffortChoice::None => "None",
-            EffortChoice::Minimal => "Minimal",
-            EffortChoice::Low => "Low",
-            EffortChoice::Medium => "Medium",
-            EffortChoice::High => "High",
-            EffortChoice::XHigh => "XHigh",
-            EffortChoice::Max => "Max",
-            EffortChoice::Ultra => "Ultra",
+        effort_choice_name(self.effort)
+    }
+
+    /// Short human name of the effort remembered for `choice`.
+    fn effort_name_for(&self, choice: &ModelChoice) -> &'static str {
+        effort_choice_name(self.stored_effort(choice))
+    }
+
+    /// The effort remembered for `choice`: the live one when it is
+    /// selected, else the parked one, else the default.
+    fn stored_effort(&self, choice: &ModelChoice) -> EffortChoice {
+        if choice == &self.model {
+            return self.effort;
         }
+        self.model_efforts
+            .iter()
+            .find(|(parked, _)| parked == choice)
+            .map(|(_, effort)| *effort)
+            .unwrap_or_default()
+    }
+
+    /// Switches to `choice`, parking the outgoing pair and restoring
+    /// the incoming one. A no-op on the already-selected model, so a
+    /// re-click never drops the live effort.
+    fn switch_model(&mut self, choice: ModelChoice) {
+        if choice == self.model {
+            return;
+        }
+        let parked = std::mem::replace(&mut self.model, choice.clone());
+        if let Some(slot) = self
+            .model_efforts
+            .iter_mut()
+            .find(|(stored, _)| *stored == parked)
+        {
+            slot.1 = self.effort;
+        } else {
+            self.model_efforts.push((parked, self.effort));
+        }
+        self.effort = self
+            .model_efforts
+            .iter()
+            .find(|(stored, _)| *stored == choice)
+            .map(|(_, effort)| *effort)
+            .unwrap_or_default();
     }
 
     /// Folds a message into the composer state. Editing actions apply
@@ -648,7 +687,7 @@ impl State {
                 };
             }
             Message::ModelSelected(choice) => {
-                self.model = choice;
+                self.switch_model(choice);
                 if self.model_menu == ModelMenu::EffortOpen {
                     self.model_menu = ModelMenu::Open;
                 }
@@ -656,7 +695,7 @@ impl State {
             }
             Message::ModelEditPressed(choice) => {
                 if self.model_menu != ModelMenu::Closed {
-                    self.model = choice;
+                    self.switch_model(choice);
                     self.model_menu = ModelMenu::EffortOpen;
                     self.refresh_derived();
                 }
@@ -1302,7 +1341,7 @@ impl State {
         let mut rows = iced::widget::column![kit::menu_row(
             "Default",
             self.model == ModelChoice::Default,
-            self.effort_name(),
+            self.effort_name_for(&ModelChoice::Default),
             Message::ModelSelected(ModelChoice::Default),
             Message::ModelEditPressed(ModelChoice::Default),
         )]
@@ -1324,7 +1363,7 @@ impl State {
                     list = list.push(kit::menu_row(
                         model.label(),
                         self.model == choice,
-                        self.effort_name(),
+                        self.effort_name_for(&choice),
                         Message::ModelSelected(choice.clone()),
                         Message::ModelEditPressed(choice),
                     ));
@@ -2026,10 +2065,10 @@ impl iced::widget::text::Highlighter for SlashHighlighter {
     }
 }
 
-/// Short human name of an effort choice, for the effort submenu.
-/// Pure data the update stores and the view reads; kept beside the
-/// composer because the domain choice carries wire values only.
-fn effort_label(effort: EffortChoice) -> &'static str {
+/// Short human name of one effort choice. The single match both
+/// the pill and the effort submenu read; kept beside the composer
+/// because the domain choice carries wire values only.
+fn effort_choice_name(effort: EffortChoice) -> &'static str {
     match effort {
         EffortChoice::Default => "Default",
         EffortChoice::None => "None",
@@ -2041,6 +2080,12 @@ fn effort_label(effort: EffortChoice) -> &'static str {
         EffortChoice::Max => "Max",
         EffortChoice::Ultra => "Ultra",
     }
+}
+
+/// Short human name of an effort choice, for the effort submenu.
+/// Pure data the update stores and the view reads.
+fn effort_label(effort: EffortChoice) -> &'static str {
+    effort_choice_name(effort)
 }
 
 #[cfg(test)]
@@ -2436,6 +2481,36 @@ mod tests {
         ))));
         // Selecting a model keeps the menu open for its Edit action.
         assert_eq!(got.model_menu, ModelMenu::Open);
+        // The switch parks Default's High and restores Spark's own
+        // (never-set) effort.
+        assert_eq!(got.model_effort_label, "Muse Spark · Default");
+        got.update(Message::ModelSelected(ModelChoice::Default));
+        // Switching back restores the parked High.
+        assert_eq!(got.effort, EffortChoice::High);
+        assert_eq!(got.model_effort_label, "Default · High");
+    }
+
+    #[test]
+    fn effort_is_remembered_per_named_model() {
+        let mut got = catalog_state();
+        got.update(Message::ModelPressed);
+        got.update(Message::ModelEditPressed(ModelChoice::Named(String::from(
+            "muse-spark",
+        ))));
+        got.update(Message::EffortSelected(EffortChoice::High));
+        assert_eq!(got.model_effort_label, "Muse Spark · High");
+        got.update(Message::ModelPressed);
+        got.update(Message::ModelSelected(ModelChoice::Named(String::from(
+            "muse-mini",
+        ))));
+        // A never-touched model reads the default effort.
+        assert_eq!(got.effort, EffortChoice::Default);
+        assert_eq!(got.model_effort_label, "Muse Mini · Default");
+        got.update(Message::ModelSelected(ModelChoice::Named(String::from(
+            "muse-spark",
+        ))));
+        // Spark's High survived the round trip through Mini.
+        assert_eq!(got.effort, EffortChoice::High);
         assert_eq!(got.model_effort_label, "Muse Spark · High");
     }
 
