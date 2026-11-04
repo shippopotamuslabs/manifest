@@ -1296,12 +1296,13 @@ impl State {
     }
 
     /// The model menu: a narrow card right-aligned above the sub-bar,
-    /// with one row per model choice, and — when a row's Edit action
-    /// has opened it — the effort card to its left.
+    /// with one row per model choice, and — when a row's reasoning
+    /// action has opened it — the effort card to its left.
     fn model_menu_view(&self) -> Element<'_, Message> {
         let mut rows = iced::widget::column![kit::menu_row(
             "Default",
             self.model == ModelChoice::Default,
+            self.effort_name(),
             Message::ModelSelected(ModelChoice::Default),
             Message::ModelEditPressed(ModelChoice::Default),
         )]
@@ -1323,6 +1324,7 @@ impl State {
                     list = list.push(kit::menu_row(
                         model.label(),
                         self.model == choice,
+                        self.effort_name(),
                         Message::ModelSelected(choice.clone()),
                         Message::ModelEditPressed(choice),
                     ));
@@ -1338,6 +1340,7 @@ impl State {
         let mut bar =
             iced::widget::row![iced::widget::container(iced::widget::text("")).width(Length::Fill)]
                 .spacing(SPACE_S)
+                .align_y(iced::alignment::Vertical::Bottom)
                 .width(Length::Fill);
         if self.model_menu == ModelMenu::EffortOpen {
             bar = bar.push(self.effort_menu_view());
