@@ -35,6 +35,9 @@ struct StatusDto {
     /// on rows from older servers and for unnamed sessions.
     #[serde(default)]
     name: Option<String>,
+    /// How the server's name was set: the host's origin vocabulary, or "fallback" for the server's provisional spawn-prompt label. Carried for the name log line below; title selection does not branch on it.
+    #[serde(default)]
+    name_origin: Option<String>,
     /// Cumulative token usage folded by the server from the session's
     /// live `session/tokenUsage`; absent or unparseable stays out of
     /// the carried vec, never a row failure.
@@ -96,6 +99,14 @@ pub(crate) fn map_status_rows(
             Some(name) if !name.is_empty() => name.to_string(),
             _ => short,
         };
+        // Console diagnostics for session naming — the wire boundary is the one place that can show whether a fallback was ever superseded.
+        eprintln!(
+            "manifest-mcp: session {} status-row name={:?} origin={} title={:?}",
+            dto.session_id,
+            dto.name.as_deref().filter(|n| !n.is_empty()),
+            dto.name_origin.as_deref().unwrap_or("<none>"),
+            title
+        );
         sessions.push(SessionSummary {
             id: SessionId::new(&dto.session_id),
             title,
@@ -505,11 +516,25 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
             // A frame without a name carries nothing to display; it
             // maps to no event rather than an error, matching the
             // server's own gating.
+            let origin = params.get("origin").and_then(Value::as_str);
             match params.get("name").and_then(Value::as_str) {
                 Some(name) if !name.is_empty() => {
+                    eprintln!(
+                        "manifest-mcp: session {} name-changed name={:?} origin={}",
+                        session.as_str(),
+                        name,
+                        origin.unwrap_or("<none>")
+                    );
                     Ok(Some(StreamEvent::NameChanged { session, name: name.to_string() }))
                 }
-                _ => Ok(None),
+                _ => {
+                    eprintln!(
+                        "manifest-mcp: session {} name-changed frame carried no name (origin={}); dropped",
+                        session.as_str(),
+                        origin.unwrap_or("<none>")
+                    );
+                    Ok(None)
+                }
             }
         }
         _ => Ok(None),
@@ -1243,14 +1268,19 @@ mod tests {
     fn rows_with_a_server_name_title_by_name() {
         let mut named = row("s1", "idle", "/home/dev/beta", 0, None);
         named["name"] = json!("Fix the login bug");
+        named["name_origin"] = json!("automatic");
         let mut empty_named = row("s2", "idle", "/home/dev/alpha", 0, None);
         empty_named["name"] = json!("");
-        let rows = vec![named, empty_named];
+        let mut fallback = row("s3", "idle", "/home/dev/gamma", 0, None);
+        fallback["name"] = json!("do the thing");
+        fallback["name_origin"] = json!("fallback");
+        let rows = vec![named, empty_named, fallback];
         let (sessions, _, _) = map_status_rows(&rows);
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 3);
         assert_eq!(sessions[0].title, String::from("Fix the login bug"));
         // An empty name is no name: the short id labels the row.
         assert_eq!(sessions[1].title, String::from("s2"));
+        assert_eq!(sessions[2].title, String::from("do the thing"));
     }
 
     #[test]
