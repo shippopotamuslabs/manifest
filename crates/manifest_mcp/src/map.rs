@@ -1,8 +1,9 @@
 //! Crate-private mapping from wire values into domain values.
 //!
 //! The wire carries no project objects: each session row keeps its
-//! workspace and a title — the server's session name when the row
-//! carries one, the session id's first 8 chars otherwise — and
+//! workspace and a title — the host-published generated short title
+//! when the row carries one, else the server's session name, else the
+//! session id's first 8 chars — and
 //! grouping onto projects happens in the shell via domain
 //! [`assign_projects`](manifest_domain::assign_projects). Anything the
 //! wire cannot explain becomes a [`Diagnostic`] value rather than a
@@ -35,6 +36,11 @@ struct StatusDto {
     /// on rows from older servers and for unnamed sessions.
     #[serde(default)]
     name: Option<String>,
+    /// The host-published generated short title (MFST-61); what Muse
+    /// shows. Wins over the canonical name for display; absent when
+    /// unpublished.
+    #[serde(default)]
+    generated_name: Option<String>,
     /// How the server's name was set: the host's origin vocabulary, or "fallback" for the server's provisional spawn-prompt label. Carried for the name log line below; title selection does not branch on it.
     #[serde(default)]
     name_origin: Option<String>,
@@ -93,17 +99,24 @@ pub(crate) fn map_status_rows(
         };
         // First 8 chars (not bytes) so multi-byte ids truncate safely.
         let short: String = dto.session_id.chars().take(8).collect();
-        // The server's name labels the row when it carries one; the
-        // short id stays as the label for unnamed rows.
-        let title = match dto.name.as_deref() {
-            Some(name) if !name.is_empty() => name.to_string(),
-            _ => short,
-        };
+        // The generated title wins when the row carries one (it is
+        // what Muse shows); the canonical name is the settled
+        // fallback, and the short id labels rows with neither.
+        let title = dto
+            .generated_name
+            .as_deref()
+            .filter(|generated| !generated.is_empty())
+            .or_else(|| dto.name.as_deref().filter(|name| !name.is_empty()))
+            .map(String::from)
+            .unwrap_or(short);
         // Console diagnostics for session naming — the wire boundary is the one place that can show whether a fallback was ever superseded.
         eprintln!(
-            "manifest-mcp: session {} status-row name={:?} origin={} title={:?}",
+            "manifest-mcp: session {} status-row name={:?} generated={:?} origin={} title={:?}",
             dto.session_id,
             dto.name.as_deref().filter(|n| !n.is_empty()),
+            dto.generated_name
+                .as_deref()
+                .filter(|generated| !generated.is_empty()),
             dto.name_origin.as_deref().unwrap_or("<none>"),
             title
         );
@@ -513,12 +526,16 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
         }
         "name-changed" => {
             let session = SessionId::new(req_string(params, "sessionId")?);
-            // A frame without a name carries nothing to display; it
-            // maps to no event rather than an error, matching the
-            // server's own gating.
+            // The generated title is preferred when the frame publishes
+            // one; frames without one keep carrying the canonical name,
+            // so nothing is ever cleared. A frame with neither carries
+            // nothing to display and maps to no event rather than an
+            // error, matching the server's own gating.
             let origin = params.get("origin").and_then(Value::as_str);
-            match params.get("name").and_then(Value::as_str) {
-                Some(name) if !name.is_empty() => {
+            let generated = field_str(params, "generatedName");
+            let name = field_str(params, "name");
+            match generated.or(name) {
+                Some(name) => {
                     eprintln!(
                         "manifest-mcp: session {} name-changed name={:?} origin={}",
                         session.as_str(),
@@ -1274,13 +1291,36 @@ mod tests {
         let mut fallback = row("s3", "idle", "/home/dev/gamma", 0, None);
         fallback["name"] = json!("do the thing");
         fallback["name_origin"] = json!("fallback");
-        let rows = vec![named, empty_named, fallback];
+        // A row carrying both titles shows the generated one.
+        let mut generated = row("s4", "idle", "/home/dev/delta", 0, None);
+        generated["name"] = json!("Settled canonical name");
+        generated["generated_name"] = json!("Generated short title");
+        // A row with only a generated title shows it, even with no
+        // canonical name at all.
+        let mut generated_only = row("s5", "idle", "/home/dev/epsilon", 0, None);
+        generated_only["generated_name"] = json!("Only generated");
+        // An empty generated title is no title: the canonical name
+        // still shows.
+        let mut empty_generated = row("s6", "idle", "/home/dev/zeta", 0, None);
+        empty_generated["name"] = json!("Canonical still shows");
+        empty_generated["generated_name"] = json!("");
+        let rows = vec![
+            named,
+            empty_named,
+            fallback,
+            generated,
+            generated_only,
+            empty_generated,
+        ];
         let (sessions, _, _) = map_status_rows(&rows);
-        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.len(), 6);
         assert_eq!(sessions[0].title, String::from("Fix the login bug"));
         // An empty name is no name: the short id labels the row.
         assert_eq!(sessions[1].title, String::from("s2"));
         assert_eq!(sessions[2].title, String::from("do the thing"));
+        assert_eq!(sessions[3].title, String::from("Generated short title"));
+        assert_eq!(sessions[4].title, String::from("Only generated"));
+        assert_eq!(sessions[5].title, String::from("Canonical still shows"));
     }
 
     #[test]
@@ -2806,6 +2846,40 @@ mod tests {
             StreamEvent::NameChanged {
                 session: SessionId::new("sess-1"),
                 name: String::from("Fix the login bug"),
+            }
+        );
+        // A frame carrying both titles maps to the generated one.
+        let generated = map_stream_event(&json!({
+            "type": "name-changed",
+            "sessionId": "sess-1",
+            "name": "Settled canonical name",
+            "generatedName": "Generated short title",
+            "origin": "automatic",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            generated,
+            StreamEvent::NameChanged {
+                session: SessionId::new("sess-1"),
+                name: String::from("Generated short title"),
+            }
+        );
+        // A frame with only a generated title maps to it, even with an
+        // empty canonical name.
+        let generated_only = map_stream_event(&json!({
+            "type": "name-changed",
+            "sessionId": "sess-1",
+            "name": "",
+            "generatedName": "Only generated",
+        }))
+        .expect("ok")
+        .expect("known");
+        assert_eq!(
+            generated_only,
+            StreamEvent::NameChanged {
+                session: SessionId::new("sess-1"),
+                name: String::from("Only generated"),
             }
         );
         // A name-changed frame without a name maps to no event.
