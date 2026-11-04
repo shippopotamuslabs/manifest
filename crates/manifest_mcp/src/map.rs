@@ -532,14 +532,8 @@ pub(crate) fn map_stream_event(params: &Value) -> Result<Option<StreamEvent>, St
             // nothing to display and maps to no event rather than an
             // error, matching the server's own gating.
             let origin = params.get("origin").and_then(Value::as_str);
-            let generated = params
-                .get("generatedName")
-                .and_then(Value::as_str)
-                .filter(|generated| !generated.is_empty());
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty());
+            let generated = field_str(params, "generatedName");
+            let name = field_str(params, "name");
             match generated.or(name) {
                 Some(name) => {
                     eprintln!(
