@@ -578,12 +578,12 @@ impl State {
 
     /// Short human name of the selected effort.
     fn effort_name(&self) -> &'static str {
-        effort_choice_name(self.effort)
+        effort_label(self.effort)
     }
 
     /// Short human name of the effort remembered for `choice`.
     fn effort_name_for(&self, choice: &ModelChoice) -> &'static str {
-        effort_choice_name(self.stored_effort(choice))
+        effort_label(self.stored_effort(choice))
     }
 
     /// The effort remembered for `choice`: the live one when it is
@@ -2065,10 +2065,10 @@ impl iced::widget::text::Highlighter for SlashHighlighter {
     }
 }
 
-/// Short human name of one effort choice. The single match both
-/// the pill and the effort submenu read; kept beside the composer
-/// because the domain choice carries wire values only.
-fn effort_choice_name(effort: EffortChoice) -> &'static str {
+/// Short human name of an effort choice. The single mapping the
+/// pill, the menu rows, and the effort submenu all read; kept beside
+/// the composer because the domain choice carries wire values only.
+fn effort_label(effort: EffortChoice) -> &'static str {
     match effort {
         EffortChoice::Default => "Default",
         EffortChoice::None => "None",
@@ -2080,12 +2080,6 @@ fn effort_choice_name(effort: EffortChoice) -> &'static str {
         EffortChoice::Max => "Max",
         EffortChoice::Ultra => "Ultra",
     }
-}
-
-/// Short human name of an effort choice, for the effort submenu.
-/// Pure data the update stores and the view reads.
-fn effort_label(effort: EffortChoice) -> &'static str {
-    effort_choice_name(effort)
 }
 
 #[cfg(test)]
