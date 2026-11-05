@@ -19,8 +19,8 @@ use crate::kit;
 use crate::patch;
 use crate::pending;
 use crate::theme::{
-    ACCENT_BASE, DANGER, FONT_SIZE_BODY, FONT_SIZE_SMALL, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
-    SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
+    ACCENT_BASE, DANGER, FONT_SIZE_BODY, FONT_SIZE_SMALL, RADIUS_PANEL, SPACE_L, SPACE_M, SPACE_S,
+    SPACE_XL, SUCCESS, SURFACE_1, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The text widgets' relative 1.3 line spacing. Confirmed against the
@@ -158,6 +158,18 @@ pub enum Row {
     },
 }
 
+/// One fetched patch: the parsed document plus its precomputed
+/// syntax highlighting (MFST-63). Highlighting runs exactly once in
+/// [`State::apply_patch_loaded`]; renders and re-expands only read
+/// the cache, and the view performs no highlighting work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedPatch {
+    /// The parsed patch document, shown inline while expanded.
+    pub document: PatchDocument,
+    /// Token spans per line, computed once from `document`.
+    pub highlighted: patch::HighlightedPatch,
+}
+
 /// One item's patch-body fetch situation, cached per item for the
 /// session-view lifetime: a re-render or a collapse/re-expand never
 /// refetches. A missing map entry reads as [`PatchLoad::Idle`].
@@ -167,8 +179,9 @@ pub enum PatchLoad {
     Idle,
     /// A fetch is in flight.
     Loading,
-    /// The parsed patch document, shown inline while expanded.
-    Ready(PatchDocument),
+    /// The parsed patch document with its cached highlighting, shown
+    /// inline while expanded.
+    Ready(LoadedPatch),
     /// The fetch failed; the entry shows the message with a Retry.
     Failed(String),
 }
@@ -931,9 +944,17 @@ impl State {
 
     /// Caches a fetched patch document for the session-view lifetime.
     /// Later renders and re-expands read the cache; never refetch.
+    /// Highlighting runs here, exactly once per fetched patch; the
+    /// view only reads the cached spans.
     pub fn apply_patch_loaded(&mut self, item_id: &str, patch: PatchDocument) {
-        self.patches
-            .insert(item_id.to_string(), PatchLoad::Ready(patch));
+        let highlighted = patch::highlight_document(&patch);
+        self.patches.insert(
+            item_id.to_string(),
+            PatchLoad::Ready(LoadedPatch {
+                document: patch,
+                highlighted,
+            }),
+        );
     }
 
     /// Marks one item's patch fetch failed; the entry shows the message
@@ -1278,8 +1299,11 @@ fn entry_height(state: &State, entry: &Entry, content_width: f32) -> f32 {
                     && state.patch_expanded(host_id)
                 {
                     height += match state.patch_status(host_id) {
-                        PatchLoad::Ready(doc) => {
-                            patch::rendered_line_count(&doc, patch::MAX_INLINE_PATCH_LINES) as f32
+                        PatchLoad::Ready(loaded) => {
+                            patch::rendered_line_count(
+                                &loaded.document,
+                                patch::MAX_INLINE_PATCH_LINES,
+                            ) as f32
                                 * LINE_HEIGHT
                         }
                         PatchLoad::Loading => LINE_HEIGHT,
@@ -1553,9 +1577,12 @@ fn render_entry<'a>(
                 ));
                 if expanded && let Some(id) = host_id {
                     match state.patches.get(id) {
-                        Some(PatchLoad::Ready(doc)) => {
-                            column = column
-                                .push(patch::patch_element(doc, patch::MAX_INLINE_PATCH_LINES));
+                        Some(PatchLoad::Ready(loaded)) => {
+                            column = column.push(patch::patch_element(
+                                &loaded.document,
+                                &loaded.highlighted,
+                                patch::MAX_INLINE_PATCH_LINES,
+                            ));
                         }
                         Some(PatchLoad::Loading) => {
                             column = column.push(
@@ -1608,9 +1635,20 @@ fn render_entry<'a>(
     }
 }
 
+/// Style for the code-block container: a flat surface step with
+/// panel corners, so the block reads as one inset panel.
+fn code_block_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(SURFACE_1)),
+        border: iced::Border::default().width(0.0).rounded(RADIUS_PANEL),
+        ..iced::widget::container::Style::default()
+    }
+}
+
 /// Markdown viewer for transcript messages: links report their URI and
-/// code blocks stack a header row (language label when present plus a
-/// Copy button carrying the raw code) over the default rendering.
+/// code blocks render as one surface container holding a header row
+/// (language label when present plus a small Copy button carrying the
+/// raw code) over syntax-highlighted lines.
 struct Viewer;
 
 impl<'a> markdown::Viewer<'a, Message> for Viewer {
@@ -1620,14 +1658,14 @@ impl<'a> markdown::Viewer<'a, Message> for Viewer {
 
     fn code_block(
         &self,
-        settings: markdown::Settings,
+        _settings: markdown::Settings,
         language: Option<&'a str>,
         code: &'a str,
-        lines: &'a [markdown::Text],
+        _lines: &'a [markdown::Text],
     ) -> Element<'a, Message> {
         let mut header = iced::widget::row![].spacing(SPACE_M).width(Length::Fill);
         if let Some(language) = language
-            && !language.is_empty()
+            && !language.trim().is_empty()
         {
             header = header.push(
                 iced::widget::text(language)
@@ -1639,17 +1677,37 @@ impl<'a> markdown::Viewer<'a, Message> for Viewer {
             iced::widget::container(iced::widget::text("").size(FONT_SIZE_SMALL))
                 .width(Length::Fill),
         );
-        header = header.push(kit::tooltip_icon_button(
+        header = header.push(kit::small_tooltip_icon_button(
             lucide_icons::Icon::Copy,
             kit::IconButtonKind::Subtle,
             "Copy",
             Some(Message::Copy(code.to_string())),
         ));
-        iced::widget::column![
-            header,
-            markdown::code_block(settings, lines, Self::on_link_click),
-        ]
-        .spacing(SPACE_M)
+        // Highlighted spans own their text (`String: IntoFragment`), so
+        // the highlight rows borrow nothing: the view builds them fresh
+        // from the raw code on every render. Token colors come from the
+        // theme via [`patch::category_color`]; plain spans fall back to
+        // the primary text tone.
+        let mut lines_column = iced::widget::column![].spacing(0).width(Length::Fill);
+        for line in patch::highlight_code(language, code) {
+            let spans: Vec<iced::widget::text::Span<'_, (), iced::Font>> = line
+                .into_iter()
+                .map(|(text, category)| {
+                    iced::widget::span(text)
+                        .color(patch::category_color(category).unwrap_or(TEXT_PRIMARY))
+                        .font(iced::Font::MONOSPACE)
+                })
+                .collect();
+            lines_column = lines_column
+                .push(iced::widget::rich_text(spans).size(FONT_SIZE_BODY).width(Length::Fill));
+        }
+        iced::widget::container(
+            iced::widget::column![header, lines_column]
+                .spacing(SPACE_S)
+                .width(Length::Fill),
+        )
+        .padding(SPACE_M)
+        .style(code_block_style)
         .width(Length::Fill)
         .into()
     }
@@ -1661,6 +1719,7 @@ mod tests {
         ESTIMATED_CHAR_WIDTH, Entry, EntryKind, Row, State, friendly_unknown, group_headline,
         row_gap_between, row_height, row_tops, wrapped_lines,
     };
+    use crate::patch;
     use crate::theme::{SPACE_L, SPACE_M};
     use manifest_domain::{ItemStatus, StreamItem, fixture};
 
@@ -2620,8 +2679,15 @@ mod tests {
         state.item_completed(patch_item("t-1"));
         assert!(state.toggle_patch("t-1").is_some());
         let doc = patch_document();
+        let highlighted = patch::highlight_document(&doc);
         state.apply_patch_loaded("t-1", doc.clone());
-        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Ready(doc));
+        assert_eq!(
+            state.patch_status("t-1"),
+            super::PatchLoad::Ready(super::LoadedPatch {
+                document: doc,
+                highlighted,
+            })
+        );
         // The expanded view builds over the cached document.
         let _ = state.view();
         // Collapse, then re-expand: no second fetch, cache intact.
@@ -2633,6 +2699,102 @@ mod tests {
             state.patch_status("t-1"),
             super::PatchLoad::Ready(_)
         ));
+        let _ = state.view();
+    }
+
+    #[test]
+    fn patch_loaded_caches_highlighting_once_with_the_document() {
+        use manifest_domain::{PatchFile, PatchHunk, PatchLine, PatchLineKind};
+        let rust = manifest_domain::PatchDocument {
+            files: vec![PatchFile {
+                path: String::from("src/main.rs"),
+                hunks: vec![PatchHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![PatchLine {
+                        kind: PatchLineKind::Added,
+                        text: String::from("+fn main() {"),
+                    }],
+                }],
+            }],
+        };
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert!(state.toggle_patch("t-1").is_some());
+        state.apply_patch_loaded("t-1", rust);
+        let loaded = match state.patch_status("t-1") {
+            super::PatchLoad::Ready(loaded) => loaded,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        // The Rust keyword highlights: at least one non-plain span.
+        assert!(loaded.highlighted.files.iter().any(|file| file
+            .hunks
+            .iter()
+            .any(|hunk| hunk.lines.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|(_, category)| *category != patch::SyntaxCategory::Plain)))));
+        // Spans join back to the stripped line text: nothing lost.
+        let joined: String = loaded.highlighted.files[0].hunks[0].lines[0]
+            .spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(joined, "fn main() {");
+        // Re-render and re-expand keep the cached model bit-identical:
+        // highlighting ran once, inside `apply_patch_loaded`.
+        let _ = state.view();
+        assert!(state.toggle_patch("t-1").is_none());
+        assert!(state.toggle_patch("t-1").is_none());
+        assert_eq!(
+            state.patch_status("t-1"),
+            super::PatchLoad::Ready(loaded)
+        );
+        let _ = state.view();
+    }
+
+    #[test]
+    fn patch_loaded_unknown_language_caches_all_plain_spans() {
+        use manifest_domain::{PatchFile, PatchHunk, PatchLine, PatchLineKind};
+        let unknown = manifest_domain::PatchDocument {
+            files: vec![PatchFile {
+                path: String::from("notes.xyz123"),
+                hunks: vec![PatchHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![PatchLine {
+                        kind: PatchLineKind::Added,
+                        text: String::from("+hello"),
+                    }],
+                }],
+            }],
+        };
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert!(state.toggle_patch("t-1").is_some());
+        state.apply_patch_loaded("t-1", unknown);
+        let loaded = match state.patch_status("t-1") {
+            super::PatchLoad::Ready(loaded) => loaded,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(loaded.highlighted.files.len(), 1);
+        assert_eq!(loaded.highlighted.files[0].language, None);
+        let line = &loaded.highlighted.files[0].hunks[0].lines[0];
+        assert_eq!(
+            line.spans,
+            vec![(String::from("hello"), patch::SyntaxCategory::Plain)]
+        );
+        // Plain carries no token color, so the renderer falls back to
+        // the per-kind diff line color: unknown languages keep their
+        // tints and gutters intact.
+        assert_eq!(
+            patch::category_color(patch::SyntaxCategory::Plain),
+            None
+        );
         let _ = state.view();
     }
 
@@ -2851,5 +3013,30 @@ mod tests {
         state.apply_patch_failed("t-1", String::from("boom"));
         state.update(super::Message::RetryPatch(String::from("t-1")));
         assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
+    }
+
+    #[test]
+    fn code_block_builds_for_known_unknown_and_missing_languages() {
+        use iced::widget::markdown;
+        let viewer = super::Viewer;
+        // Known, unknown, and missing languages all build the custom
+        // block (unknown/missing render all-plain rows inside it).
+        for language in [Some("python"), Some("xyz123"), None] {
+            let _ = markdown::Viewer::code_block(
+                &viewer,
+                super::markdown_settings(),
+                language,
+                "def f():\n    return 42\n",
+                &[],
+            );
+        }
+        // Empty code still builds.
+        let _ = markdown::Viewer::code_block(
+            &viewer,
+            super::markdown_settings(),
+            Some("rust"),
+            "",
+            &[],
+        );
     }
 }

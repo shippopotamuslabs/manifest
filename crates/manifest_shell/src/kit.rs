@@ -22,7 +22,8 @@ use crate::theme::{
     BG_SUBTLE, BORDER_DEFAULT, BORDER_SUBTLE, COMPOSER_INPUT_PADDING, COMPOSER_LINE_HEIGHT,
     CONTEXT_RING_SIZE, CONTEXT_RING_STROKE, DANGER, DIVIDER_HIT_WIDTH, FONT_SIZE_BODY,
     FONT_SIZE_PANEL, FONT_SIZE_PANEL_SMALL, FONT_SIZE_SMALL, GOAL_EDITOR_MAX_LINES,
-    ICON_BUTTON_SIZE, ICON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM, SPACE_L,
+    ICON_BUTTON_SIZE, ICON_SIZE, MENU_ROW_HEIGHT, RADIUS_PANEL, RADIUS_PILL, SCRIM,
+    SMALL_ICON_BUTTON_SIZE, SMALL_ICON_SIZE, SPACE_L,
     SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXS, SUCCESS, SURFACE_1, SURFACE_2, TEXT_FAINT,
     TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
@@ -1438,6 +1439,36 @@ pub(crate) fn icon_button<'a, Message: Clone + 'a>(
     kind: IconButtonKind,
     on_press: Option<Message>,
 ) -> Element<'a, Message> {
+    sized_icon_button(icon, kind, on_press, ICON_BUTTON_SIZE, ICON_SIZE)
+}
+
+/// A compact circular icon button for buttons nested inside content
+/// blocks (e.g. a code block's header row): the same treatment at the
+/// [`SMALL_ICON_BUTTON_SIZE`] scale. The regular [`icon_button`] is
+/// unchanged.
+pub(crate) fn small_icon_button<'a, Message: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    kind: IconButtonKind,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    sized_icon_button(
+        icon,
+        kind,
+        on_press,
+        SMALL_ICON_BUTTON_SIZE,
+        SMALL_ICON_SIZE,
+    )
+}
+
+/// Shared core behind [`icon_button`] and [`small_icon_button`]: a
+/// fixed-square circular button with its glyph centered.
+fn sized_icon_button<'a, Message: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    kind: IconButtonKind,
+    on_press: Option<Message>,
+    button_size: f32,
+    icon_size: f32,
+) -> Element<'a, Message> {
     let style = match kind {
         IconButtonKind::Accent => accent_icon_style,
         IconButtonKind::Subtle => subtle_icon_style,
@@ -1446,12 +1477,12 @@ pub(crate) fn icon_button<'a, Message: Clone + 'a>(
         container(
             text(char::from(icon).to_string())
                 .font(iced::Font::with_name("lucide"))
-                .size(ICON_SIZE),
+                .size(icon_size),
         )
-        .center(Length::Fixed(ICON_BUTTON_SIZE)),
+        .center(Length::Fixed(button_size)),
     )
-    .width(Length::Fixed(ICON_BUTTON_SIZE))
-    .height(Length::Fixed(ICON_BUTTON_SIZE))
+    .width(Length::Fixed(button_size))
+    .height(Length::Fixed(button_size))
     .padding(0.0)
     .on_press_maybe(on_press)
     .style(style)
@@ -1465,8 +1496,30 @@ pub(crate) fn tooltip_icon_button<'a, Message: Clone + 'a>(
     tooltip: &'a str,
     on_press: Option<Message>,
 ) -> Element<'a, Message> {
+    tooltip_wrap(icon_button(icon, kind, on_press), tooltip)
+}
+
+/// A compact icon button with a small tooltip shown above it on
+/// hover: mirrors [`tooltip_icon_button`] at the
+/// [`SMALL_ICON_BUTTON_SIZE`] scale for buttons nested inside content
+/// blocks.
+pub(crate) fn small_tooltip_icon_button<'a, Message: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    kind: IconButtonKind,
+    tooltip: &'a str,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    tooltip_wrap(small_icon_button(icon, kind, on_press), tooltip)
+}
+
+/// Shared tooltip shell behind [`tooltip_icon_button`] and
+/// [`small_tooltip_icon_button`].
+fn tooltip_wrap<'a, Message: Clone + 'a>(
+    content: Element<'a, Message>,
+    tooltip: &'a str,
+) -> Element<'a, Message> {
     iced::widget::tooltip(
-        icon_button(icon, kind, on_press),
+        content,
         container(
             text(tooltip)
                 .size(FONT_SIZE_PANEL_SMALL)

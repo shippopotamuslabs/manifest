@@ -21,3 +21,13 @@ iced = { version = "0.14", features = ["markdown", "canvas"] }
 iced_core = "0.14"
 lucide_icons = { package = "lucide-icons", version = "1", features = ["iced"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Syntax tokenizer for patch code highlighting (MFST-63, step 1).
+# Minimal pure-Rust backend: default syntax definitions + fancy-regex
+# engine (no oniguruma C dependency) + YAML loader for the vendored
+# extra syntaxes in assets/syntax/ (`SyntaxDefinition::load_from_str`
+# needs `yaml-load`; still pure Rust via yaml-rust).
+# Note: the backend feature is named `regex-fancy` (it pulls in the
+# `fancy-regex` crate); the bare `fancy-regex` feature only adds the
+# dep without wiring the backend.
+# Deliberately no `default-themes`: token colors come from theme.rs.
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy", "yaml-load"] }
