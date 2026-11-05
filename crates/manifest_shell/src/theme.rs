@@ -60,6 +60,16 @@ pub const DANGER: Color = Color::from_rgb8(0xE0, 0x7A, 0x7A);
 #[allow(dead_code)]
 pub const INFO: Color = Color::from_rgb8(0x7B, 0xB5, 0xD6);
 
+// Syntax token colors (MFST-63): foregrounds over the existing diff
+// background tints; diff meaning stays in the tints and gutters.
+pub const SYNTAX_KEYWORD: Color = ACCENT_BASE; // keyword: accent indigo family.
+pub const SYNTAX_STRING: Color = SUCCESS; // string: success green family.
+pub const SYNTAX_COMMENT: Color = TEXT_FAINT; // comment: faint gray text ramp.
+pub const SYNTAX_TYPE: Color = INFO; // type: info blue family.
+pub const SYNTAX_FUNCTION: Color = WARNING; // function: warning tan family.
+pub const SYNTAX_NUMBER: Color = Color::from_rgb8(0xE0, 0x9E, 0x7A); // number: warm coral between warning tan and danger red.
+pub const SYNTAX_CONSTANT: Color = Color::from_rgb8(0x8A, 0xC9, 0xC4); // constant: teal between info blue and success green.
+
 // Spacing scale in logical pixels.
 #[allow(dead_code)]
 pub const SPACE_XXS: f32 = 2.0;
@@ -96,6 +106,12 @@ pub const SCRIM: Color = with_alpha(BG_BASE, 0.65);
 pub const COMPOSER_MAX_LINES: usize = 5;
 pub const COMPOSER_LINE_HEIGHT: f32 = 27.0;
 pub const ICON_BUTTON_SIZE: f32 = 36.0;
+// Compact icon-button geometry for buttons nested inside content
+// blocks (e.g. the Copy button in a code block's header row): same
+// circular treatment at roughly two-thirds scale, so the button reads
+// as part of the block rather than a peer of the bar buttons.
+pub const SMALL_ICON_BUTTON_SIZE: f32 = 26.0;
+pub const SMALL_ICON_SIZE: f32 = 15.0;
 // Context ring geometry: the clickable usage ring at the sub-bar's
 // right end. A fixed square with a thin track circle plus a progress
 // arc; kit reads both tokens, call sites name no value.
