@@ -47,7 +47,14 @@ pub enum ItemStatus {
 ///
 /// The mapper classifies every item the host streams; the shell renders
 /// from these variants instead of raw JSON.
+///
+/// The `ToolCall` variant dominates by design: transcript values flow
+/// by value through channels into the reducer, which matches and
+/// compares full items in headless tests, so boxing the item to
+/// please the size lint would churn every match site for no
+/// behavioral gain.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamItem {
     /// Something the user wrote; the prompt echo.
     UserMessage {
@@ -92,6 +99,15 @@ pub enum StreamItem {
         output: Option<String>,
         /// Machine-readable failure detail; present on failed calls.
         failure: Option<String>,
+        /// Server-authored diff summary (`added`/`removed` line counts
+        /// plus the file-entry count); present only on edit-family
+        /// calls whose item carried a usable `patchSummary`.
+        patch_summary: Option<PatchSummary>,
+        /// Stored diff reference; the shell fetches the body through
+        /// [`SessionEngine::load_patch`]. Absent when the item carried
+        /// no `patchRef`, and dropped (like an absent ref) when the
+        /// ref names an unavailable body: both render counts only.
+        patch_ref: Option<PatchRef>,
     },
     /// Host bookkeeping with no user-facing content.
     ///
@@ -142,6 +158,138 @@ impl StreamItem {
             | Self::Compaction { item_id, .. }
             | Self::Unknown { item_id, .. } => item_id,
         }
+    }
+}
+
+/// Server-authored edit-family diff summary, carried beside the
+/// stored patch reference.
+///
+/// `added`/`removed` are total `+`/`-`-prefixed LINE counts summed
+/// over the stored patch's hunks across all files (line counts,
+/// never hunk or byte counts); `files` counts the stored document's
+/// file entries. The shell always renders these server counts, never
+/// client-recomputed ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchSummary {
+    /// Total `+`-prefixed line count across all files' hunks.
+    pub added: u64,
+    /// Total `-`-prefixed line count across all files' hunks.
+    pub removed: u64,
+    /// File entries in the stored patch document.
+    pub files: u64,
+}
+
+/// Stored structured-patch reference for one tool call.
+///
+/// The body is fetched via `item/readOutput` with [`PatchRef::id`]
+/// as the `outputRef` param. Only the id travels back on fetch;
+/// `kind`, `media_type`, and `byte_len` ride along for display and
+/// diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchRef {
+    /// The stored output's durable id; sent back as `outputRef`.
+    pub id: String,
+    /// The stored output's kind, verbatim (e.g. `"tool_patch"`).
+    pub kind: Option<String>,
+    /// The stored output's media type (e.g. `"application/json"`).
+    pub media_type: Option<String>,
+    /// Stored byte length, when recorded.
+    pub byte_len: Option<u64>,
+}
+
+/// One diff line's classification.
+///
+/// String lines classify by first byte only (`+` added, `-`
+/// removed, `@` hunk header, anything else — including `" "`,
+/// empty, or unknown prefixes — context), so classification is
+/// total and never panics. Object lines (`{type, text}`) classify
+/// by their `type` when it names a known kind, else [`PatchLineKind::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchLineKind {
+    /// A `+`-prefixed (or `added`-typed) line.
+    Added,
+    /// A `-`-prefixed (or `removed`-typed) line.
+    Removed,
+    /// A context line (or `context`-typed).
+    Context,
+    /// A hunk header line (or `header`-typed).
+    Header,
+    /// An object line whose `type` named no known kind.
+    Other,
+}
+
+/// One line of a patch hunk: its classification plus its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchLine {
+    /// How the line classified.
+    pub kind: PatchLineKind,
+    /// The line's text, verbatim (prefix included for string lines).
+    pub text: String,
+}
+
+/// One unified-diff-style hunk of a patch file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchHunk {
+    /// First line number in the old file (1-based).
+    pub old_start: u64,
+    /// Line count in the old file.
+    pub old_lines: u64,
+    /// First line number in the new file (1-based).
+    pub new_start: u64,
+    /// Line count in the new file.
+    pub new_lines: u64,
+    /// Hunk lines in document order.
+    pub lines: Vec<PatchLine>,
+}
+
+/// One file entry of a patch document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchFile {
+    /// Workspace path of the patched file.
+    pub path: String,
+    /// Hunks in document order.
+    pub hunks: Vec<PatchHunk>,
+}
+
+impl PatchFile {
+    /// Added-line count over this file's hunks, by classification.
+    pub fn added(&self) -> u64 {
+        self.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind == PatchLineKind::Added)
+            .count() as u64
+    }
+
+    /// Removed-line count over this file's hunks, by classification.
+    pub fn removed(&self) -> u64 {
+        self.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind == PatchLineKind::Removed)
+            .count() as u64
+    }
+}
+
+/// A stored structured-patch document: file entries in document order.
+///
+/// The parser never depends on entry ordering (multi-file ordering
+/// is unobserved upstream).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchDocument {
+    /// File entries in document order.
+    pub files: Vec<PatchFile>,
+}
+
+impl PatchDocument {
+    /// Added-line count across all files, by classification.
+    pub fn added(&self) -> u64 {
+        self.files.iter().map(PatchFile::added).sum()
+    }
+
+    /// Removed-line count across all files, by classification.
+    pub fn removed(&self) -> u64 {
+        self.files.iter().map(PatchFile::removed).sum()
     }
 }
 
@@ -1383,6 +1531,10 @@ pub enum FailedCommand {
     Goal(SessionId),
     /// Fetching this session's stored history failed.
     History(SessionId),
+    /// Fetching one tool call's stored patch body failed; carries
+    /// the session and the item the fetch addressed, so one item's
+    /// failure never releases another item's fetch.
+    Patch(SessionId, String),
     /// Fetching pending approvals/questions failed.
     ///
     /// The fetch is global (`muse_pending` takes no session), so
@@ -1399,7 +1551,13 @@ pub enum FailedCommand {
 /// `PartialEq` without `Eq`: [`StreamEvent`] (carried by
 /// [`EngineEvent::Stream`]) holds a float goal percent, which has no
 /// total equality.
+///
+/// The `Stream` variant dominates by design: it carries the
+/// [`StreamItem`] values (see its own size note) by value so the
+/// shell matches without indirection, so the size difference is
+/// accepted rather than boxed through every stream match site.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum EngineEvent {
     /// The engine connection state changed.
     ConnectionChanged(Connection),
@@ -1463,6 +1621,17 @@ pub enum EngineEvent {
         /// Stored items, oldest first; system items ride along and
         /// the shell drops them while seeding.
         items: Vec<StreamItem>,
+    },
+    /// A stored patch-body fetch succeeded; the shell caches the
+    /// document per item for the session-view lifetime and never
+    /// refetches on re-render.
+    PatchLoaded {
+        /// Session the item belongs to.
+        session: SessionId,
+        /// Item the patch body belongs to.
+        item_id: String,
+        /// The parsed patch document.
+        patch: PatchDocument,
     },
     /// A command failed while the connection stays up.
     ///
@@ -1540,6 +1709,16 @@ pub trait SessionEngine: Send + Sync {
     /// [`FailedCommand::History`]. Engines without history support
     /// keep the default, which drops the call.
     fn load_history(&self, _session: SessionId) {}
+    /// Fetch one tool call's stored patch body.
+    ///
+    /// Non-blocking; `patch_ref_id` is the item's
+    /// [`PatchRef::id`](PatchRef), sent back as the `item/readOutput`
+    /// `outputRef` param. Success arrives as
+    /// [`EngineEvent::PatchLoaded`], failure as
+    /// [`EngineEvent::CommandFailed`] with
+    /// [`FailedCommand::Patch`]. Engines without patch support keep
+    /// the default, which drops the call.
+    fn load_patch(&self, _session: SessionId, _item_id: String, _patch_ref_id: String) {}
     /// Inject `prompt` into the running `turn` of `session`.
     ///
     /// Non-blocking; failure (idle session, unknown turn) arrives as
@@ -1705,6 +1884,8 @@ mod tests {
                     status: ItemStatus::InProgress,
                     output: None,
                     failure: None,
+                    patch_summary: None,
+                    patch_ref: None,
                 },
                 "t",
             ),
@@ -1971,6 +2152,12 @@ mod tests {
         engine.cancel_turn(SessionId::new("s"), Some(TurnId::new("t")));
         engine.list_models(None, None);
         engine.list_skills(SessionId::new("s"));
+        engine.load_history(SessionId::new("s"));
+        engine.load_patch(
+            SessionId::new("s"),
+            String::from("item-1"),
+            String::from("ref-1"),
+        );
         engine.pause_goal(SessionId::new("s"));
         engine.resume_goal(SessionId::new("s"));
         engine.edit_goal(SessionId::new("s"), String::from("ship it"));
@@ -1987,6 +2174,43 @@ mod tests {
             String::from("r1"),
             PendingAnswer::single("q1", AnswerValue::Skipped),
         );
+    }
+
+    #[test]
+    fn patch_counts_tally_classified_lines() {
+        let line = |kind| PatchLine {
+            kind,
+            text: String::new(),
+        };
+        let document = PatchDocument {
+            files: vec![
+                PatchFile {
+                    path: String::from("/w/a.txt"),
+                    hunks: vec![PatchHunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 2,
+                        lines: vec![
+                            line(PatchLineKind::Context),
+                            line(PatchLineKind::Removed),
+                            line(PatchLineKind::Added),
+                            line(PatchLineKind::Header),
+                            line(PatchLineKind::Other),
+                        ],
+                    }],
+                },
+                PatchFile {
+                    path: String::from("/w/b.txt"),
+                    hunks: vec![],
+                },
+            ],
+        };
+        assert_eq!(document.files[0].added(), 1);
+        assert_eq!(document.files[0].removed(), 1);
+        assert_eq!(document.files[1].added(), 0);
+        assert_eq!(document.added(), 1);
+        assert_eq!(document.removed(), 1);
     }
 
     #[test]

@@ -47,6 +47,12 @@ pub const ACCENT_MUTED_BG: Color = with_alpha(ACCENT_BASE, 0.15);
 #[allow(dead_code)]
 pub const FOCUS_RING: Color = with_alpha(ACCENT_BASE, 0.40);
 
+// Diff background tints: translucent semantic fills behind added and
+// removed diff lines (full-line red/green tints). Line text on a tint
+// reads TEXT_PRIMARY; gutters and signs keep their kind tones.
+pub const DIFF_ADDED_BG: Color = with_alpha(SUCCESS, 0.22);
+pub const DIFF_REMOVED_BG: Color = with_alpha(DANGER, 0.22);
+
 // Semantics.
 pub const SUCCESS: Color = Color::from_rgb8(0x7D, 0xBE, 0x8C);
 pub const WARNING: Color = Color::from_rgb8(0xD9, 0xB0, 0x7A);

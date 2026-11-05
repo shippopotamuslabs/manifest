@@ -115,6 +115,14 @@ impl EngineHandle {
         self.inner.load_history(session);
     }
 
+    /// Fetches one tool call's stored patch body; results arrive as
+    /// `PatchLoaded`, failures as `CommandFailed(Patch)`. The shell
+    /// fetches once per item on first expand; the transcript cache
+    /// owns the body after that.
+    pub fn load_patch(&self, session: SessionId, item_id: String, patch_ref_id: String) {
+        self.inner.load_patch(session, item_id, patch_ref_id);
+    }
+
     /// Compacts the session's context; failures arrive as
     /// `CommandFailed(Compact)`, success emits nothing.
     pub fn compact_session(&self, session: SessionId) {
@@ -416,6 +424,17 @@ mod tests {
     #[derive(Clone)]
     struct RecordingEngine {
         resumed: std::sync::Arc<std::sync::Mutex<Vec<SessionId>>>,
+        patches: std::sync::Arc<std::sync::Mutex<Vec<(SessionId, String, String)>>>,
+    }
+
+    impl RecordingEngine {
+        /// Empty recorder for handle-passthrough tests.
+        fn new() -> Self {
+            Self {
+                resumed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                patches: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl SessionEngine for RecordingEngine {
@@ -433,6 +452,13 @@ mod tests {
 
         fn resume_session(&self, session: SessionId) {
             self.resumed.lock().unwrap().push(session);
+        }
+
+        fn load_patch(&self, session: SessionId, item_id: String, patch_ref_id: String) {
+            self.patches
+                .lock()
+                .unwrap()
+                .push((session, item_id, patch_ref_id));
         }
     }
 
@@ -458,10 +484,26 @@ mod tests {
 
     #[test]
     fn resume_passthrough_forwards_session() {
-        let engine = RecordingEngine {
-            resumed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+        let engine = RecordingEngine::new();
         EngineHandle::new(engine.clone()).resume_session(SessionId::new("s-1"));
         assert_eq!(*engine.resumed.lock().unwrap(), vec![SessionId::new("s-1")]);
+    }
+
+    #[test]
+    fn patch_passthrough_forwards_session_item_and_ref() {
+        let engine = RecordingEngine::new();
+        EngineHandle::new(engine.clone()).load_patch(
+            SessionId::new("s-1"),
+            String::from("item-1"),
+            String::from("ref-1"),
+        );
+        assert_eq!(
+            *engine.patches.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("item-1"),
+                String::from("ref-1")
+            )]
+        );
     }
 }

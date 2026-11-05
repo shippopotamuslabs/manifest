@@ -1981,6 +1981,28 @@ impl App {
                     self.apply_pending(child);
                     Task::none()
                 }
+                // Patch toggles/retries mark the visible transcript (which
+                // owns expansion + cache for the session-view lifetime) and
+                // the fetch issues here: only the app knows the visible
+                // session the fetch needs, and state cannot produce tasks.
+                transcript::Message::TogglePatch(item_id) => {
+                    if let Some(fetch) = self.transcript.toggle_patch(&item_id)
+                        && let (Some(session), Some(engine)) =
+                            (self.visible_session.clone(), &self.engine)
+                    {
+                        engine.load_patch(session, fetch.item_id, fetch.patch_ref_id);
+                    }
+                    Task::none()
+                }
+                transcript::Message::RetryPatch(item_id) => {
+                    if let Some(fetch) = self.transcript.retry_patch(&item_id)
+                        && let (Some(session), Some(engine)) =
+                            (self.visible_session.clone(), &self.engine)
+                    {
+                        engine.load_patch(session, fetch.item_id, fetch.patch_ref_id);
+                    }
+                    Task::none()
+                }
                 other => {
                     self.transcript.update(other);
                     Task::none()
@@ -2239,6 +2261,15 @@ impl App {
                                     // session stays sendable.
                                     self.history_requested.remove(&session);
                                 }
+                                manifest_domain::FailedCommand::Patch(session, item_id) => {
+                                    // One item's fetch failed: the entry
+                                    // shows the message with a Retry while
+                                    // the counts line stays rendered. The
+                                    // transcript line above carries the
+                                    // failure like every other command.
+                                    self.target_transcript(&session)
+                                        .apply_patch_failed(&item_id, message.clone());
+                                }
                                 manifest_domain::FailedCommand::Turn(session) => {
                                     // The optimistically started turn
                                     // never began: end it for this
@@ -2381,6 +2412,18 @@ impl App {
                             } else {
                                 self.stored_transcript(&session).seed_history(items);
                             }
+                        }
+                        EngineEvent::PatchLoaded {
+                            session,
+                            item_id,
+                            patch,
+                        } => {
+                            // Caches the body in the owning transcript
+                            // (visible or parked) for the session-view
+                            // lifetime; later renders and re-expands read
+                            // the cache and never refetch.
+                            self.target_transcript(&session)
+                                .apply_patch_loaded(&item_id, patch);
                         }
                         EngineEvent::PendingLoaded { requests } => {
                             appended = self.apply_pending_loaded(requests);
@@ -3363,6 +3406,8 @@ mod tests {
                 status: manifest_domain::ItemStatus::Completed,
                 output: None,
                 failure: None,
+                patch_summary: None,
+                patch_ref: None,
             },
         }
     }
@@ -3383,6 +3428,8 @@ mod tests {
                 status: manifest_domain::ItemStatus::InProgress,
                 output: None,
                 failure: None,
+                patch_summary: None,
+                patch_ref: None,
             },
         }
     }
@@ -3729,6 +3776,9 @@ mod tests {
         models: std::sync::Arc<std::sync::Mutex<Vec<ModelsCall>>>,
         skills: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         histories: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
+        patches:
+            std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String, String)>>>,
+
         compacts: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
         goals: std::sync::Arc<std::sync::Mutex<Vec<(manifest_domain::SessionId, String)>>>,
         goal_pauses: std::sync::Arc<std::sync::Mutex<Vec<manifest_domain::SessionId>>>,
@@ -3802,6 +3852,18 @@ mod tests {
             self.histories.lock().unwrap().push(session);
         }
 
+        fn load_patch(
+            &self,
+            session: manifest_domain::SessionId,
+            item_id: String,
+            patch_ref_id: String,
+        ) {
+            self.patches
+                .lock()
+                .unwrap()
+                .push((session, item_id, patch_ref_id));
+        }
+
         fn compact_session(&self, session: manifest_domain::SessionId) {
             self.compacts.lock().unwrap().push(session);
         }
@@ -3868,6 +3930,7 @@ mod tests {
             models: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             histories: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            patches: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             compacts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             goal_pauses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -6914,6 +6977,143 @@ mod tests {
         assert_eq!(
             *fake.histories.lock().unwrap(),
             vec![SessionId::new("sess-orphan")]
+        );
+    }
+
+    /// A completed tool item carrying the server patch pair.
+    fn patch_tool_completed(session: &str, item_id: &str) -> manifest_domain::StreamEvent {
+        manifest_domain::StreamEvent::ItemCompleted {
+            session: SessionId::new(session),
+            turn: None,
+            view_cursor: None,
+            item: manifest_domain::StreamItem::ToolCall {
+                item_id: String::from(item_id),
+                tool: String::from("write_file"),
+                headline: Some(String::from("src/main.rs")),
+                args_json: String::new(),
+                todos: None,
+                status: manifest_domain::ItemStatus::Completed,
+                output: None,
+                failure: None,
+                patch_summary: Some(manifest_domain::PatchSummary {
+                    added: 1,
+                    removed: 0,
+                    files: 1,
+                }),
+                patch_ref: Some(manifest_domain::PatchRef {
+                    id: String::from("ref-1"),
+                    kind: Some(String::from("tool_patch")),
+                    media_type: Some(String::from("application/json")),
+                    byte_len: None,
+                }),
+            },
+        }
+    }
+
+    fn patch_doc() -> manifest_domain::PatchDocument {
+        manifest_domain::PatchDocument { files: Vec::new() }
+    }
+
+    #[test]
+    fn toggle_patch_visible_fetches_once_then_serves_from_cache() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        stream(&mut app, patch_tool_completed("s-1", "t-1"));
+        // Expanding the visible entry fetches through the visible session.
+        let _ = app.update(Message::Transcript(
+            crate::transcript::Message::TogglePatch(String::from("t-1")),
+        ));
+        assert_eq!(
+            *fake.patches.lock().unwrap(),
+            vec![(
+                SessionId::new("s-1"),
+                String::from("t-1"),
+                String::from("ref-1")
+            )]
+        );
+        // The loaded body caches in the visible transcript.
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PatchLoaded {
+                session: SessionId::new("s-1"),
+                item_id: String::from("t-1"),
+                patch: patch_doc(),
+            }),
+        );
+        assert!(matches!(
+            app.transcript.patch_status("t-1"),
+            crate::transcript::PatchLoad::Ready(_)
+        ));
+        // Collapse and re-expand: the cache serves, no second fetch.
+        let _ = app.update(Message::Transcript(
+            crate::transcript::Message::TogglePatch(String::from("t-1")),
+        ));
+        let _ = app.update(Message::Transcript(
+            crate::transcript::Message::TogglePatch(String::from("t-1")),
+        ));
+        assert_eq!(fake.patches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn patch_loaded_for_background_lands_in_parked_transcript() {
+        let (mut app, _) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1", "s-2"]);
+        assert_eq!(app.visible_session, Some(SessionId::new("s-1")));
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::PatchLoaded {
+                session: SessionId::new("s-2"),
+                item_id: String::from("t-9"),
+                patch: patch_doc(),
+            }),
+        );
+        // The visible transcript is untouched; the parked one caches.
+        assert_eq!(
+            app.transcript.patch_status("t-9"),
+            crate::transcript::PatchLoad::Idle
+        );
+        assert!(matches!(
+            app.transcripts
+                .get(&SessionId::new("s-2"))
+                .expect("parked transcript exists")
+                .patch_status("t-9"),
+            crate::transcript::PatchLoad::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn patch_failure_marks_entry_and_retry_refetches() {
+        let (mut app, fake) = live_app();
+        deliver_connected(&mut app);
+        loaded(&mut app, &["s-1"]);
+        stream(&mut app, patch_tool_completed("s-1", "t-1"));
+        let _ = app.update(Message::Transcript(
+            crate::transcript::Message::TogglePatch(String::from("t-1")),
+        ));
+        assert_eq!(fake.patches.lock().unwrap().len(), 1);
+        deliver(
+            &mut app,
+            engine::Input::event(manifest_domain::EngineEvent::CommandFailed {
+                command: manifest_domain::FailedCommand::Patch(
+                    SessionId::new("s-1"),
+                    String::from("t-1"),
+                ),
+                message: String::from("boom"),
+            }),
+        );
+        assert!(matches!(
+            app.transcript.patch_status("t-1"),
+            crate::transcript::PatchLoad::Failed(_)
+        ));
+        let _ = app.update(Message::Transcript(crate::transcript::Message::RetryPatch(
+            String::from("t-1"),
+        )));
+        assert_eq!(fake.patches.lock().unwrap().len(), 2);
+        assert_eq!(
+            app.transcript.patch_status("t-1"),
+            crate::transcript::PatchLoad::Loading
         );
     }
 
