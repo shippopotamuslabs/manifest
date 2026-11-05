@@ -369,6 +369,28 @@ pub(crate) fn history_call(id: u64, session_id: &str) -> String {
     )
 }
 
+/// A `tools/call` request reading one stored patch body through `muse_raw`.
+///
+/// The host method is `item/readOutput` with `sessionId`, `itemId`,
+/// `outputRef` (the item's `patchRef.id`), and `offsetBytes` (a
+/// read, so no `commandId`). The worker pages `offsetBytes` forward
+/// by each reply's `byteLen` until `eof`, then parses the
+/// concatenated body as the patch document.
+pub(crate) fn patch_call(
+    id: u64,
+    session_id: &str,
+    item_id: &str,
+    patch_ref_id: &str,
+    offset: u64,
+) -> String {
+    raw_call(
+        id,
+        session_id,
+        "item/readOutput",
+        json!({"sessionId": session_id, "itemId": item_id, "outputRef": patch_ref_id, "offsetBytes": offset}),
+    )
+}
+
 /// A `tools/call` request invoking `muse_cancel` with the given numeric id.
 ///
 /// Argument names follow the server's `muse_cancel` input schema:
@@ -1004,6 +1026,29 @@ mod tests {
             .expect("params present");
         assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
         assert_eq!(params.get("excludeItems"), Some(&json!(false)));
+        assert!(params.get("commandId").is_none());
+    }
+
+    #[test]
+    fn patch_call_sends_item_read_output_without_command_id() {
+        let value: Value = serde_json::from_str(&patch_call(9, "sess-1", "item-7", "ref-3", 41))
+            .expect("valid JSON");
+        assert_eq!(value.pointer("/params/name"), Some(&json!("muse_raw")));
+        assert_eq!(
+            value.pointer("/params/arguments/session_id"),
+            Some(&json!("sess-1"))
+        );
+        assert_eq!(
+            value.pointer("/params/arguments/method"),
+            Some(&json!("item/readOutput"))
+        );
+        let params = value
+            .pointer("/params/arguments/params")
+            .expect("params present");
+        assert_eq!(params.get("sessionId"), Some(&json!("sess-1")));
+        assert_eq!(params.get("itemId"), Some(&json!("item-7")));
+        assert_eq!(params.get("outputRef"), Some(&json!("ref-3")));
+        assert_eq!(params.get("offsetBytes"), Some(&json!(41)));
         assert!(params.get("commandId").is_none());
     }
 

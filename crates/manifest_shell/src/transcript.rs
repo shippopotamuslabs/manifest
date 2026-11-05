@@ -7,17 +7,20 @@
 //! [`iced::widget::markdown::Content`]; only the live entry re-renders
 //! while it streams (UI contract §3).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use iced::widget::markdown;
 use iced::{Element, Length};
-use manifest_domain::{ItemStatus, SessionId, StreamItem, TranscriptItem};
+use manifest_domain::{
+    ItemStatus, PatchDocument, PatchRef, PatchSummary, SessionId, StreamItem, TranscriptItem,
+};
 
 use crate::kit;
+use crate::patch;
 use crate::pending;
 use crate::theme::{
-    ACCENT_BASE, DANGER, FONT_SIZE_BODY, FONT_SIZE_SMALL, SPACE_L, SPACE_M, SPACE_XL, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_TERTIARY,
+    ACCENT_BASE, DANGER, FONT_SIZE_BODY, FONT_SIZE_SMALL, SPACE_L, SPACE_M, SPACE_S, SPACE_XL,
+    SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY,
 };
 
 /// The text widgets' relative 1.3 line spacing. Confirmed against the
@@ -103,6 +106,12 @@ pub enum EntryKind {
         status: ItemStatus,
         /// Machine-readable failure detail; present on failed calls.
         failure: Option<String>,
+        /// Server-authored diff counts; present on edit-family calls.
+        /// Items without a summary render exactly as before.
+        patch_summary: Option<PatchSummary>,
+        /// Stored diff reference; the body fetches on first expand.
+        /// Items without a ref render exactly as before.
+        patch_ref: Option<PatchRef>,
     },
     /// A note worth showing inline, e.g. a fixture tool summary or an
     /// unknown item kind the shell renders instead of dropping.
@@ -149,6 +158,32 @@ pub enum Row {
     },
 }
 
+/// One item's patch-body fetch situation, cached per item for the
+/// session-view lifetime: a re-render or a collapse/re-expand never
+/// refetches. A missing map entry reads as [`PatchLoad::Idle`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchLoad {
+    /// No fetch attempted yet (or no ref to fetch).
+    Idle,
+    /// A fetch is in flight.
+    Loading,
+    /// The parsed patch document, shown inline while expanded.
+    Ready(PatchDocument),
+    /// The fetch failed; the entry shows the message with a Retry.
+    Failed(String),
+}
+
+/// A patch-body fetch the shell must issue: the transcript marked
+/// the item loading, and the app (which owns the session mapping the
+/// transcript never sees) calls `load_patch` with these handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchFetch {
+    /// Host item handle the patch body belongs to.
+    pub item_id: String,
+    /// Stored output id, sent back as the `item/readOutput` outputRef.
+    pub patch_ref_id: String,
+}
+
 /// Transcript state: shell entries, their derived rows, and
 /// scroll-derived sticky data.
 #[derive(Debug)]
@@ -159,6 +194,11 @@ pub struct State {
     pub rows: Vec<Row>,
     /// Group keys currently expanded.
     expanded: HashSet<String>,
+    /// Host item ids with an expanded inline patch.
+    patch_expanded: HashSet<String>,
+    /// Patch-body fetch situations by host item id; lives for the
+    /// session-view lifetime (one [`State`] per session view).
+    patches: HashMap<String, PatchLoad>,
     /// Markdown rendering config, built once from theme tokens.
     settings: markdown::Settings,
     /// Absolute vertical scroll offset in px, from the last viewport.
@@ -180,6 +220,8 @@ impl Default for State {
             entries: Vec::new(),
             rows: Vec::new(),
             expanded: HashSet::new(),
+            patch_expanded: HashSet::new(),
+            patches: HashMap::new(),
             settings: markdown_settings(),
             scroll_offset: 0.0,
             content_width: 0.0,
@@ -203,6 +245,14 @@ pub enum Message {
     /// A Copy button was pressed; the app writes the text to the
     /// clipboard (a `Task`, which state cannot produce).
     Copy(String),
+    /// A patch affordance was pressed: the app marks the item through
+    /// [`State::toggle_patch`] and issues the returned fetch, mirroring
+    /// the `Copy` interception (state cannot produce tasks, and only the
+    /// app knows the visible session the fetch needs).
+    TogglePatch(String),
+    /// A patch Retry button was pressed: same interception as
+    /// [`Message::TogglePatch`], via [`State::retry_patch`].
+    RetryPatch(String),
     /// A markdown link was clicked. No-op in this slice: link opening
     /// lands later, which will read the URI.
     #[allow(dead_code)]
@@ -284,9 +334,28 @@ fn reasoning_text(summary: &[String]) -> String {
     summary.join("\n")
 }
 
-/// Whether an entry joins a group run.
+/// Whether a tool entry carries a diff: a summary, a stored ref, or both.
+fn is_diff_bearing(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::Tool {
+            patch_summary: Some(_),
+            ..
+        } | EntryKind::Tool {
+            patch_ref: Some(_),
+            ..
+        }
+    )
+}
+
+/// Whether an entry joins a group run. Diff-bearing tools render as
+/// standalone rows in the main flow, never inside a group.
 fn is_groupable(kind: &EntryKind) -> bool {
-    matches!(kind, EntryKind::Reasoning { .. } | EntryKind::Tool { .. })
+    match kind {
+        EntryKind::Reasoning { .. } => true,
+        EntryKind::Tool { .. } => !is_diff_bearing(kind),
+        _ => false,
+    }
 }
 
 /// Whether an entry is a user prompt (the only sticky row kind).
@@ -327,6 +396,8 @@ fn entry_from_item(item: &StreamItem, completed: bool) -> Option<Entry> {
             output,
             status,
             failure,
+            patch_summary,
+            patch_ref,
             ..
         } => EntryKind::Tool {
             tool: tool.clone(),
@@ -334,6 +405,8 @@ fn entry_from_item(item: &StreamItem, completed: bool) -> Option<Entry> {
             output: output.clone().unwrap_or_default(),
             status: status.clone(),
             failure: failure.clone(),
+            patch_summary: *patch_summary,
+            patch_ref: patch_ref.clone(),
         },
         StreamItem::System { .. } => return None,
         StreamItem::Compaction {
@@ -642,6 +715,8 @@ impl State {
                             output,
                             status,
                             failure,
+                            patch_summary,
+                            patch_ref,
                         },
                         StreamItem::ToolCall {
                             tool: next_tool,
@@ -649,6 +724,8 @@ impl State {
                             output: next_output,
                             status: next_status,
                             failure: next_failure,
+                            patch_summary: next_summary,
+                            patch_ref: next_ref,
                             ..
                         },
                     ) => {
@@ -659,6 +736,10 @@ impl State {
                         }
                         *status = next_status.clone();
                         *failure = next_failure.clone();
+                        // Completed is authoritative: the pair lands
+                        // wholesale, including `None`.
+                        *patch_summary = *next_summary;
+                        *patch_ref = next_ref.clone();
                     }
                     (
                         EntryKind::Reasoning { summary },
@@ -737,8 +818,9 @@ impl State {
     }
 
     /// Derives rows from entries: a maximal run of consecutive
-    /// reasoning/tool entries forms one group (even a run of one);
-    /// everything else stands alone. Expanded flags persist by key.
+    /// groupable (reasoning/non-diff tool) entries forms one group
+    /// (even a run of one); diff-bearing tools break runs and stand
+    /// alone. Expanded flags persist by key.
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
         let mut index = 0;
@@ -771,8 +853,11 @@ impl State {
     }
 
     /// Reducer: folds viewport samples and group toggles into state.
-    /// Copy is intercepted by the app (clipboard is a `Task`); link
-    /// clicks are a documented no-op in this slice.
+    /// Copy is intercepted by the app (clipboard is a `Task`); patch
+    /// toggles/retries are likewise intercepted there so the fetch the
+    /// state names can issue with the visible session. The headless arms
+    /// below still mark loading with no fetch, so reducer tests drive
+    /// them directly. Link clicks are a documented no-op in this slice.
     pub fn update(&mut self, message: Message) {
         match message {
             Message::Scrolled(viewport) => {
@@ -786,8 +871,89 @@ impl State {
                 }
                 self.rebuild_rows();
             }
+            Message::TogglePatch(item_id) => {
+                let _ = self.toggle_patch(&item_id);
+            }
+            Message::RetryPatch(item_id) => {
+                let _ = self.retry_patch(&item_id);
+            }
             Message::Copy(_) | Message::LinkClicked(_) | Message::Pending(_) => {}
         }
+    }
+
+    /// Patch-body fetch situation for `item_id`; a missing entry reads
+    /// as idle, so items without a ref never fetch.
+    pub fn patch_status(&self, item_id: &str) -> PatchLoad {
+        self.patches
+            .get(item_id)
+            .cloned()
+            .unwrap_or(PatchLoad::Idle)
+    }
+
+    /// Whether the item's inline patch is expanded.
+    pub fn patch_expanded(&self, item_id: &str) -> bool {
+        self.patch_expanded.contains(item_id)
+    }
+
+    /// Toggles one tool entry's inline patch. Collapsing never fetches;
+    /// expanding an idle item with a ref marks it loading and returns
+    /// the fetch for the app to issue. Ready, loading, and failed items
+    /// just expand; items without a ref stay collapsed.
+    pub fn toggle_patch(&mut self, item_id: &str) -> Option<PatchFetch> {
+        if self.patch_expanded.remove(item_id) {
+            return None;
+        }
+        let ref_id = self.tool_patch_ref(item_id)?;
+        self.patch_expanded.insert(item_id.to_string());
+        match self.patches.get(item_id) {
+            Some(PatchLoad::Loading | PatchLoad::Ready(_) | PatchLoad::Failed(_)) => None,
+            _ => {
+                self.patches.insert(item_id.to_string(), PatchLoad::Loading);
+                Some(PatchFetch {
+                    item_id: item_id.to_string(),
+                    patch_ref_id: ref_id,
+                })
+            }
+        }
+    }
+
+    /// Retries one item's patch fetch: marks it loading and returns the
+    /// fetch for the app to issue. Items without a ref never fetch.
+    pub fn retry_patch(&mut self, item_id: &str) -> Option<PatchFetch> {
+        let ref_id = self.tool_patch_ref(item_id)?;
+        self.patch_expanded.insert(item_id.to_string());
+        self.patches.insert(item_id.to_string(), PatchLoad::Loading);
+        Some(PatchFetch {
+            item_id: item_id.to_string(),
+            patch_ref_id: ref_id,
+        })
+    }
+
+    /// Caches a fetched patch document for the session-view lifetime.
+    /// Later renders and re-expands read the cache; never refetch.
+    pub fn apply_patch_loaded(&mut self, item_id: &str, patch: PatchDocument) {
+        self.patches
+            .insert(item_id.to_string(), PatchLoad::Ready(patch));
+    }
+
+    /// Marks one item's patch fetch failed; the entry shows the message
+    /// with a Retry. The counts line stays rendered throughout.
+    pub fn apply_patch_failed(&mut self, item_id: &str, message: String) {
+        self.patches
+            .insert(item_id.to_string(), PatchLoad::Failed(message));
+    }
+
+    /// The stored patch ref id for a tool entry, if it carries one.
+    fn tool_patch_ref(&self, item_id: &str) -> Option<String> {
+        self.entries.iter().find_map(|entry| {
+            if entry.host_id.as_deref() != Some(item_id) {
+                return None;
+            }
+            match &entry.kind {
+                EntryKind::Tool { patch_ref, .. } => patch_ref.as_ref().map(|pref| pref.id.clone()),
+                _ => None,
+            }
+        })
     }
 
     /// Folds one viewport sample into scroll and sticky state. Tests in
@@ -803,7 +969,7 @@ impl State {
             self.sticky_height = 0.0;
             return;
         }
-        let tops = row_tops(&self.rows, &self.entries, content_width);
+        let tops = row_tops(self, content_width);
         // Rule: nothing sticks while the offset sits at or above the top
         // of the first user prompt. There the overlay would exactly cover
         // the natural bubble, so leaving it out is cleaner.
@@ -829,7 +995,7 @@ impl State {
                 self.sticky_height = 0.0;
             }
             Some(row) => {
-                let height = row_height(&self.rows[row], &self.entries, content_width);
+                let height = row_height(self, &self.rows[row], content_width);
                 let next_top =
                     self.rows
                         .iter()
@@ -900,7 +1066,7 @@ impl State {
             }
             list = list.push(render_row(
                 item,
-                &self.entries,
+                self,
                 self.settings,
                 pending_state,
                 session,
@@ -984,6 +1150,8 @@ fn refresh_entry(entry: &mut Entry, item: &StreamItem) {
                 output,
                 status,
                 failure,
+                patch_summary,
+                patch_ref,
             },
             StreamItem::ToolCall {
                 tool: next_tool,
@@ -991,6 +1159,8 @@ fn refresh_entry(entry: &mut Entry, item: &StreamItem) {
                 output: next_output,
                 status: next_status,
                 failure: next_failure,
+                patch_summary: next_summary,
+                patch_ref: next_ref,
                 ..
             },
         ) => {
@@ -1007,6 +1177,14 @@ fn refresh_entry(entry: &mut Entry, item: &StreamItem) {
             }
             *status = next_status.clone();
             *failure = next_failure.clone();
+            // Started values converge: a patch pair arriving mid-stream
+            // replaces; empty started values never wipe a carried pair.
+            if next_summary.is_some() {
+                *patch_summary = *next_summary;
+            }
+            if next_ref.is_some() {
+                *patch_ref = next_ref.clone();
+            }
         }
         _ => {}
     }
@@ -1055,9 +1233,10 @@ fn wrapped_lines(text: &str, text_width: f32) -> usize {
 /// horizontal padding (see [`kit::prompt_bubble`]) and taller by its
 /// vertical padding; assistant text spans the full content width with a
 /// Copy row under completed messages; tool entries stack one headline
-/// line over wrapped output and failure lines. These constants must
-/// match the kit constructors and the column spacing.
-fn entry_height(entry: &Entry, content_width: f32) -> f32 {
+/// line over wrapped output and failure lines, plus the patch counts
+/// affordance line and the capped inline patch while expanded. These
+/// constants must match the kit constructors and the column spacing.
+fn entry_height(state: &State, entry: &Entry, content_width: f32) -> f32 {
     let full_width = content_width.max(ESTIMATED_CHAR_WIDTH);
     match &entry.kind {
         EntryKind::User { text } => {
@@ -1076,7 +1255,10 @@ fn entry_height(entry: &Entry, content_width: f32) -> f32 {
             wrapped_lines(&reasoning_text(summary), full_width) as f32 * LINE_HEIGHT
         }
         EntryKind::Tool {
-            output, failure, ..
+            output,
+            failure,
+            patch_summary,
+            ..
         } => {
             let mut height = LINE_HEIGHT;
             if !output.is_empty() {
@@ -1086,6 +1268,25 @@ fn entry_height(entry: &Entry, content_width: f32) -> f32 {
                 && !failure.is_empty()
             {
                 height += wrapped_lines(failure, full_width) as f32 * LINE_HEIGHT;
+            }
+            // The counts affordance line, plus the expanded body; the
+            // body count mirrors [`patch::rendered_line_count`] so the
+            // estimator and the view cannot drift.
+            if patch_summary.is_some() {
+                height += LINE_HEIGHT;
+                if let Some(host_id) = entry.host_id.as_deref()
+                    && state.patch_expanded(host_id)
+                {
+                    height += match state.patch_status(host_id) {
+                        PatchLoad::Ready(doc) => {
+                            patch::rendered_line_count(&doc, patch::MAX_INLINE_PATCH_LINES) as f32
+                                * LINE_HEIGHT
+                        }
+                        PatchLoad::Loading => LINE_HEIGHT,
+                        PatchLoad::Failed(_) => 2.0 * LINE_HEIGHT,
+                        PatchLoad::Idle => 0.0,
+                    };
+                }
             }
             height
         }
@@ -1099,9 +1300,9 @@ fn entry_height(entry: &Entry, content_width: f32) -> f32 {
 /// Estimated row height in px. A collapsed group is one header row;
 /// an expanded group stacks its header over its members with inner
 /// single-spacing gaps above each member.
-fn row_height(row: &Row, entries: &[Entry], content_width: f32) -> f32 {
+fn row_height(state: &State, row: &Row, content_width: f32) -> f32 {
     match row {
-        Row::Single(index) => entry_height(&entries[*index], content_width),
+        Row::Single(index) => entry_height(state, &state.entries[*index], content_width),
         Row::Group {
             first,
             last,
@@ -1112,7 +1313,7 @@ fn row_height(row: &Row, entries: &[Entry], content_width: f32) -> f32 {
                 return GROUP_HEADER_HEIGHT;
             }
             let members: f32 = (*first..=*last)
-                .map(|index| entry_height(&entries[index], content_width))
+                .map(|index| entry_height(state, &state.entries[index], content_width))
                 .sum();
             GROUP_HEADER_HEIGHT + (last - first + 1) as f32 * SPACE_M + members
         }
@@ -1133,15 +1334,15 @@ fn row_gap_between(previous: &Row, current: &Row, entries: &[Entry]) -> f32 {
 /// Top edge of every row in px. Rows stack with [`row_gap_between`] of
 /// the neighboring pair between them, no spacing before the first, and
 /// the content carries no other padding.
-fn row_tops(rows: &[Row], entries: &[Entry], content_width: f32) -> Vec<f32> {
-    let mut tops = Vec::with_capacity(rows.len());
+fn row_tops(state: &State, content_width: f32) -> Vec<f32> {
+    let mut tops = Vec::with_capacity(state.rows.len());
     let mut top = 0.0;
-    for (index, row) in rows.iter().enumerate() {
+    for (index, row) in state.rows.iter().enumerate() {
         if index > 0 {
-            top += row_gap_between(&rows[index - 1], row, entries);
+            top += row_gap_between(&state.rows[index - 1], row, &state.entries);
         }
         tops.push(top);
-        top += row_height(row, entries, content_width);
+        top += row_height(state, row, content_width);
     }
     tops
 }
@@ -1150,13 +1351,19 @@ fn row_tops(rows: &[Row], entries: &[Entry], content_width: f32) -> Vec<f32> {
 /// below it while expanded.
 fn render_row<'a>(
     row: &'a Row,
-    entries: &'a [Entry],
+    state: &'a State,
     settings: markdown::Settings,
     pending_state: Option<&'a pending::State>,
     session: Option<&'a SessionId>,
 ) -> Element<'a, Message> {
     match row {
-        Row::Single(index) => render_entry(&entries[*index], settings, pending_state, session),
+        Row::Single(index) => render_entry(
+            &state.entries[*index],
+            state,
+            settings,
+            pending_state,
+            session,
+        ),
         Row::Group {
             first,
             last,
@@ -1171,12 +1378,84 @@ fn render_row<'a>(
             )]
             .width(Length::Fill);
             if *expanded {
-                for entry in entries.iter().take(*last + 1).skip(*first) {
-                    column = column.push(render_entry(entry, settings, pending_state, session));
+                for entry in state.entries.iter().take(*last + 1).skip(*first) {
+                    column =
+                        column.push(render_entry(entry, state, settings, pending_state, session));
                 }
             }
             column.into()
         }
+    }
+}
+
+/// Whether a headline reads as a file path: the patch affordance names
+/// the file from it instead of repeating the files count.
+fn headline_is_path(headline: &str) -> bool {
+    headline.contains('/') || headline.contains('\\')
+}
+
+/// Display name for the patch affordance: the headline when it looks
+/// like a path, else the files count. Never fabricates a file name.
+fn patch_name(headline: &Option<String>, files: u64) -> String {
+    match headline {
+        Some(line) if !line.is_empty() && headline_is_path(line) => line.clone(),
+        _ => format!("{files} file(s)"),
+    }
+}
+
+/// Transparent button style for the patch affordance row: the row's
+/// own text widgets carry the tones, so the button adds no chrome.
+fn affordance_style(
+    _theme: &iced::Theme,
+    _status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    iced::widget::button::Style {
+        background: None,
+        ..iced::widget::button::Style::default()
+    }
+}
+
+/// The patch counts line: `{name} · +{added} −{removed}` with the
+/// added count in success and the removed count in danger. Clickable
+/// (expand/collapse) only while a stored ref can fetch the body; plain
+/// text otherwise.
+fn patch_affordance<'a>(
+    host_id: Option<&str>,
+    expanded: bool,
+    name: String,
+    summary: &PatchSummary,
+    fetchable: bool,
+) -> Element<'a, Message> {
+    let counts = iced::widget::row![
+        kit::icon(
+            kit::drawer_chevron(expanded),
+            FONT_SIZE_SMALL,
+            TEXT_TERTIARY
+        ),
+        iced::widget::text(name)
+            .size(FONT_SIZE_SMALL)
+            .color(TEXT_SECONDARY),
+        iced::widget::text(MIDDOT)
+            .size(FONT_SIZE_SMALL)
+            .color(TEXT_TERTIARY),
+        iced::widget::text(format!("+{}", summary.added))
+            .size(FONT_SIZE_SMALL)
+            .color(SUCCESS),
+        iced::widget::text(format!("−{}", summary.removed))
+            .size(FONT_SIZE_SMALL)
+            .color(DANGER),
+    ]
+    .spacing(SPACE_S)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+    match (host_id, fetchable) {
+        (Some(id), true) => iced::widget::button(counts)
+            .width(Length::Fill)
+            .padding([crate::theme::SPACE_XS, SPACE_S])
+            .on_press(Message::TogglePatch(id.to_string()))
+            .style(affordance_style)
+            .into(),
+        _ => counts.into(),
     }
 }
 
@@ -1185,6 +1464,7 @@ fn render_row<'a>(
 /// own their data): Copy buttons clone the text they will write.
 fn render_entry<'a>(
     entry: &'a Entry,
+    state: &'a State,
     settings: markdown::Settings,
     pending_state: Option<&'a pending::State>,
     session: Option<&'a SessionId>,
@@ -1217,6 +1497,8 @@ fn render_entry<'a>(
             headline,
             output,
             failure,
+            patch_summary,
+            patch_ref,
             ..
         } => {
             let name = if tool.is_empty() {
@@ -1256,6 +1538,50 @@ fn render_entry<'a>(
                     )
                     .width(Length::Fill),
                 );
+            }
+            // The server-authored counts line rides below the result;
+            // expanding it shows the cached patch body inline.
+            if let Some(summary) = patch_summary {
+                let host_id = entry.host_id.as_deref();
+                let expanded = host_id.is_some_and(|id| state.patch_expanded(id));
+                column = column.push(patch_affordance(
+                    host_id,
+                    expanded,
+                    patch_name(headline, summary.files),
+                    summary,
+                    patch_ref.is_some(),
+                ));
+                if expanded && let Some(id) = host_id {
+                    match state.patches.get(id) {
+                        Some(PatchLoad::Ready(doc)) => {
+                            column = column
+                                .push(patch::patch_element(doc, patch::MAX_INLINE_PATCH_LINES));
+                        }
+                        Some(PatchLoad::Loading) => {
+                            column = column.push(
+                                iced::widget::text("Loading diff…")
+                                    .size(FONT_SIZE_BODY)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        }
+                        Some(PatchLoad::Failed(message)) => {
+                            column = column.push(
+                                iced::widget::column![
+                                    iced::widget::text(message.as_str())
+                                        .size(FONT_SIZE_BODY)
+                                        .color(DANGER),
+                                    kit::pill_button(
+                                        "Retry",
+                                        kit::ButtonKind::Ghost,
+                                        Some(Message::RetryPatch(id.to_string())),
+                                    ),
+                                ]
+                                .width(Length::Fill),
+                            );
+                        }
+                        Some(PatchLoad::Idle) | None => {}
+                    }
+                }
             }
             column.into()
         }
@@ -1391,6 +1717,8 @@ mod tests {
             status,
             output: output.map(String::from),
             failure: failure.map(String::from),
+            patch_summary: None,
+            patch_ref: None,
         }
     }
 
@@ -1474,19 +1802,21 @@ mod tests {
             completed: true,
         };
         let width = 600.0;
-        let gap = super::entry_height(&user, width) - super::entry_height(&note, width);
+        let probe = State::default();
+        let gap =
+            super::entry_height(&probe, &user, width) - super::entry_height(&probe, &note, width);
         assert!((gap - 2.0 * SPACE_L).abs() < 0.001);
     }
 
     #[test]
     fn tops_accumulate_height_plus_spacing() {
         let state = State::from_items(fixture().transcript);
-        let tops = row_tops(&state.rows, &state.entries, 600.0);
+        let tops = row_tops(&state, 600.0);
         assert_eq!(tops.len(), state.rows.len());
         assert_eq!(tops[0], 0.0);
         for (index, top) in tops.iter().enumerate().skip(1) {
             let want = tops[index - 1]
-                + row_height(&state.rows[index - 1], &state.entries, 600.0)
+                + row_height(&state, &state.rows[index - 1], 600.0)
                 + row_gap_between(&state.rows[index - 1], &state.rows[index], &state.entries);
             assert!((top - want).abs() < 0.001);
         }
@@ -1553,7 +1883,7 @@ mod tests {
     #[test]
     fn scrolled_past_first_prompt_sticks_it() {
         let mut state = State::from_items(fixture().transcript);
-        let tops = row_tops(&state.rows, &state.entries, 600.0);
+        let tops = row_tops(&state, 600.0);
         let users = user_rows(&state);
         assert!(users.len() >= 2);
         state.on_viewport(tops[users[0]] + 1.0, 600.0);
@@ -1565,9 +1895,9 @@ mod tests {
     #[test]
     fn incoming_prompt_pushes_sticky_up() {
         let mut state = State::from_items(fixture().transcript);
-        let tops = row_tops(&state.rows, &state.entries, 600.0);
+        let tops = row_tops(&state, 600.0);
         let users = user_rows(&state);
-        let height = row_height(&state.rows[users[0]], &state.entries, 600.0);
+        let height = row_height(&state, &state.rows[users[0]], 600.0);
         let offset = tops[users[1]] - height / 2.0;
         state.on_viewport(offset, 600.0);
         assert_eq!(state.sticky, Some(users[0]));
@@ -1577,7 +1907,7 @@ mod tests {
     #[test]
     fn arriving_at_next_prompt_switches_sticky() {
         let mut state = State::from_items(fixture().transcript);
-        let tops = row_tops(&state.rows, &state.entries, 600.0);
+        let tops = row_tops(&state, 600.0);
         let users = user_rows(&state);
         state.on_viewport(tops[users[1]], 600.0);
         assert_eq!(state.sticky, Some(users[1]));
@@ -1588,8 +1918,8 @@ mod tests {
     fn narrower_width_recomputes_sticky() {
         let mut state = State::from_items(fixture().transcript);
         let users = user_rows(&state);
-        let tops_wide = row_tops(&state.rows, &state.entries, 600.0);
-        let height_wide = row_height(&state.rows[users[0]], &state.entries, 600.0);
+        let tops_wide = row_tops(&state, 600.0);
+        let height_wide = row_height(&state, &state.rows[users[0]], 600.0);
         let offset = tops_wide[users[1]] - height_wide / 2.0;
         state.on_viewport(offset, 600.0);
         assert_eq!(state.sticky, Some(users[0]));
@@ -1659,7 +1989,7 @@ mod tests {
         assert!(super::pending_element(&pending_state, Some(&session), "missing").is_none());
         let entry = &state.entries[0];
         assert_eq!(
-            super::entry_height(entry, 600.0),
+            super::entry_height(&state, entry, 600.0),
             super::PENDING_CARD_HEIGHT
         );
         // The full view builds with the inline card present.
@@ -2165,16 +2495,16 @@ mod tests {
             None,
         ));
         let width = 600.0;
-        let collapsed = row_height(&state.rows[0], &state.entries, width);
+        let collapsed = row_height(&state, &state.rows[0], width);
         assert!((collapsed - super::GROUP_HEADER_HEIGHT).abs() < 0.001);
         let key = match &state.rows[0] {
             Row::Group { key, .. } => key.clone(),
             Row::Single(_) => panic!("reasoning plus tool must group"),
         };
         state.update(super::Message::ToggleGroup(key));
-        let expanded = row_height(&state.rows[0], &state.entries, width);
+        let expanded = row_height(&state, &state.rows[0], width);
         assert!(expanded > collapsed);
-        let tops = row_tops(&state.rows, &state.entries, width);
+        let tops = row_tops(&state, width);
         assert_eq!(tops[0], 0.0);
     }
 
@@ -2187,10 +2517,339 @@ mod tests {
         state.push_user(String::from("second"));
         // Rows: user, group, user.
         assert_eq!(state.rows.len(), 3);
-        let tops = row_tops(&state.rows, &state.entries, 600.0);
+        let tops = row_tops(&state, 600.0);
         state.on_viewport(tops[2], 600.0);
         assert_eq!(state.sticky, Some(2));
         state.on_viewport(tops[0] + 1.0, 600.0);
         assert_eq!(state.sticky, Some(0));
+    }
+
+    fn patch_summary() -> manifest_domain::PatchSummary {
+        manifest_domain::PatchSummary {
+            added: 3,
+            removed: 1,
+            files: 1,
+        }
+    }
+
+    fn patch_ref() -> manifest_domain::PatchRef {
+        manifest_domain::PatchRef {
+            id: String::from("ref-1"),
+            kind: Some(String::from("tool_patch")),
+            media_type: Some(String::from("application/json")),
+            byte_len: Some(128),
+        }
+    }
+
+    fn patch_item(id: &str) -> StreamItem {
+        StreamItem::ToolCall {
+            item_id: String::from(id),
+            tool: String::from("write_file"),
+            headline: Some(String::from("src/main.rs")),
+            args_json: String::new(),
+            todos: None,
+            status: ItemStatus::Completed,
+            output: None,
+            failure: None,
+            patch_summary: Some(patch_summary()),
+            patch_ref: Some(patch_ref()),
+        }
+    }
+
+    fn patch_document() -> manifest_domain::PatchDocument {
+        use manifest_domain::{PatchFile, PatchHunk, PatchLine, PatchLineKind};
+        manifest_domain::PatchDocument {
+            files: vec![PatchFile {
+                path: String::from("src/main.rs"),
+                hunks: vec![PatchHunk {
+                    old_start: 1,
+                    old_lines: 2,
+                    new_start: 1,
+                    new_lines: 4,
+                    lines: vec![
+                        PatchLine {
+                            kind: PatchLineKind::Context,
+                            text: String::from(" context"),
+                        },
+                        PatchLine {
+                            kind: PatchLineKind::Removed,
+                            text: String::from("-old"),
+                        },
+                        PatchLine {
+                            kind: PatchLineKind::Added,
+                            text: String::from("+new"),
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn completed_patch_item_carries_summary_and_ref_to_entry() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert!(matches!(
+            &state.entries[0].kind,
+            EntryKind::Tool {
+                patch_summary: Some(summary),
+                patch_ref: Some(pref),
+                ..
+            } if *summary == patch_summary() && pref.id == "ref-1"
+        ));
+        // The full view builds with the collapsed counts line present.
+        let _ = state.view();
+    }
+
+    #[test]
+    fn expand_idle_patch_marks_loading_and_names_fetch() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Idle);
+        let fetch = state.toggle_patch("t-1").expect("idle with ref must fetch");
+        assert_eq!(fetch.item_id, "t-1");
+        assert_eq!(fetch.patch_ref_id, "ref-1");
+        assert!(state.patch_expanded("t-1"));
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
+        let _ = state.view();
+    }
+
+    #[test]
+    fn patch_loaded_caches_ready_and_reexpand_never_refetches() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert!(state.toggle_patch("t-1").is_some());
+        let doc = patch_document();
+        state.apply_patch_loaded("t-1", doc.clone());
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Ready(doc));
+        // The expanded view builds over the cached document.
+        let _ = state.view();
+        // Collapse, then re-expand: no second fetch, cache intact.
+        assert!(state.toggle_patch("t-1").is_none());
+        assert!(!state.patch_expanded("t-1"));
+        assert!(state.toggle_patch("t-1").is_none());
+        assert!(state.patch_expanded("t-1"));
+        assert!(matches!(
+            state.patch_status("t-1"),
+            super::PatchLoad::Ready(_)
+        ));
+        let _ = state.view();
+    }
+
+    #[test]
+    fn patch_failure_shows_failed_and_retry_refetches() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert!(state.toggle_patch("t-1").is_some());
+        state.apply_patch_failed("t-1", String::from("boom"));
+        assert_eq!(
+            state.patch_status("t-1"),
+            super::PatchLoad::Failed(String::from("boom"))
+        );
+        // The failed view builds with its Retry affordance.
+        let _ = state.view();
+        let fetch = state.retry_patch("t-1").expect("retry must refetch");
+        assert_eq!(fetch.patch_ref_id, "ref-1");
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
+    }
+
+    #[test]
+    fn tool_without_patch_never_expands_or_fetches() {
+        let mut state = State::default();
+        state.item_completed(tool_item(
+            "t-1",
+            "bash",
+            Some("ls"),
+            Some("ok"),
+            ItemStatus::Completed,
+            None,
+        ));
+        assert!(state.toggle_patch("t-1").is_none());
+        assert!(!state.patch_expanded("t-1"));
+        assert!(state.retry_patch("t-1").is_none());
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Idle);
+        // Items without a summary render exactly as before.
+        let _ = state.view();
+    }
+
+    #[test]
+    fn expanded_patch_grows_entry_height() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        let width = 600.0;
+        let collapsed = super::entry_height(&state, &state.entries[0], width);
+        assert!(state.toggle_patch("t-1").is_some());
+        let loading = super::entry_height(&state, &state.entries[0], width);
+        assert!(loading > collapsed);
+        state.apply_patch_loaded("t-1", patch_document());
+        let ready = super::entry_height(&state, &state.entries[0], width);
+        // Path + hunk header + 3 lines = 5 body lines over loading's 1.
+        assert!(ready > loading);
+        let _ = state.view();
+    }
+
+    #[test]
+    fn seed_history_carries_patch_fields() {
+        let mut state = State::default();
+        assert!(state.seed_history(vec![patch_item("t-1")]));
+        assert!(matches!(
+            &state.entries[0].kind,
+            EntryKind::Tool {
+                patch_summary: Some(_),
+                patch_ref: Some(_),
+                ..
+            }
+        ));
+        assert!(state.entries[0].completed);
+    }
+
+    #[test]
+    fn diff_tool_splits_groups_and_renders_single_in_order() {
+        use super::is_diff_bearing;
+        let mut state = State::default();
+        state.item_completed(reasoning_item("r-1", &["plan"]));
+        state.item_completed(tool_item(
+            "t-1",
+            "bash",
+            Some("ls"),
+            Some("ok"),
+            ItemStatus::Completed,
+            None,
+        ));
+        state.item_completed(patch_item("t-2"));
+        state.item_completed(tool_item(
+            "t-3",
+            "bash",
+            Some("pwd"),
+            Some("ok"),
+            ItemStatus::Completed,
+            None,
+        ));
+        state.item_completed(reasoning_item("r-2", &["next"]));
+        assert!(is_diff_bearing(&state.entries[2].kind));
+        assert_eq!(state.rows.len(), 3);
+        assert!(matches!(
+            &state.rows[0],
+            Row::Group { first: 0, last: 1, .. }
+        ));
+        assert!(matches!(&state.rows[1], Row::Single(2)));
+        assert!(matches!(
+            &state.rows[2],
+            Row::Group { first: 3, last: 4, .. }
+        ));
+        // Order preserved: the single sits between the two groups.
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.host_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(String::from("r-1")),
+                Some(String::from("t-1")),
+                Some(String::from("t-2")),
+                Some(String::from("t-3")),
+                Some(String::from("r-2")),
+            ]
+        );
+        let _ = state.view();
+    }
+
+    #[test]
+    fn group_headlines_exclude_diff_tool() {
+        let mut state = State::default();
+        state.item_completed(reasoning_item("r-1", &["plan"]));
+        state.item_completed(tool_item(
+            "t-1",
+            "bash",
+            Some("ls"),
+            Some("ok"),
+            ItemStatus::Completed,
+            None,
+        ));
+        state.item_completed(patch_item("t-2"));
+        state.item_completed(tool_item(
+            "t-3",
+            "bash",
+            Some("pwd"),
+            Some("ok"),
+            ItemStatus::Completed,
+            None,
+        ));
+        state.item_completed(reasoning_item("r-2", &["next"]));
+        assert!(matches!(
+            &state.rows[0],
+            Row::Group { headline, .. } if headline == "Thinking · 1 tool call"
+        ));
+        assert!(matches!(
+            &state.rows[2],
+            Row::Group { headline, .. } if headline == "Thinking · 1 tool call"
+        ));
+    }
+
+    #[test]
+    fn completing_tool_with_patch_moves_it_out_of_group() {
+        let mut state = State::default();
+        state.item_started(reasoning_item("r-1", &["plan"]));
+        state.item_started(tool_item(
+            "t-1",
+            "write_file",
+            Some("src/main.rs"),
+            None,
+            ItemStatus::InProgress,
+            None,
+        ));
+        // Still groupable while the patch pair has not arrived.
+        assert_eq!(state.rows.len(), 1);
+        assert!(matches!(&state.rows[0], Row::Group { .. }));
+        state.item_completed(patch_item("t-1"));
+        state.item_completed(reasoning_item("r-1", &["plan"]));
+        assert_eq!(state.rows.len(), 2);
+        assert!(matches!(
+            &state.rows[0],
+            Row::Group { first: 0, last: 0, .. }
+        ));
+        assert!(matches!(&state.rows[1], Row::Single(1)));
+    }
+
+    #[test]
+    fn seeded_history_diff_item_is_single() {
+        let mut state = State::default();
+        assert!(state.seed_history(vec![patch_item("t-1")]));
+        assert_eq!(state.rows.len(), 1);
+        assert!(matches!(&state.rows[0], Row::Single(0)));
+    }
+
+    #[test]
+    fn patch_toggle_on_single_row_still_loads() {
+        let mut state = State::default();
+        state.item_completed(reasoning_item("r-1", &["plan"]));
+        state.item_completed(patch_item("t-1"));
+        assert!(matches!(&state.rows[1], Row::Single(1)));
+        state.update(super::Message::TogglePatch(String::from("t-1")));
+        assert!(state.patch_expanded("t-1"));
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
+        state.apply_patch_loaded("t-1", patch_document());
+        let _ = state.view();
+    }
+
+    #[test]
+    fn lone_diff_tool_is_one_single_row_with_no_group() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        assert_eq!(state.rows.len(), 1);
+        assert!(matches!(&state.rows[0], Row::Single(0)));
+    }
+
+    #[test]
+    fn patch_messages_drive_toggle_and_retry_headlessly() {
+        let mut state = State::default();
+        state.item_completed(patch_item("t-1"));
+        state.update(super::Message::TogglePatch(String::from("t-1")));
+        assert!(state.patch_expanded("t-1"));
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
+        state.apply_patch_failed("t-1", String::from("boom"));
+        state.update(super::Message::RetryPatch(String::from("t-1")));
+        assert_eq!(state.patch_status("t-1"), super::PatchLoad::Loading);
     }
 }

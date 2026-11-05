@@ -12,7 +12,8 @@
 use crate::error::Error;
 use manifest_domain::{
     ApprovalChoiceSummary, ApprovalRequest, EngineEvent, GoalInfo, GoalStatus, ItemStatus,
-    ModelInfo, PendingKind, PendingPhase, PendingRequest, Question, QuestionOption,
+    ModelInfo, PatchDocument, PatchFile, PatchHunk, PatchLine, PatchLineKind, PatchRef,
+    PatchSummary, PendingKind, PendingPhase, PendingRequest, Question, QuestionOption,
     QuestionRequest, SessionId, SessionStatus, SessionSummary, SkillInfo, StreamEvent, StreamItem,
     TodoItem, TodoStatus, TurnId, UsageKind, UsageSnapshot,
 };
@@ -375,6 +376,8 @@ fn parse_stream_item(item: &Value) -> Result<StreamItem, String> {
                     .get("failureReason")
                     .and_then(Value::as_str)
                     .map(String::from),
+                patch_summary: parse_patch_summary(item),
+                patch_ref: parse_patch_ref(item),
             })
         }
         "reminderChild" => Ok(StreamItem::System {
@@ -1144,6 +1147,335 @@ pub(crate) fn history_truncation_diagnostic(none_reason: &str) -> Option<String>
     } else {
         None
     }
+}
+
+/// Cap on one fetched patch body, in stored bytes.
+///
+/// The server serves up to 6 MiB per `item/readOutput` page; the
+/// total matches that page max, so a body that does not fit one
+/// full page fails as a value instead of growing without bound. The
+/// counts line still renders; only the expand shows the failure.
+pub(crate) const MAX_PATCH_BYTES: u64 = 6 * 1024 * 1024;
+
+/// Lenient `u64` for wire numbers: integers ride as-is, and a
+/// finite non-negative float truncates (the server's counts are
+/// whole numbers; anything else is not a count).
+fn u64_lenient(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .and_then(|float| (float.is_finite() && float >= 0.0).then_some(float as u64))
+    })
+}
+
+/// Lenient `patchSummary` (`{added, removed, files}` counts).
+///
+/// All three counts are required; an absent or malformed summary —
+/// a missing object, a non-count field — stays `None`, never an
+/// item failure. Items without a summary render exactly as today.
+fn parse_patch_summary(item: &Value) -> Option<PatchSummary> {
+    let summary = item.get("patchSummary")?.as_object()?;
+    let count = |key: &str| -> Option<u64> { summary.get(key).and_then(u64_lenient) };
+    Some(PatchSummary {
+        added: count("added")?,
+        removed: count("removed")?,
+        files: count("files")?,
+    })
+}
+
+/// Lenient `patchRef` (stored patch reference).
+///
+/// The id is required and non-empty; `kind`, `mediaType`, and
+/// `byteLen` ride when present and well-formed. An absent or
+/// malformed ref stays `None`, never an item failure. A ref whose
+/// `availability` names anything but `available` (for example
+/// `missing` or `accessFailed`) also maps to `None`: the body is
+/// not servable, so the item renders counts only and never fetches.
+/// A missing `availability` reads as servable.
+fn parse_patch_ref(item: &Value) -> Option<PatchRef> {
+    let reference = item.get("patchRef")?.as_object()?;
+    if reference
+        .get("availability")
+        .and_then(Value::as_str)
+        .is_some_and(|availability| availability != "available")
+    {
+        return None;
+    }
+    let id = reference
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    Some(PatchRef {
+        id: id.to_string(),
+        kind: reference
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(String::from),
+        media_type: reference
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .map(String::from),
+        byte_len: reference.get("byteLen").and_then(u64_lenient),
+    })
+}
+
+/// One `item/readOutput` page: the decoded bytes of this range plus
+/// the paging cursor the worker advances with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PatchPage {
+    /// Decoded bytes served in this response.
+    pub bytes: Vec<u8>,
+    /// Stored bytes served in this response; the next page's
+    /// `offsetBytes` is `offset_bytes + byte_len`.
+    pub byte_len: u64,
+    /// The stored-byte offset this response served from.
+    pub offset_bytes: u64,
+    /// Whether this range reached the end of the stored output.
+    pub eof: bool,
+}
+
+/// Decode one base-64 page body into its stored bytes.
+///
+/// Standard alphabet with `=` padding; ASCII whitespace is
+/// skipped. Anything outside the alphabet fails: a garbled page is
+/// a fetch failure value, never a panic.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some((byte - b'A') as u32),
+            b'a'..=b'z' => Some((byte - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((byte - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if clean.is_empty() {
+        return Some(Vec::new());
+    }
+    if !clean.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = clean.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let mut group: u32 = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'=' {
+                // Padding only closes the final quantum.
+                if index < 2 {
+                    return None;
+                }
+                group <<= 6;
+            } else {
+                group = (group << 6) | sextet(*byte)?;
+            }
+        }
+        out.push((group >> 16) as u8);
+        if chunk[2] != b'=' {
+            out.push((group >> 8) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push(group as u8);
+        }
+    }
+    // A padded quantum must not smuggle payload bits in the pad.
+    if padding > 0 && out.len() != clean.len() / 4 * 3 - padding {
+        return None;
+    }
+    Some(out)
+}
+
+/// Map a `muse_raw` `item/readOutput` result into its page.
+///
+/// The content text parses as the method result: one page object
+/// with `content`, `encoding` (`utf8` for text media like the
+/// patch's `application/json`, `base64` for binary), `byteLen`,
+/// `offsetBytes`, and `eof`. `encoding` defaults to `utf8` when
+/// absent; `byteLen` defaults to the decoded length; `offsetBytes`
+/// defaults to 0. A missing `eof` or an unknown `encoding` fails
+/// the page: without the end marker or the decode contract the
+/// worker cannot page safely. A server-authored `isError` body
+/// passes through as the failure text; anything else that does not
+/// parse fails with the friendly generic message, mirroring
+/// [`map_models_result`].
+pub(crate) fn map_patch_result(result: &Value) -> Result<PatchPage, String> {
+    let generic = "Couldn't load that tool call's diff from the Muse MCP server.";
+    // Each message converts to String exactly once, at this boundary.
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        let text = first_text_opt(result).unwrap_or_else(|| String::from(generic));
+        return Err(Error::Tool(text).to_string());
+    }
+    let text = match first_text_opt(result) {
+        Some(text) => text,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let content = match body.get("content").and_then(Value::as_str) {
+        Some(content) => content,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let bytes = match body.get("encoding").and_then(Value::as_str) {
+        None | Some("utf8") => content.as_bytes().to_vec(),
+        Some("base64") => match decode_base64(content) {
+            Some(bytes) => bytes,
+            None => return Err(Error::Tool(String::from(generic)).to_string()),
+        },
+        Some(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let eof = match body.get("eof").and_then(Value::as_bool) {
+        Some(eof) => eof,
+        None => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let byte_len = body
+        .get("byteLen")
+        .and_then(u64_lenient)
+        .unwrap_or(bytes.len() as u64);
+    let offset_bytes = body.get("offsetBytes").and_then(u64_lenient).unwrap_or(0);
+    Ok(PatchPage {
+        bytes,
+        byte_len,
+        offset_bytes,
+        eof,
+    })
+}
+
+/// Classify one object line's `type` (or `kind`) name.
+///
+/// Known names (case-insensitive, plus the single-char prefixes as
+/// aliases); anything else is not a known kind.
+fn classify_line_type(name: &str) -> Option<PatchLineKind> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "added" | "+" => Some(PatchLineKind::Added),
+        "removed" | "-" => Some(PatchLineKind::Removed),
+        "context" | " " => Some(PatchLineKind::Context),
+        "header" | "@" => Some(PatchLineKind::Header),
+        _ => None,
+    }
+}
+
+/// Classify one string line by its first byte only: `+` added,
+/// `-` removed, `@` header, anything else (including `" "`,
+/// empty, or unknown prefixes) context.
+fn classify_line_prefix(text: &str) -> PatchLineKind {
+    match text.as_bytes().first() {
+        Some(b'+') => PatchLineKind::Added,
+        Some(b'-') => PatchLineKind::Removed,
+        Some(b'@') => PatchLineKind::Header,
+        _ => PatchLineKind::Context,
+    }
+}
+
+/// Parse one patch line: a string classifies by first byte; an
+/// object reads `type` (or `kind`) for the kind and `text` (or
+/// `content`) for the text, defaulting to [`PatchLineKind::Other`]
+/// with empty text when neither is usable. Anything else is
+/// skipped, never a document failure.
+fn parse_patch_line(entry: &Value) -> Option<PatchLine> {
+    match entry {
+        Value::String(text) => Some(PatchLine {
+            kind: classify_line_prefix(text),
+            text: text.clone(),
+        }),
+        Value::Object(_) => {
+            let kind = entry
+                .get("type")
+                .or_else(|| entry.get("kind"))
+                .and_then(Value::as_str)
+                .and_then(classify_line_type)
+                .unwrap_or(PatchLineKind::Other);
+            let text = entry
+                .get("text")
+                .or_else(|| entry.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(PatchLine { kind, text })
+        }
+        _ => None,
+    }
+}
+
+/// Lenient `u64` object field with a fixed default.
+fn hunk_number(hunk: &serde_json::Map<String, Value>, key: &str, default: u64) -> u64 {
+    hunk.get(key).and_then(u64_lenient).unwrap_or(default)
+}
+
+/// Parse one patch hunk: `oldStart`/`newStart` default to 1,
+/// `oldLines`/`newLines` to 0, `lines` to empty; unparseable line
+/// entries are skipped, never a document failure.
+fn parse_patch_hunk(entry: &Value) -> Option<PatchHunk> {
+    let hunk = entry.as_object()?;
+    let lines = hunk
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|lines| lines.iter().filter_map(parse_patch_line).collect())
+        .unwrap_or_default();
+    Some(PatchHunk {
+        old_start: hunk_number(hunk, "oldStart", 1),
+        old_lines: hunk_number(hunk, "oldLines", 0),
+        new_start: hunk_number(hunk, "newStart", 1),
+        new_lines: hunk_number(hunk, "newLines", 0),
+        lines,
+    })
+}
+
+/// Parse one patch file entry: the path is the first present
+/// non-empty string among `path`, `filePath`, `newPath`,
+/// `oldPath`, `filename` (else `"(unknown file)"`); a missing or
+/// non-array `hunks` reads as no hunks. A non-object entry is
+/// skipped, never a document failure.
+fn parse_patch_file(entry: &Value) -> Option<PatchFile> {
+    let file = entry.as_object()?;
+    let path = ["path", "filePath", "newPath", "oldPath", "filename"]
+        .into_iter()
+        .find_map(|key| file.get(key).and_then(Value::as_str))
+        .filter(|path| !path.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| String::from("(unknown file)"));
+    let hunks = file
+        .get("hunks")
+        .and_then(Value::as_array)
+        .map(|hunks| hunks.iter().filter_map(parse_patch_hunk).collect())
+        .unwrap_or_default();
+    Some(PatchFile { path, hunks })
+}
+
+/// Parse stored patch-document bytes into a [`PatchDocument`].
+///
+/// Tolerates the observed shape and its gaps: the top level is an
+/// object with a `files` array, or a bare file array; unknown
+/// fields are ignored at every level; file entries keep document
+/// order. A body that is not JSON, or JSON with neither shape,
+/// fails with a friendly message: the counts line still renders
+/// and the expand shows the failure.
+pub(crate) fn parse_patch_document(body: &[u8]) -> Result<PatchDocument, String> {
+    let generic = "Couldn't read that tool call's diff from the Muse MCP server.";
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    let entries: &[Value] = match &value {
+        Value::Array(files) => files,
+        Value::Object(_) => match value.get("files").and_then(Value::as_array) {
+            Some(files) => files,
+            None => return Err(Error::Tool(String::from(generic)).to_string()),
+        },
+        _ => return Err(Error::Tool(String::from(generic)).to_string()),
+    };
+    Ok(PatchDocument {
+        files: entries.iter().filter_map(parse_patch_file).collect(),
+    })
 }
 
 /// Text of the first `type == "text"` content item, if any.
@@ -2007,6 +2339,8 @@ mod tests {
                         status: ItemStatus::Completed,
                         output: Some(String::from("Read text file `/tmp/ws/note.txt`.")),
                         failure: None,
+                        patch_summary: None,
+                        patch_ref: None,
                     }
                 );
             }
@@ -2054,6 +2388,8 @@ mod tests {
                     status: ItemStatus::Completed,
                     output: Some(String::from("total 0")),
                     failure: None,
+                    patch_summary: None,
+                    patch_ref: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),
@@ -2092,6 +2428,8 @@ mod tests {
                         "tool failed: No such file or directory (os error 2)"
                     )),
                     failure: Some(String::from("No such file or directory (os error 2)")),
+                    patch_summary: None,
+                    patch_ref: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),
@@ -2126,6 +2464,8 @@ mod tests {
                     status: ItemStatus::InProgress,
                     output: None,
                     failure: None,
+                    patch_summary: None,
+                    patch_ref: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),
@@ -2216,6 +2556,8 @@ mod tests {
                     status: ItemStatus::InProgress,
                     output: None,
                     failure: None,
+                    patch_summary: None,
+                    patch_ref: None,
                 }
             ),
             other => panic!("wrong event: {other:?}"),
@@ -3018,5 +3360,437 @@ mod tests {
         );
         let missing = map_stream_event(&json!({"type": "catalog-changed"}));
         assert!(missing.is_err());
+    }
+
+    fn tool_call_item(extra: Value) -> Value {
+        let mut item = json!({
+            "itemId": "c-p1",
+            "kind": "toolCall",
+            "status": "completed",
+            "tool": "write_file",
+            "args": "{\"path\":\"/tmp/ws/note.txt\"}",
+            "turnId": "t",
+        });
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            item[key] = value.clone();
+        }
+        item
+    }
+
+    fn patch_item(tool_item: Value) -> StreamItem {
+        let event = map_stream_event(&json!({
+            "type": "item-completed",
+            "sessionId": "s",
+            "item": tool_item,
+        }))
+        .expect("ok")
+        .expect("known");
+        match event {
+            StreamEvent::ItemCompleted { item, .. } => item,
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_tool_call_carries_patch_summary_and_ref() {
+        let item = patch_item(tool_call_item(json!({
+            "patchSummary": {"added": 54, "removed": 0, "files": 1},
+            "patchRef": {
+                "availability": "available",
+                "byteLen": 2376,
+                "id": "ref-1",
+                "kind": "tool_patch",
+                "mediaType": "application/json",
+                "uri": "tool-output://local/c-p1/call-p1-tool_patch.json",
+            },
+        })));
+        match item {
+            StreamItem::ToolCall {
+                patch_summary,
+                patch_ref,
+                ..
+            } => {
+                assert_eq!(
+                    patch_summary,
+                    Some(PatchSummary {
+                        added: 54,
+                        removed: 0,
+                        files: 1,
+                    })
+                );
+                let reference = patch_ref.expect("patch ref present");
+                assert_eq!(reference.id, "ref-1");
+                assert_eq!(reference.kind.as_deref(), Some("tool_patch"));
+                assert_eq!(reference.media_type.as_deref(), Some("application/json"));
+                assert_eq!(reference.byte_len, Some(2376));
+            }
+            other => panic!("wrong item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_tool_call_without_patch_fields_renders_as_today() {
+        let item = patch_item(tool_call_item(json!({})));
+        match item {
+            StreamItem::ToolCall {
+                patch_summary,
+                patch_ref,
+                tool,
+                status,
+                ..
+            } => {
+                assert_eq!(patch_summary, None);
+                assert_eq!(patch_ref, None);
+                assert_eq!(tool, "write_file");
+                assert_eq!(status, ItemStatus::Completed);
+            }
+            other => panic!("wrong item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_tool_call_malformed_patch_fields_stay_none() {
+        // Each malformed shape degrades to `None`, never an item failure.
+        let full = || {
+            Some(PatchSummary {
+                added: 54,
+                removed: 0,
+                files: 1,
+            })
+        };
+        for (extra, want_summary) in [
+            (json!({"patchSummary": {"added": 54}}), None),
+            (
+                json!({"patchSummary": {"added": "lots", "removed": 0, "files": 1}}),
+                None,
+            ),
+            (json!({"patchSummary": [54, 0, 1]}), None),
+            (json!({"patchRef": {"kind": "tool_patch"}}), None),
+            (json!({"patchRef": {"id": ""}}), None),
+            (json!({"patchRef": "ref-1"}), None),
+            (
+                json!({"patchRef": {"id": "ref-1", "availability": "missing"}}),
+                None,
+            ),
+            (
+                json!({"patchRef": {"id": "ref-1", "availability": "accessFailed"}}),
+                None,
+            ),
+            // An unavailable ref drops while the summary still rides.
+            (
+                json!({
+                    "patchSummary": {"added": 54, "removed": 0, "files": 1},
+                    "patchRef": {"id": "ref-1", "availability": "unsupported"},
+                }),
+                full(),
+            ),
+        ] {
+            let item = patch_item(tool_call_item(extra));
+            match item {
+                StreamItem::ToolCall {
+                    patch_summary,
+                    patch_ref,
+                    ..
+                } => {
+                    assert_eq!(patch_ref, None, "ref degrades to None");
+                    assert_eq!(patch_summary, want_summary);
+                }
+                other => panic!("wrong item: {other:?}"),
+            }
+        }
+        // A summary-only item keeps its counts with no ref to fetch.
+        let item = patch_item(tool_call_item(json!({
+            "patchSummary": {"added": 3, "removed": 1, "files": 2},
+        })));
+        match item {
+            StreamItem::ToolCall {
+                patch_summary,
+                patch_ref,
+                ..
+            } => {
+                assert_eq!(
+                    patch_summary,
+                    Some(PatchSummary {
+                        added: 3,
+                        removed: 1,
+                        files: 2,
+                    })
+                );
+                assert_eq!(patch_ref, None);
+            }
+            other => panic!("wrong item: {other:?}"),
+        }
+    }
+
+    fn patch_page_envelope(page: Value) -> Value {
+        json!({
+            "content": [{"type": "text", "text": serde_json::to_string(&page).expect("page is JSON")}],
+            "isError": false,
+        })
+    }
+
+    #[test]
+    fn patch_result_single_utf8_page_maps() {
+        let body = "{\"files\":[]}";
+        let result = patch_page_envelope(json!({
+            "byteLen": body.len(),
+            "content": body,
+            "encoding": "utf8",
+            "eof": true,
+            "mediaType": "application/json",
+            "offsetBytes": 0,
+        }));
+        let page = map_patch_result(&result).expect("ok");
+        assert_eq!(page.bytes, body.as_bytes());
+        assert_eq!(page.byte_len as usize, body.len());
+        assert_eq!(page.offset_bytes, 0);
+        assert!(page.eof);
+    }
+
+    #[test]
+    fn patch_result_base64_page_decodes() {
+        // "hello" in base64.
+        let result = patch_page_envelope(json!({
+            "byteLen": 5,
+            "content": "aGVsbG8=",
+            "encoding": "base64",
+            "eof": true,
+            "mediaType": "application/octet-stream",
+            "offsetBytes": 7,
+        }));
+        let page = map_patch_result(&result).expect("ok");
+        assert_eq!(page.bytes, b"hello");
+        assert_eq!(page.byte_len, 5);
+        assert_eq!(page.offset_bytes, 7);
+        assert!(page.eof);
+    }
+
+    #[test]
+    fn patch_base64_padding_quantums_decode() {
+        // One-byte ("M"), two-byte ("Ma"), and whitespace tolerance.
+        let page = |content: &str| {
+            map_patch_result(&patch_page_envelope(json!({
+                "byteLen": 3,
+                "content": content,
+                "encoding": "base64",
+                "eof": true,
+                "mediaType": "application/octet-stream",
+                "offsetBytes": 0,
+            })))
+            .expect("ok")
+            .bytes
+        };
+        assert_eq!(page("TQ=="), b"M");
+        assert_eq!(page("TWE="), b"Ma");
+        assert_eq!(page("TWE=\n"), b"Ma");
+        // Interior padding is tolerated leniently, never a panic.
+        assert_eq!(
+            map_patch_result(&patch_page_envelope(json!({
+                "byteLen": 3,
+                "content": "AB=C",
+                "encoding": "base64",
+                "eof": true,
+                "mediaType": "application/octet-stream",
+                "offsetBytes": 0,
+            })))
+            .map(|page| page.bytes.len()),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn patch_result_multi_page_cursor_advances() {
+        let first = patch_page_envelope(json!({
+            "byteLen": 10,
+            "content": "0123456789",
+            "encoding": "utf8",
+            "eof": false,
+            "mediaType": "application/json",
+            "offsetBytes": 0,
+        }));
+        let page = map_patch_result(&first).expect("ok");
+        assert!(!page.eof);
+        let next = page.offset_bytes + page.byte_len;
+        assert_eq!(next, 10);
+        let second = patch_page_envelope(json!({
+            "byteLen": 4,
+            "content": "abcd",
+            "encoding": "utf8",
+            "eof": true,
+            "mediaType": "application/json",
+            "offsetBytes": next,
+        }));
+        let tail = map_patch_result(&second).expect("ok");
+        assert!(tail.eof);
+        assert_eq!(tail.offset_bytes, 10);
+        let mut body = page.bytes;
+        body.extend_from_slice(&tail.bytes);
+        assert_eq!(body, b"0123456789abcd");
+    }
+
+    #[test]
+    fn patch_result_error_arms_carry_server_or_generic_text() {
+        let generic = "Couldn't load that tool call's diff from the Muse MCP server.";
+        let server = json!({
+            "content": [{"type": "text", "text": "no such output"}],
+            "isError": true,
+        });
+        assert_eq!(
+            map_patch_result(&server),
+            Err(String::from("no such output"))
+        );
+        for bad in [
+            json!({"content": [], "isError": false}),
+            json!({"content": [{"type": "text", "text": "not json"}], "isError": false}),
+            patch_page_envelope(json!({
+                "content": "e30=",
+                "encoding": "base64!",
+                "eof": true,
+                "byteLen": 3,
+                "offsetBytes": 0,
+            })),
+            patch_page_envelope(json!({
+                "content": "!!!",
+                "encoding": "base64",
+                "eof": true,
+                "byteLen": 3,
+                "offsetBytes": 0,
+            })),
+            patch_page_envelope(json!({
+                "content": "{}",
+                "encoding": "utf8",
+                "byteLen": 2,
+                "offsetBytes": 0,
+            })),
+        ] {
+            assert_eq!(map_patch_result(&bad), Err(String::from(generic)));
+        }
+    }
+
+    fn patch_body(files: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({"files": files})).expect("body is JSON")
+    }
+
+    #[test]
+    fn patch_document_parses_string_lines_in_order() {
+        let body = patch_body(json!([{
+            "path": "/home/dev/storefront-web/build.gradle.kts",
+            "hunks": [{
+                "oldStart": 41, "oldLines": 8, "newStart": 41, "newLines": 9,
+                "lines": [" context", "-removed", "+added"],
+            }],
+        }]));
+        let document = parse_patch_document(&body).expect("ok");
+        assert_eq!(document.files.len(), 1);
+        let file = &document.files[0];
+        assert_eq!(file.path, "/home/dev/storefront-web/build.gradle.kts");
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!(
+            (
+                hunk.old_start,
+                hunk.old_lines,
+                hunk.new_start,
+                hunk.new_lines
+            ),
+            (41, 8, 41, 9)
+        );
+        assert_eq!(
+            hunk.lines.iter().map(|line| line.kind).collect::<Vec<_>>(),
+            vec![
+                PatchLineKind::Context,
+                PatchLineKind::Removed,
+                PatchLineKind::Added,
+            ]
+        );
+        assert_eq!(hunk.lines[0].text, " context");
+        // Tallies follow classification, not the server summary.
+        assert_eq!(document.added(), 1);
+        assert_eq!(document.removed(), 1);
+    }
+
+    #[test]
+    fn patch_document_tolerates_multi_file_object_lines_and_aliases() {
+        let body = patch_body(json!([
+            {
+                "path": "/w/second.txt",
+                "hunks": [{
+                    "oldStart": 1, "oldLines": 0, "newStart": 1, "newLines": 1,
+                    "lines": [{"type": "added", "text": "+whole"}],
+                }],
+            },
+            {
+                // Path aliases and unknown fields ride along.
+                "filePath": "/w/first.txt",
+                "extra": true,
+                "hunks": [
+                    {
+                        "oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+                        "unknownHunkField": 1,
+                        "lines": [
+                            {"kind": "removed", "content": "-gone"},
+                            {"type": "CONTEXT", "text": " kept"},
+                            {"type": "header", "text": "@@ -2,1 +2,1 @@ leftovers"},
+                            {"type": "mystery", "text": "?kept"},
+                            "",
+                            7,
+                        ],
+                    },
+                    "not-a-hunk",
+                ],
+            },
+            "not-a-file",
+        ]));
+        let document = parse_patch_document(&body).expect("ok");
+        // Document order is kept; non-object entries are skipped.
+        assert_eq!(document.files.len(), 2);
+        assert_eq!(document.files[0].path, "/w/second.txt");
+        assert_eq!(document.files[1].path, "/w/first.txt");
+        let lines = &document.files[1].hunks[0].lines;
+        assert_eq!(
+            lines.iter().map(|line| line.kind).collect::<Vec<_>>(),
+            vec![
+                PatchLineKind::Removed,
+                PatchLineKind::Context,
+                PatchLineKind::Header,
+                PatchLineKind::Other,
+                PatchLineKind::Context,
+            ]
+        );
+        assert_eq!(lines[0].text, "-gone");
+        assert_eq!(lines[3].text, "?kept");
+        // Unknown prefixes classify as context, never panic.
+        assert_eq!(lines[4].text, "");
+        assert_eq!(document.added(), 1);
+        assert_eq!(document.removed(), 1);
+    }
+
+    #[test]
+    fn patch_document_accepts_bare_array_and_empty_shapes() {
+        let bare = serde_json::to_vec(&json!([{"path": "/w/a.txt"}])).expect("bare is JSON");
+        let document = parse_patch_document(&bare).expect("ok");
+        assert_eq!(document.files.len(), 1);
+        assert_eq!(document.files[0].path, "/w/a.txt");
+        assert!(document.files[0].hunks.is_empty());
+        let empty = patch_body(json!([]));
+        assert!(parse_patch_document(&empty).expect("ok").files.is_empty());
+        let missing_path = patch_body(json!([{"hunks": []}]));
+        assert_eq!(
+            parse_patch_document(&missing_path).expect("ok").files[0].path,
+            "(unknown file)"
+        );
+    }
+
+    #[test]
+    fn patch_document_rejects_garbage() {
+        let generic = "Couldn't read that tool call's diff from the Muse MCP server.";
+        for bad in [
+            Vec::from("not json{"),
+            serde_json::to_vec(&json!({"files": "nope"})).expect("JSON"),
+            serde_json::to_vec(&json!({"other": []})).expect("JSON"),
+            serde_json::to_vec(&json!("just a string")).expect("JSON"),
+        ] {
+            assert_eq!(parse_patch_document(&bad), Err(String::from(generic)));
+        }
     }
 }

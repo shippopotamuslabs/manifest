@@ -15,7 +15,8 @@ pub use branch::{parse_gitdir_pointer, parse_head, resolve_git_dir};
 pub use engine::{
     AnswerValue, ApprovalChoiceSummary, ApprovalDecision, ApprovalRequest, BuiltinCommand,
     Connection, DraftAction, EffortChoice, EngineEvent, FREE_TEXT_LIMIT, FailedCommand, GoalInfo,
-    GoalStatus, ItemStatus, ModelChoice, ModelInfo, MusePermission, PendingAnswer, PendingDecision,
+    GoalStatus, ItemStatus, ModelChoice, ModelInfo, MusePermission, PatchDocument, PatchFile,
+    PatchHunk, PatchLine, PatchLineKind, PatchRef, PatchSummary, PendingAnswer, PendingDecision,
     PendingKind, PendingPhase, PendingRequest, PendingResolution, PermissionMode, Question,
     QuestionOption, QuestionRequest, SessionEngine, SkillInfo, SkillInvocation, SpawnChoices,
     StreamEvent, StreamItem, TurnId, TurnInput, UsageKind, UsageSnapshot, WireAnswerKind,

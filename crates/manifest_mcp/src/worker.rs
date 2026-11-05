@@ -20,9 +20,9 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::map::{
-    history_truncation_diagnostic, map_ack_result, map_history_result, map_models_result,
-    map_pending_result, map_resume_result, map_skills_result, map_spawn_result, map_status_result,
-    map_stream_event, map_turn_result,
+    MAX_PATCH_BYTES, history_truncation_diagnostic, map_ack_result, map_history_result,
+    map_models_result, map_patch_result, map_pending_result, map_resume_result, map_skills_result,
+    map_spawn_result, map_status_result, map_stream_event, map_turn_result, parse_patch_document,
 };
 use crate::{ServerConfig, wire};
 
@@ -89,6 +89,13 @@ pub(crate) enum Command {
     ListSkills { session: SessionId },
     /// Fetch the session's stored history: `muse_raw` with `session/read`.
     LoadHistory { session: SessionId },
+    /// Fetch one tool call's stored patch body: `muse_raw` with
+    /// `item/readOutput`, paging until `eof`.
+    LoadPatch {
+        session: SessionId,
+        item_id: String,
+        patch_ref_id: String,
+    },
     /// Fetch pending approvals/questions: `muse_pending`.
     FetchPending,
     /// Decide a pending approval: `muse_decide` as `actor: "user"`.
@@ -132,6 +139,15 @@ enum Pending {
     Models,
     Skills(SessionId),
     History(SessionId),
+    Patch {
+        session: SessionId,
+        item_id: String,
+        patch_ref_id: String,
+        /// Stored bytes accumulated so far, in order.
+        bytes: Vec<u8>,
+        /// Stored-byte offset the next page starts from.
+        offset: u64,
+    },
     Fetch,
     Decide {
         session: SessionId,
@@ -160,6 +176,9 @@ fn failed_command(pending: &Pending) -> Option<FailedCommand> {
         Pending::Models => Some(FailedCommand::Models),
         Pending::Skills(session) => Some(FailedCommand::Skills(session.clone())),
         Pending::History(session) => Some(FailedCommand::History(session.clone())),
+        Pending::Patch {
+            session, item_id, ..
+        } => Some(FailedCommand::Patch(session.clone(), item_id.clone())),
         Pending::Fetch => Some(FailedCommand::PendingFetch),
         Pending::Decide {
             session,
@@ -427,6 +446,38 @@ impl Worker {
         self.send_line(&wire::history_call(id, session.as_str()))
     }
 
+    /// Issue an `item/readOutput` round trip through `muse_raw`
+    /// with a fresh id, carrying the accumulated body and the next
+    /// page offset in the pending entry.
+    fn send_patch_call(
+        &mut self,
+        session: &SessionId,
+        item_id: &str,
+        patch_ref_id: &str,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(
+            id,
+            Pending::Patch {
+                session: session.clone(),
+                item_id: item_id.to_string(),
+                patch_ref_id: patch_ref_id.to_string(),
+                bytes,
+                offset,
+            },
+        );
+        self.send_line(&wire::patch_call(
+            id,
+            session.as_str(),
+            item_id,
+            patch_ref_id,
+            offset,
+        ))
+    }
+
     /// Handle one stdout line. `Ok(true)` keeps looping, `Ok(false)`
     /// shuts the worker down.
     fn handle_line(&mut self, line: &str) -> bool {
@@ -503,6 +554,7 @@ impl Worker {
             | Pending::Models
             | Pending::Skills(_)
             | Pending::History(_)
+            | Pending::Patch { .. }
             | Pending::Fetch
             | Pending::Decide { .. }
             | Pending::Answer { .. } => self.handle_command_reply(&pending, message),
@@ -575,6 +627,24 @@ impl Worker {
             // History carries partial-success diagnostics alongside
             // the loaded event, so it folds in its own reply handler.
             Pending::History(session) => return self.handle_history_reply(session, message),
+            // Patches page across several replies, so they fold in
+            // their own reply handler too.
+            Pending::Patch {
+                session,
+                item_id,
+                patch_ref_id,
+                bytes,
+                offset,
+            } => {
+                return self.handle_patch_reply(
+                    session.clone(),
+                    item_id.clone(),
+                    patch_ref_id.clone(),
+                    bytes.clone(),
+                    *offset,
+                    message,
+                );
+            }
             Pending::Spawn => match map_spawn_result(&result) {
                 Ok((session, turn)) => EngineEvent::SessionSpawned { session, turn },
                 Err(message) => EngineEvent::CommandFailed { command, message },
@@ -718,6 +788,80 @@ impl Worker {
                 message,
             }),
         }
+    }
+
+    /// Handle the reply to an `item/readOutput` round trip. The
+    /// connection stays up: every outcome is a value the shell
+    /// renders, mirroring [`Worker::handle_history_reply`]. Short
+    /// pages reissue from `offset_bytes + byte_len` until `eof`,
+    /// then the concatenated body parses as the patch document.
+    fn handle_patch_reply(
+        &mut self,
+        session: SessionId,
+        item_id: String,
+        patch_ref_id: String,
+        accumulated: Vec<u8>,
+        offset: u64,
+        message: &Value,
+    ) -> bool {
+        let command = FailedCommand::Patch(session.clone(), item_id.clone());
+        if let Some(error) = message.get("error") {
+            let text = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Couldn't load that tool call's diff from the Muse MCP server.");
+            return self.emit(EngineEvent::CommandFailed {
+                command,
+                message: text.to_string(),
+            });
+        }
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        let page = match map_patch_result(&result) {
+            Ok(page) => page,
+            Err(message) => return self.emit(EngineEvent::CommandFailed { command, message }),
+        };
+        let mut bytes = accumulated;
+        if page.bytes.len() as u64 > MAX_PATCH_BYTES.saturating_sub(bytes.len() as u64) {
+            return self.emit(EngineEvent::CommandFailed {
+                command,
+                message: String::from(
+                    "That tool call's diff is too large to show; the counts above still stand.",
+                ),
+            });
+        }
+        bytes.extend_from_slice(&page.bytes);
+        if page.eof {
+            return match parse_patch_document(&bytes) {
+                Ok(patch) => self.emit(EngineEvent::PatchLoaded {
+                    session,
+                    item_id,
+                    patch,
+                }),
+                Err(message) => self.emit(EngineEvent::CommandFailed { command, message }),
+            };
+        }
+        let next = page.offset_bytes.saturating_add(page.byte_len);
+        if next <= offset {
+            return self.emit(EngineEvent::CommandFailed {
+                command,
+                message: String::from(
+                    "Couldn't page that tool call's diff from the Muse MCP server.",
+                ),
+            });
+        }
+        if bytes.len() as u64 >= MAX_PATCH_BYTES {
+            return self.emit(EngineEvent::CommandFailed {
+                command,
+                message: String::from(
+                    "That tool call's diff is too large to show; the counts above still stand.",
+                ),
+            });
+        }
+        if let Err(err) = self.send_patch_call(&session, &item_id, &patch_ref_id, next, bytes) {
+            let _ = self.fail(err);
+            return false;
+        }
+        true
     }
 
     /// Handle the reply to a `muse_status` call. The connection stays up.
@@ -1083,6 +1227,25 @@ pub(crate) fn run(
                         message: not_connected_message(),
                     })
                 } else if let Err(err) = worker.send_history_call(&session) {
+                    let _ = worker.fail(err);
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerMsg::Command(Command::LoadPatch {
+                session,
+                item_id,
+                patch_ref_id,
+            }) => {
+                if !worker.connected {
+                    worker.emit(EngineEvent::CommandFailed {
+                        command: FailedCommand::Patch(session.clone(), item_id.clone()),
+                        message: not_connected_message(),
+                    })
+                } else if let Err(err) =
+                    worker.send_patch_call(&session, &item_id, &patch_ref_id, 0, Vec::new())
+                {
                     let _ = worker.fail(err);
                     false
                 } else {
